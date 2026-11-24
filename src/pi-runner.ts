@@ -83,7 +83,7 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
   const model: Model<"openai-completions"> = {
     id: config.modelId,
     name: config.modelId,
-    provider: "data-maker",
+    provider: "pi-posttrain-loop",
     api: "openai-completions",
     baseUrl: config.baseUrl,
     input: ["text"],
@@ -102,7 +102,7 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
   };
   const models = createModels();
   models.setProvider(createProvider({
-    id: "data-maker",
+    id: "pi-posttrain-loop",
     baseUrl: config.baseUrl,
     auth: { apiKey: {
       name: "LLM_API_KEY",

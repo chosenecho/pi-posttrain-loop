@@ -1,6 +1,6 @@
 # 测试集（`test`）、DPO 采题池（`dpo`）与评测流水线设计
 
-本文档记录 `data-maker` 的持久化三分区防泄漏架构、结构化评分要点（`eval_rubrics`）抽取、不可变测试集版本冻结（`test_set_versions`）、首版盲测基线 `test-v1`，以及后续脱稿盲测与 On-policy DPO 闭环演进路线。
+本文档记录 `pi-posttrain-loop` 的持久化三分区防泄漏架构、结构化评分要点（`eval_rubrics`）抽取、不可变测试集版本冻结（`test_set_versions`）、首版盲测基线 `test-v1`，以及后续脱稿盲测与 On-policy DPO 闭环演进路线。
 
 ---
 

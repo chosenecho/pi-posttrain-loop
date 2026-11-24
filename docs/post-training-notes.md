@@ -45,7 +45,7 @@
 ## 3. 整体后训练路线（SFT → On-policy DPO → 按需评估 CPT/RAG）
 
 1. **阶段 1：SFT（当前核心）**
-   - 持续使用 `data-maker` 生产 `train` 分区高质量单轮 + 多轮对话样本（并按需通过 `npm run reasoning` 补写 CoT），训练时按 10%–20% 混入通用对话数据防灾难性遗忘。
+   - 持续使用 `pi-posttrain-loop` 生产 `train` 分区高质量单轮 + 多轮对话样本（并按需通过 `npm run reasoning` 补写 CoT），训练时按 10%–20% 混入通用对话数据防灾难性遗忘。
    - 保留 `data/data-maker.sqlite` 中的全部过程记录（`attempts` 里会自动沉淀 `revise → pass` 记录，留作后续 DPO 补充素材）。
    - 训练完成后，先在冻结的 **`test` 分区盲测集（`test-v1`，`output/test.jsonl`）** 上结合 `eval_rubrics` 验收首轮 SFT 效果。
 

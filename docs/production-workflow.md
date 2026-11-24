@@ -1,6 +1,6 @@
 # 生产操作手册（日常批量生成与导出）
 
-本手册面向日常使用 `data-maker` 对视频文稿库进行增量出题、多轮问答质检、故障补跑与总训练集导出的完整操作。
+本手册面向日常使用 `pi-posttrain-loop` 对视频文稿库进行增量出题、多轮问答质检、故障补跑与总训练集导出的完整操作。
 
 ---
 
@@ -133,7 +133,7 @@ npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-v
 
 ## 3. 运行中监控与故障处理
 
-- **只读查看实时进度**（WAL 模式下随时可安全只读查询 [data/data-maker.sqlite](<../data/data-maker.sqlite>)）：
+- **只读查看实时进度**（WAL 模式下随时可安全只读查询 `data/data-maker.sqlite`）：
   ```sql
   -- 查看最近一次运行各状态分布
   SELECT status, COUNT(*) AS count

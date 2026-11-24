@@ -26,7 +26,7 @@ const DEFAULT_DB = join(ROOT, "data/data-maker.sqlite");
 const DEFAULT_DEMO_DB = join(ROOT, "output/demo.sqlite");
 const DEMO_DIRECTION = "根据传感器说明生成使用与告警规则的问答";
 
-const HELP = `data-maker — 统一 SQLite 训练数据生成 CLI
+const HELP = `pi-posttrain-loop — 统一 SQLite 训练数据生成 CLI
 
 离线演示（固定脚本，无模型调用，默认写入 output/demo.sqlite）：
   npm run demo

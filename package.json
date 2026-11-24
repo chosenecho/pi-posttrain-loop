@@ -1,9 +1,9 @@
 {
-  "name": "data-maker",
+  "name": "pi-posttrain-loop",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pi Agent-based post-training dataset synthesis, CoT reasoning backfill, and adversarial probe evaluation pipeline backed by SQLite.",
+  "description": "Pi Agent loop for post-training dataset synthesis, blind CoT reasoning backfill, and adversarial probe evaluation backed by SQLite.",
   "license": "MIT",
   "engines": { "node": ">=22.19.0" },
   "scripts": {
