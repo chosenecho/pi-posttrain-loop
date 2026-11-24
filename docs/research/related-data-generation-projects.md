@@ -1,0 +1,23 @@
+# 相似开源数据生成项目：三项目核对
+
+核对日期：2026-11-23。目标流程：材料与方向 → 出题 0–3 个 → 回答 → 质检输出 `pass/revise/drop`；只在回答/质检之间做有界循环。以下仅据官方文档与公开源码，未安装、运行或测量性能。仓库未检出 Markdown 笔记约定，故使用本路径。
+
+## 结论
+
+- **借鉴产品流程：Easy Dataset 最接近。** 已有文档拆分、问题、答案、质量评分、AI 优化和导出，但此次核对到的是分开的评估/优化动作，不是现成的自动 `revise → 重答 → 再判` 状态机。[官方总览](https://github.com/ConardLi/easy-dataset)、[优化实现](https://github.com/ConardLi/easy-dataset/blob/main/app/api/projects/%5BprojectId%5D/datasets/optimize/route.js)
+- **借鉴可组合数据管道：Distilabel 最完整。** 有生成、judge、重写组件；用户需要的退出条件、尝试次数与 `pass/revise/drop` 协议仍需自己编排。`EvolQuality` 的固定轮数演化不等于按 judge 反馈修到合格。[EvolQuality](https://distilabel.argilla.io/latest/components-gallery/tasks/evolquality/)、[自定义 Step](https://distilabel.argilla.io/latest/sections/how_to_guides/basic/step/)
+- **借鉴有界反馈重写：DeepEval Synthesizer 有真实内置案例，但循环对象是问题/input，不是回答。** 因而适合参考其结构，未直接覆盖当前需求。[Synthesizer 文档](https://deepeval.com/docs/golden-synthesizer)、[重写源码](https://github.com/confident-ai/deepeval/blob/main/deepeval/synthesizer/synthesizer.py)
+
+## 能力与边界
+
+| 项目 | 材料 → QA | 质量打分/过滤 | 按反馈重写与循环 | 语言栈、相对轻重 |
+| --- | --- | --- | --- | --- |
+| [ConardLi/easy-dataset](https://github.com/ConardLi/easy-dataset) | **内置**：文档解析/切块/问题生成；按“问题 + 对应文本块 + 标签”生成答案。[生成文档](https://docs.easy-dataset.com/ed/en/datasets/dataset-generation.md) | **内置**：官方 README 列出 AI 评分与过滤；评估服务返回 `score` 与文字评价，分数归一至 0–5、0.5 步长。[README](https://github.com/ConardLi/easy-dataset)、[评估源码](https://github.com/ConardLi/easy-dataset/blob/main/lib/services/datasets/evaluation.js) | **内置单次 AI 优化**：用户提供 advice，接口生成并保存新答案。已检文档/接口未确认有自动 judge→rewrite→judge 质量闭环；应按需自建。[管理文档](https://docs.easy-dataset.com/ed/en/datasets/dataset-management.md)、[优化接口](https://github.com/ConardLi/easy-dataset/blob/main/app/api/projects/%5BprojectId%5D/datasets/optimize/route.js) | JavaScript / React / Next.js / Prisma，另有 Electron 桌面壳；是完整应用，作为三 Agent 小程序的依赖偏重。依据功能和依赖作相对判断，非 benchmark。[package.json](https://github.com/ConardLi/easy-dataset/blob/main/package.json) |
+| [argilla-io/distilabel](https://github.com/argilla-io/distilabel) | **有组件**：`Genstruct` 将文档 title/content 生成 user/assistant；通用 Task 可另拆出题与作答，但并非用户需求的现成三角色模板。[Genstruct](https://distilabel.argilla.io/latest/components-gallery/tasks/genstruct/) | **有 judge 组件**：`UltraFeedback` 输出 ratings/rationales；落到阈值过滤与三态路由需自己的 Step/规则。[UltraFeedback](https://distilabel.argilla.io/latest/components-gallery/tasks/ultrafeedback/)、[Step](https://distilabel.argilla.io/latest/sections/how_to_guides/basic/step/) | **有重写组件，无已确认的同款闭环**：`EvolQuality(num_evolutions=N)` 固定次数重写，`CLAIR` 生成一次 revision/rational；都不自动等价于按质量达标退出。Pipeline DAG 检查阻止成环，可在自定义 Step/外层有界控制器内实现循环。[EvolQuality](https://distilabel.argilla.io/latest/components-gallery/tasks/evolquality/)、[CLAIR](https://distilabel.argilla.io/latest/components-gallery/tasks/clair/)、[DAG 源码](https://github.com/argilla-io/distilabel/blob/main/src/distilabel/pipeline/_dag.py) | Python 库；含批处理、缓存、Pipeline 等设施，不要求独立 GUI；比完整应用容易代码复用，但为这个小任务引入的抽象较多。[README](https://github.com/argilla-io/distilabel)、[Pipeline 文档](https://distilabel.argilla.io/latest/sections/how_to_guides/basic/pipeline/) |
+| [confident-ai/deepeval](https://github.com/confident-ai/deepeval) Synthesizer | **内置**：docs/contexts → goldens；`include_expected_output=True` 可生成参考答案。`actual_output` 留给被测应用生成，定位首先是评测数据而非 SFT 数据工厂。[Synthesizer](https://deepeval.com/docs/golden-synthesizer)、[文档输入](https://deepeval.com/docs/synthesizer-generate-from-docs) | **内置 input 质量评分**：默认阈值 `synthetic_input_quality_threshold=0.5`，侧重清楚、自包含；不是对最终回答全面验收。[Filtration](https://deepeval.com/docs/golden-synthesizer#filtration-quality) | **真实有界反馈重写**：`_rewrite_inputs` / `_a_rewrite_inputs` 评 input、拿 feedback，低于阈值便重写，达到阈值提前退出；`max_quality_retries` 默认 3。但作用于 input，当前“回答↔质检”仍需自建。[文档](https://deepeval.com/docs/golden-synthesizer)、[实现](https://github.com/confident-ai/deepeval/blob/main/deepeval/synthesizer/synthesizer.py) | Python 评测框架中的库组件；入口较短，文档抽取/上下文构建仍有额外依赖；对既有 TypeScript 小项目意味着跨语言或只借鉴算法。此为集成复杂度判断。[官方用法](https://deepeval.com/docs/golden-synthesizer) |
+
+## 选型提醒
+
+1. **judge / filter / rewrite / bounded loop 是四个不同能力。** 三者都不宜描述成“开箱即用的同款三 Agent 系统”。本次也未确认其直接执行用户自定义判断 Skill，或严格保证每段材料只产 0–3 题；这些约束应由自有提示词、schema 与控制器表达。
+2. **DeepEval 文档与当前 main 实现存在退出语义差异。** 文档称重试耗尽后保留最高分候选，且可能低于阈值；本次源码的 `_rewrite_inputs` 则看见最终 input 无条件追加，没有维护 best-so-far，最后一次低分后还会重写而未再评该版本。故保守结论是“有界反馈重写，质量门槛不构成最终硬保证”，实际采用时应锁版本并测试。[文档](https://deepeval.com/docs/golden-synthesizer#filtration)、[源码](https://github.com/confident-ai/deepeval/blob/main/deepeval/synthesizer/synthesizer.py)
+3. 以上来自随时间变化的 `main` / `latest` 与在线文档；不把文档中的产品闭环措辞解释成自动质量修订循环。就简单 MVP 而言，优先借鉴 Easy Dataset 的数据模型和 DeepEval 的反馈循环结构；是否引框架由主线程的 pi 包核对决定。

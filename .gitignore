@@ -1,0 +1,26 @@
+# Dependencies & build caches
+node_modules/
+coverage/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
+
+# Local secrets & environment configuration
+.env
+.env.*
+!.env.example
+
+# Generated outputs & exports
+output/
+
+# Local SQLite databases & corpus checkouts (keep data/materials.example.jsonl tracked)
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.sqlite-journal
+data/weimingzi-source/
+data/weimingzi-semantic/
+
+# OS metadata
+.DS_Store
+Thumbs.db

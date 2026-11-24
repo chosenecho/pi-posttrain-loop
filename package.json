@@ -1,0 +1,32 @@
+{
+  "name": "data-maker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi Agent-based post-training dataset synthesis, CoT reasoning backfill, and adversarial probe evaluation pipeline backed by SQLite.",
+  "license": "MIT",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env --import tsx src/cli.ts",
+    "demo": "node --import tsx src/cli.ts --demo",
+    "questions": "node --env-file-if-exists=.env --import tsx src/question-cli.ts",
+    "judge": "node --env-file-if-exists=.env --import tsx src/judge-cli.ts",
+    "batch": "node --env-file-if-exists=.env --import tsx src/batch-cli.ts",
+    "migrate": "node --import tsx src/migrate.ts",
+    "export": "node --import tsx src/export-cli.ts",
+    "eval": "node --env-file-if-exists=.env --import tsx src/eval-cli.ts",
+    "reasoning": "node --env-file-if-exists=.env --import tsx src/reasoning-cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.6.0",
+    "@earendil-works/pi-ai": "1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
