@@ -304,6 +304,55 @@ test("batch-cli runs end-to-end video selection, question generation, 2-turn jud
   assert.match(second.stdout, /"selectedVideos": 0/);
 });
 
+test("question CLI keeps unsaved model output in trace without printing it or storing it in error", async (t) => {
+  const dir = await tempDir(t);
+  const corpusDir = join(dir, "corpus");
+  const dbPath = join(dir, "privacy.sqlite");
+  await mkdir(join(corpusDir, "by_bv", "BV_PRIVACY"), { recursive: true });
+  await writeFile(join(corpusDir, "by_bv", "BV_PRIVACY", "P001.md"), "仅用于隐私回归的合成材料。");
+  const marker = "privacy-user@example.invalid fixture-private-token";
+  let calls = 0;
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      calls++;
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify({ id: "privacy", choices: [{ index: 0, delta: { role: "assistant", content: marker }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: "privacy", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+      res.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const result = await runQuestionCli([
+    "--input-dir", corpusDir, "--db", dbPath, "--call-attempts", "2", "--retry-delay-ms", "0",
+  ], {
+    LLM_BASE_URL: `http://127.0.0.1:${address.port}/v1`,
+    LLM_MAX_TOKENS: "256", LLM_CONTEXT_WINDOW: "32768", LLM_TIMEOUT_MS: "5000",
+  });
+  assert.equal(result.code, 1);
+  assert.equal(calls, 2);
+  assert.match(result.stdout, /model_save_tool_missing/);
+  assert.match(result.stdout, /question:call:\d+/);
+  for (const value of [marker, "privacy-user@example.invalid", "fixture-private-token"]) {
+    assert.equal(`${result.stdout}\n${result.stderr}`.includes(value), false);
+  }
+  const store = new DataMakerStore(dbPath);
+  try {
+    const row = store.db.prepare("SELECT output_text, error FROM model_calls WHERE role = 'question'").get() as { output_text: string; error: string };
+    assert.equal(row.output_text, marker);
+    assert.match(row.error, /model_save_tool_missing/);
+    assert.equal(row.error.includes(marker), false);
+  } finally {
+    store.close();
+  }
+});
+
 test("computeQuestionQuota keeps compact v2 quotas (2-6) to maximize corpus video coverage", () => {
   // Single-P tiers: <1500 -> 2, 1500..4999 -> 3, 5000..14999 -> 4, >=15000 -> 5
   assert.equal(computeQuestionQuota(1200, 1), 2);

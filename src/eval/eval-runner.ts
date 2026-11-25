@@ -5,7 +5,8 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../retry.js";
-import { errorMessage, nonEmpty, validateConcurrency } from "../schema.js";
+import { nonEmpty, validateConcurrency } from "../schema.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import type { CandidateRunner, ChatMessage } from "./candidate-client.js";
 import {
@@ -261,7 +262,7 @@ export async function runSuiteEvaluation(
             maxAttempts: callMaxAttempts,
             delayMs: callRetryDelayMs,
             onRetry: (attempt: number, max: number, error: unknown) => {
-              options.onProgress?.(`${tag}[t${turn.turnNo}] 重试 ${attempt}/${max}：${errorMessage(error)}`);
+              options.onProgress?.(`${tag}[t${turn.turnNo}] 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
             },
             run: async (): Promise<string> => {
               const callId = evalStore.startCall({
@@ -282,12 +283,17 @@ export async function runSuiteEvaluation(
                   temperature: options.temperature,
                   maxTokens: options.maxTokens,
                 });
-                const trimmed = nonEmpty(raw, "候选模型回答");
+                let trimmed: string;
+                try {
+                  trimmed = nonEmpty(raw, "候选模型回答");
+                } catch (error) {
+                  throw toPublicError(error, "model_output_invalid");
+                }
                 evalStore.finishCall(callId, { output: trimmed });
                 return trimmed;
               } catch (error) {
-                evalStore.finishCall(callId, { error: errorMessage(error) });
-                throw error;
+                evalStore.finishCall(callId, { error: publicErrorMessage(error) });
+                throw toPublicError(error);
               }
             },
           });
@@ -308,7 +314,7 @@ export async function runSuiteEvaluation(
             content: historyMode === "gold" ? turn.referenceAnswer : answer,
           });
         } catch (error) {
-          const errMsg = errorMessage(error);
+          const errMsg = publicErrorMessage(error);
           errorTurns++;
           evalStore.saveEvalPrediction({
             evalRunId,
@@ -334,8 +340,8 @@ export async function runSuiteEvaluation(
 
     evalStore.finishEvalRun(evalRunId, "completed");
   } catch (error) {
-    evalStore.finishEvalRun(evalRunId, "failed", errorMessage(error));
-    throw error;
+    evalStore.finishEvalRun(evalRunId, "failed", publicErrorMessage(error));
+    throw toPublicError(error);
   }
 
   const totalCallsRow = evalStore.db

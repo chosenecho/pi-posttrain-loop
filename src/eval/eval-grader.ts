@@ -5,7 +5,8 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../retry.js";
-import { errorMessage, nonEmpty, validateConcurrency } from "../schema.js";
+import { nonEmpty, validateConcurrency } from "../schema.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import type { RoleRunner } from "../types.js";
 import {
@@ -228,7 +229,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
         maxAttempts: callMaxAttempts,
         delayMs: callRetryDelayMs,
         onRetry: (attempt: number, max: number, error: unknown) => {
-          options.onProgress?.(`${tag} 重试 ${attempt}/${max}：${errorMessage(error)}`);
+          options.onProgress?.(`${tag} 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
         },
         run: async () => {
           const callId = evalStore.startCall({
@@ -248,12 +249,17 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
               systemPrompt: graderPrompt,
               input: gradeInput,
             });
-            const judgement = parseGradeResult(raw, normalized.rubric);
+            let judgement: ReturnType<typeof parseGradeResult>;
+            try {
+              judgement = parseGradeResult(raw, normalized.rubric);
+            } catch (error) {
+              throw toPublicError(error, "model_output_invalid");
+            }
             evalStore.finishCall(callId, { output: raw });
             return { callId, judgement };
           } catch (error) {
-            evalStore.finishCall(callId, { error: errorMessage(error) });
-            throw error;
+            evalStore.finishCall(callId, { error: publicErrorMessage(error) });
+            throw toPublicError(error);
           }
         },
       });
@@ -284,7 +290,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
       options.onProgress?.(`${tag} -> score=${scored.finalScore}, behaviorOk=${scored.behaviorOk}`);
     } catch (error) {
       errors++;
-      options.onProgress?.(`${tag} 批卷失败：${errorMessage(error)}`);
+      options.onProgress?.(`${tag} 批卷失败：${publicErrorMessage(error)}`);
     }
   });
 

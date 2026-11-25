@@ -3,7 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { createPiRunner, readPiConfig } from "./pi-runner.js";
+import { createPiRunner, readEvalPiConfig, readPiConfig } from "./pi-runner.js";
 import {
   DEFAULT_CALL_MAX_ATTEMPTS,
   DEFAULT_CALL_RETRY_DELAY_MS,
@@ -77,7 +77,7 @@ const HELP = `独立评测库与对抗测试集生产 CLI（Probe Pipeline）
   npm run eval -- calibrate --run all --concurrency 8 --out output/eval/calibration-report.md
   npm run eval -- calibrate --run all --report-only --out output/eval/calibration-report.md
   npm run eval -- freeze --name adv-v1 --max-easy-ratio 0.2 --export output/eval/adv-v1.jsonl --manifest-out output/eval/adv-v1.manifest.json
-  npm run eval -- run --suite adv-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --history-mode gold
+  npm run eval -- run --suite adv-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --history-mode gold
   npm run eval -- grade --run latest --grader-model <独立裁判模型> --concurrency 8
   npm run eval -- report --suites indist-v1,adv-v1 --candidates base,sft-v1 --out output/eval/report.md
   npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-v1 --out output/eval/compare-base-vs-sft.md
@@ -481,7 +481,7 @@ async function main(): Promise<void> {
     if (!bundle.allReady) {
       throw new Error(`存在未就绪的 eval Skill（profile=${profile}），无法启动正式评测考题构建`);
     }
-    const config = readPiConfig();
+    const config = readEvalPiConfig();
     const runRole = createPiRunner(config);
 
     const bareCheckEnabled = !values["no-bare-check"];
@@ -636,10 +636,11 @@ async function main(): Promise<void> {
     }
 
     const baseConfig = readPiConfig();
+    const graderConfig = readEvalPiConfig();
     const bareModelId = values.model?.trim() || baseConfig.modelId;
-    const graderModelId = values["grader-model"]?.trim() || process.env.EVAL_LLM_MODEL?.trim() || baseConfig.modelId;
+    const graderModelId = values["grader-model"]?.trim() || graderConfig.modelId;
     const runBareModel = createPiRunner({ ...baseConfig, modelId: bareModelId });
-    const runGrader = createPiRunner({ ...baseConfig, modelId: graderModelId });
+    const runGrader = createPiRunner({ ...graderConfig, modelId: graderModelId });
 
     const store = new EvalStore(evalDbPath);
     try {
@@ -895,12 +896,7 @@ async function main(): Promise<void> {
     const callRetryDelayMs = validateCallRetryDelayMs(parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms") ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
     const bundle = await loadCalibrationPromptBundle();
-    const baseConfig = readPiConfig({
-      ...process.env,
-      ...(process.env.EVAL_LLM_BASE_URL ? { LLM_BASE_URL: process.env.EVAL_LLM_BASE_URL } : {}),
-      ...(process.env.EVAL_LLM_API_KEY ? { LLM_API_KEY: process.env.EVAL_LLM_API_KEY } : {}),
-      ...(process.env.EVAL_LLM_MODEL ? { LLM_MODEL: process.env.EVAL_LLM_MODEL } : {}),
-    });
+    const baseConfig = readEvalPiConfig();
     const graderModelId = values["grader-model"]?.trim() || baseConfig.modelId;
     const runGrader = createPiRunner({ ...baseConfig, modelId: graderModelId });
 

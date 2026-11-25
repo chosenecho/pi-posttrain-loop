@@ -1,6 +1,8 @@
 import http from "node:http";
 import https from "node:https";
 import { nonEmpty } from "../schema.js";
+import { PublicError, toPublicError } from "../shared/public-error.js";
+import { resolveApiEndpoint } from "../shared/api-config.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -27,23 +29,6 @@ export interface OpenAiCandidateConfig {
   fetchFn?: typeof fetch;
 }
 
-function normalizeBaseUrl(raw: string | undefined, label: string): string {
-  const trimmed = nonEmpty(raw, label).replace(/\/+$/, "");
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error(`${label} 必须是有效的 HTTP(S) API 根地址`);
-  }
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
-    throw new Error(`${label} 必须使用 HTTP(S) API 根地址，认证信息请通过 API Key 传入`);
-  }
-  if (/\/chat\/completions$/.test(url.pathname)) {
-    throw new Error(`${label} 请填 API 根地址（如 http://127.0.0.1:8000/v1），不要附带 /chat/completions`);
-  }
-  return trimmed;
-}
-
 export function readCandidateConfig(
   overrides: {
     baseUrl?: string;
@@ -56,18 +41,18 @@ export function readCandidateConfig(
   } = {},
   env: NodeJS.ProcessEnv = process.env,
 ): OpenAiCandidateConfig {
-  const baseUrl = normalizeBaseUrl(
-    overrides.baseUrl ?? env.CANDIDATE_LLM_BASE_URL ?? env.LLM_BASE_URL,
-    "候选模型 API 地址（--base-url / CANDIDATE_LLM_BASE_URL / LLM_BASE_URL）",
-  );
+  const { baseUrl, apiKey } = resolveApiEndpoint({
+    baseUrl: overrides.baseUrl ?? env.CANDIDATE_LLM_BASE_URL ?? env.LLM_BASE_URL,
+    apiKey: overrides.apiKey ?? env.CANDIDATE_LLM_API_KEY,
+    fallbacks: [{ baseUrl: env.LLM_BASE_URL, apiKey: env.LLM_API_KEY }],
+    baseUrlLabel: "候选模型 API 地址（--base-url / CANDIDATE_LLM_BASE_URL / LLM_BASE_URL）",
+    apiKeyLabel: "候选模型密钥（--api-key / CANDIDATE_LLM_API_KEY）",
+    allowEmptyKey: true,
+  });
   const modelId = nonEmpty(
     overrides.modelId ?? env.CANDIDATE_LLM_MODEL ?? env.LLM_MODEL,
     "候选模型名称（--model / CANDIDATE_LLM_MODEL / LLM_MODEL）",
   );
-  // Local vLLM / Ollama endpoints often accept any non-empty placeholder key like "EMPTY"
-  const rawKey = overrides.apiKey ?? env.CANDIDATE_LLM_API_KEY ?? env.LLM_API_KEY ?? "";
-  const apiKey = rawKey.trim() || "EMPTY";
-
   const temperature = overrides.temperature ?? 0;
   if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
     throw new Error("--temperature 必须在 [0, 2] 范围内");
@@ -103,21 +88,8 @@ export function stripLeadingThinkBlock(text: string): string {
 
 interface RawHttpResponse {
   status: number;
-  statusText: string;
   contentType: string;
   bodyText: string;
-}
-
-function formatErrorWithCause(error: unknown): string {
-  if (!(error instanceof Error)) return String(error);
-  const cause = (error as Error & { cause?: unknown }).cause;
-  if (!cause) return error.message;
-  if (cause instanceof Error) {
-    const code = (cause as NodeJS.ErrnoException).code;
-    const detail = code ? `${code}: ${cause.message}` : cause.message;
-    return `${error.message} (${detail})`;
-  }
-  return `${error.message} (${String(cause)})`;
 }
 
 /**
@@ -168,7 +140,6 @@ function postJsonViaNodeHttp(
           const contentType = Array.isArray(ctHeader) ? ctHeader.join(", ") : (ctHeader ?? "");
           resolve({
             status: res.statusCode ?? 0,
-            statusText: res.statusMessage ?? "",
             contentType,
             bodyText: Buffer.concat(chunks).toString("utf8"),
           });
@@ -177,7 +148,7 @@ function postJsonViaNodeHttp(
     );
 
     const timer = setTimeout(() => {
-      const err = new Error(`请求超时（${timeoutMs}ms）`);
+      const err = new PublicError("model_timeout");
       req.destroy(err);
       finishError(err);
     }, timeoutMs);
@@ -195,12 +166,8 @@ function postJsonViaNodeHttp(
 export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): CandidateRunner {
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
-  function redact(message: string): string {
-    if (!config.apiKey || config.apiKey === "EMPTY") return message;
-    return message.replaceAll(config.apiKey, "[REDACTED]");
-  }
-
   return async ({ messages, temperature, maxTokens }) => {
+    let requestTimedOut = false;
     try {
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -219,7 +186,10 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
       let rawResponse: RawHttpResponse;
       if (config.fetchFn) {
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(new Error(`请求超时（${config.timeoutMs}ms）`)), config.timeoutMs);
+        const timer = setTimeout(() => {
+          requestTimedOut = true;
+          controller.abort(new PublicError("model_timeout"));
+        }, config.timeoutMs);
         try {
           const response = await config.fetchFn(endpoint, {
             method: "POST",
@@ -229,7 +199,6 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
           });
           rawResponse = {
             status: response.status,
-            statusText: response.statusText,
             contentType: response.headers.get("content-type") ?? "",
             bodyText: await response.text(),
           };
@@ -240,22 +209,21 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
         rawResponse = await postJsonViaNodeHttp(endpoint, headers, body, config.timeoutMs);
       }
 
-      const { status, statusText, contentType, bodyText } = rawResponse;
+      const { status, contentType, bodyText } = rawResponse;
 
       if (status < 200 || status >= 300) {
-        const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 240);
-        throw new Error(`HTTP ${status} ${statusText}: ${snippet || "(empty body)"}`);
+        throw new PublicError("candidate_http_error", { httpStatus: status });
       }
 
       if (contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html/i.test(bodyText)) {
-        throw new Error(`上游返回 HTML 网页而非 API JSON（content-type=${contentType || "unknown"}）`);
+        throw new PublicError("candidate_html_response", { httpStatus: status });
       }
 
       let parsed: unknown;
       try {
         parsed = JSON.parse(bodyText);
       } catch {
-        throw new Error(`候选模型接口返回非合法 JSON：${bodyText.slice(0, 200)}`);
+        throw new PublicError("candidate_invalid_json", { httpStatus: status });
       }
 
       const payload = parsed as {
@@ -266,15 +234,12 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
         }>;
       };
       if (payload.error) {
-        const msg = typeof payload.error === "string"
-          ? payload.error
-          : payload.error.message ?? JSON.stringify(payload.error);
-        throw new Error(`候选模型接口报错：${msg}`);
+        throw new PublicError("candidate_api_error", { httpStatus: status });
       }
 
       const choice = payload.choices?.[0];
       if (!choice) {
-        throw new Error("候选模型接口响应缺少 choices[0]");
+        throw new PublicError("candidate_missing_choice", { httpStatus: status });
       }
       const rawContent = choice.message?.content;
       let text = "";
@@ -288,11 +253,11 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
 
       const cleaned = config.stripThinkTags !== false ? stripLeadingThinkBlock(text) : text.trim();
       if (!cleaned) {
-        throw new Error(`候选模型返回空正文（finish_reason=${String(choice.finish_reason ?? "unknown")}）`);
+        throw new PublicError("candidate_empty_output", { httpStatus: status, stopReason: choice.finish_reason });
       }
       return cleaned;
     } catch (error) {
-      throw new Error(redact(formatErrorWithCause(error)));
+      throw requestTimedOut ? new PublicError("model_timeout") : toPublicError(error, "candidate_request_failed");
     }
   };
 }

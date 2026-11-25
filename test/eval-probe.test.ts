@@ -152,6 +152,60 @@ test("probe-schema uses tolerant parsing (宽进严出) without brittle format r
   assert.equal(gapRubric.forbidden.length, 1);
 });
 
+test("probe progress and error fields omit model feedback and schema details while traces retain them", async () => {
+  const bundle = await loadEvalPromptBundle();
+  const marker = "privacy-user@example.invalid fixture-private-token";
+  for (const mode of ["skip", "critic", "bare", "verifier", "parse", "throw"] as const) {
+    const store = new EvalStore(":memory:");
+    try {
+      const { record: source } = store.insertSourceMaterial({
+        videoId: "BV_PRIVACY", videoKey: "BV_PRIVACY", partCount: 1,
+        content: "制度约束影响行动选择，具体结论应依据材料本身。", splitSnapshot: "test",
+      });
+      const progress: string[] = [];
+      const runRole: RoleRunner = async ({ role, input }) => {
+        if (role === "probe_writer") {
+          if (mode === "throw") throw new Error(marker, { cause: new Error(marker) });
+          if (mode === "parse") return marker;
+          if (mode === "skip") return JSON.stringify({ probes: [], skipReason: marker });
+          return JSON.stringify({ probes: [{ probeType: "wild_short", persona: "学生", question: "行动选择受什么影响？", anchor: "制度约束影响行动选择", trap: "泛泛作答" }] });
+        }
+        if (role === "probe_critic") {
+          const reject = mode === "critic" || (mode === "bare" && input.mode === "bare_check");
+          return JSON.stringify({ decision: reject ? "reject" : "accept", issues: reject ? [marker] : [], feedback: reject ? marker : "" });
+        }
+        if (role === "reference") return "制度约束影响行动选择。";
+        if (role === "verifier") return JSON.stringify({ decision: "drop", issues: [marker], feedback: marker });
+        throw new Error(`Unexpected fixture role: ${role}`);
+      };
+      const summary = await runProbeBuild({
+        evalStore: store, sources: [source], prompts: bundle.prompts, skills: bundle.skills,
+        runRole, modelId: "fixture", probesPerVideo: 1, maxAnswerAttempts: 1,
+        callMaxAttempts: 2, callRetryDelayMs: 0, concurrency: 1,
+        ...(mode === "bare" ? { runBareModel: (async () => marker) as RoleRunner, barePrompt: "合成裸答测试", bareModelId: "fixture-bare" } : {}),
+        onProgress: (message) => progress.push(message),
+      });
+      const calls = store.db.prepare("SELECT output_text, error FROM agent_calls").all() as Array<{ output_text: string | null; error: string | null }>;
+      const publicText = JSON.stringify({ progress, errors: calls.map((call) => call.error), probes: store.listProbes({ runId: summary.runId }).map((probe) => probe.rejectReason) });
+      for (const sensitive of [marker, "privacy-user@example.invalid", "fixture-private-token"]) {
+        assert.equal(publicText.includes(sensitive), false, `${mode}: public diagnostics leaked fixture content`);
+      }
+      if (mode !== "throw") assert.ok(calls.some((call) => call.output_text?.includes(marker)), `${mode}: raw trace was lost`);
+      if (mode === "parse") {
+        assert.equal(summary.draftErrors, 1);
+        assert.ok(calls.some((call) => call.error?.includes("model_output_invalid")));
+        assert.match(progress.join("\n"), /call:\d+.*第 1\/2 次/);
+      }
+      if (mode === "throw") assert.equal(summary.draftErrors, 1);
+      if (mode === "skip") assert.equal(summary.skippedVideos, 1);
+      if (mode === "critic" || mode === "bare") assert.equal(summary.statusCounts.rejected, 1);
+      if (mode === "verifier") assert.equal(summary.statusCounts.dropped, 1);
+    } finally {
+      store.close();
+    }
+  }
+});
+
 test("runProbeBuild runs Agent Loop v3 (autonomous planning, skip, semantic dedup, inline blind bare-check feedback, verifier, rubric)", async () => {
   const bundle = await loadEvalPromptBundle();
   const calBundle = await loadCalibrationPromptBundle();

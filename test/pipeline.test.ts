@@ -112,11 +112,11 @@ test("three revise rounds exhaust the default budget without saving a result", a
 });
 
 const failures: Array<{ name: string; outputs: Array<string | Error>; attempts: number; error: RegExp }> = [
-  { name: "malformed review after revision", outputs: ["第一版", revise, "第二版", "not JSON"], attempts: 2, error: /JSON/ },
-  { name: "invalid review structure", outputs: ["错误答案", '{"decision":"pass","issues":["仍有错误"],"feedback":""}'], attempts: 1, error: /issues/ },
-  { name: "answer model failure", outputs: [new Error("answer unavailable")], attempts: 1, error: /answer unavailable/ },
-  { name: "judge model failure", outputs: ["待审答案", new Error("judge unavailable")], attempts: 1, error: /judge unavailable/ },
-  { name: "empty answer", outputs: ["   "], attempts: 1, error: /非空字符串/ },
+  { name: "malformed review after revision", outputs: ["第一版", revise, "第二版", "not JSON"], attempts: 2, error: /model_output_invalid/ },
+  { name: "invalid review structure", outputs: ["错误答案", '{"decision":"pass","issues":["仍有错误"],"feedback":""}'], attempts: 1, error: /model_output_invalid/ },
+  { name: "answer model failure", outputs: [new Error("answer unavailable")], attempts: 1, error: /unexpected_error/ },
+  { name: "judge model failure", outputs: ["待审答案", new Error("judge unavailable")], attempts: 1, error: /unexpected_error/ },
+  { name: "empty answer", outputs: ["   "], attempts: 1, error: /model_output_invalid/ },
 ];
 
 for (const scenario of failures) {

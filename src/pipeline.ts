@@ -2,7 +2,8 @@ import { DataMakerStore, validateMaxTurns } from "./db.js";
 import { runDialogueBatch, type RunDialogueBatchSummary } from "./dialogue-loop.js";
 import { readAnswerStyle, readFollowupSkill, readQuestionSkill } from "./io.js";
 import { answerPrompt, followupPrompt as composeFollowupPrompt, judgePrompt, questionPrompt, readFollowupPrompt, readSystemPrompts } from "./prompts.js";
-import { errorMessage, nonEmpty, parseMaterial, parseQuestions, validateConcurrency, validateMaxAttempts } from "./schema.js";
+import { nonEmpty, parseMaterial, parseQuestions, validateConcurrency, validateMaxAttempts } from "./schema.js";
+import { publicErrorMessage, toPublicError } from "./shared/public-error.js";
 import type { Material, MaterialResult, OutcomeSummary, ResultSample, Review, RoleRunner, Rubric, RunMaterialOptions, Skill, SystemPrompts } from "./types.js";
 
 export interface SkillSnapshot {
@@ -168,7 +169,12 @@ export async function runMaterialsToStore(options: RunMaterialsToStoreOptions): 
           systemPrompt: questioningPrompt,
           input: { material: { id: rawMaterial.id, text: materialRecord.content }, direction },
         });
-        const parsed = parseQuestions(rawOutput);
+        let parsed: string[];
+        try {
+          parsed = parseQuestions(rawOutput);
+        } catch (error) {
+          throw toPublicError(error, "model_output_invalid");
+        }
         store.transaction(() => {
           store.finishModelCall(callId, rawOutput!);
           for (const qText of parsed) {
@@ -181,12 +187,12 @@ export async function runMaterialsToStore(options: RunMaterialsToStoreOptions): 
           }
         });
       } catch (error) {
-        const msg = errorMessage(error);
+        const msg = publicErrorMessage(error);
         store.failModelCall(callId, msg, { outputText: rawOutput ?? null });
         questionErrors++;
         options.onProgress?.(`[${rawMaterial.id}] 出题失败：${msg}`);
         if (options.throwOnQuestionError) {
-          fatalQuestionError = error;
+          fatalQuestionError = toPublicError(error);
           return;
         }
       }
@@ -195,7 +201,7 @@ export async function runMaterialsToStore(options: RunMaterialsToStoreOptions): 
   await Promise.all(questionWorkers);
 
   if (fatalQuestionError !== undefined) {
-    store.finishRun(questionRunId, "error", { error: errorMessage(fatalQuestionError) });
+    store.finishRun(questionRunId, "error", { error: publicErrorMessage(fatalQuestionError) });
     throw fatalQuestionError;
   }
 

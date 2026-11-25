@@ -116,17 +116,74 @@ test("Pi runner applies per-role thinkingLevel overrides and falls back to globa
   assert.deepEqual(seenEfforts, ["high", "high", "low", undefined]);
 });
 
-test("Pi adapter surfaces HTTP errors, redacts project API key, and avoids retries", async (t) => {
+test("public errors discard arbitrary messages, causes and mutated public text", async () => {
+  const { PublicError, publicErrorMessage, toPublicError } = await import("../src/shared/public-error.js");
+  const marker = "privacy-user@example.invalid token-private-fixture";
+  const unknown = Object.assign(new Error(marker, { cause: new Error(marker) }), { status: 503 });
+  assert.equal(publicErrorMessage(unknown), "内部处理失败 [unexpected_error] (HTTP 503)");
+  const safe = toPublicError(unknown, "candidate_request_failed");
+  safe.message = marker;
+  assert.equal(publicErrorMessage(safe), "候选模型请求失败 [candidate_request_failed] (HTTP 503)");
+  assert.equal(new PublicError("candidate_empty_output", { stopReason: marker }).message.includes(marker), false);
+  const throwingStatus = Object.defineProperty({}, "status", { get() { throw new Error(marker); } });
+  assert.equal(publicErrorMessage(throwingStatus), "内部处理失败 [unexpected_error]");
+});
+
+test("Pi adapter uses an explicit EMPTY key without inheriting another credential", async (t) => {
+  let auth: string | undefined;
+  const baseUrl = await localApi(t, (request, response) => {
+    auth = request.headers.authorization;
+    sendText(response, "完成");
+  });
+  const { readEvalPiConfig } = await import("../src/pi-runner.js");
+  const evaluationConfig = readEvalPiConfig({
+    LLM_BASE_URL: "https://primary.example.invalid/v1", LLM_API_KEY: config(baseUrl).apiKey,
+    LLM_MODEL: "local-fixture", EVAL_LLM_BASE_URL: baseUrl, EVAL_LLM_API_KEY: "EMPTY",
+    LLM_MAX_TOKENS: "256", LLM_CONTEXT_WINDOW: "32768", LLM_TIMEOUT_MS: "5000",
+  });
+  assert.equal(evaluationConfig.apiKey, "EMPTY");
+  const runner = createPiRunner(evaluationConfig);
+  assert.equal(await runner({ role: "answer", systemPrompt: "回答", input: {} }), "完成");
+  assert.ok(auth === undefined || auth === "Bearer EMPTY");
+  assert.equal(auth?.includes(config(baseUrl).apiKey) ?? false, false);
+});
+
+test("Pi adapter never forwards inputs or credentials through API redirects", async (t) => {
+  let calls = 0;
+  let redirectedCalls = 0;
+  const baseUrl = await localApi(t, (request, response) => {
+    calls++;
+    if (request.url?.startsWith("/other/")) {
+      redirectedCalls++;
+      sendText(response, "unexpected forwarded input");
+      return;
+    }
+    response.writeHead(307, { Location: "/other/chat/completions", "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "private-redirect-fixture" } }));
+  });
+  await assert.rejects(createPiRunner(config(baseUrl))({ role: "answer", systemPrompt: "fixture", input: { text: "private-input-fixture" } }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!error.message.includes("private-redirect-fixture"));
+    return true;
+  });
+  assert.equal(calls, 1);
+  assert.equal(redirectedCalls, 0);
+});
+
+test("Pi adapter keeps HTTP status but omits provider bodies and credentials without retrying", async (t) => {
   let calls = 0;
   const baseUrl = await localApi(t, (_request, response) => {
     calls++;
     response.writeHead(503, { "Content-Type": "application/json", "Retry-After": "0" });
-    response.end(JSON.stringify({ error: { message: "bad fixture-test-key", type: "invalid_request_error" } }));
+    response.end(JSON.stringify({ error: { message: "bad fixture-test-key privacy-user@example.invalid", type: "invalid_request_error", metadata: { raw: "private-provider-detail" } } }));
   });
   await assert.rejects(createPiRunner(config(baseUrl))({ role: "answer", systemPrompt: "x", input: {} }), (error: unknown) => {
     assert.ok(error instanceof Error);
     assert.ok(!error.message.includes("fixture-test-key"));
-    assert.match(error.message, /REDACTED/);
+    assert.match(error.message, /HTTP 503/);
+    assert.equal(error.message.includes("privacy-user@example.invalid"), false);
+    assert.equal(error.message.includes("private-provider-detail"), false);
+    assert.match(error.message, /model_incomplete|model_request_failed/);
     return true;
   });
   assert.equal(calls, 1);

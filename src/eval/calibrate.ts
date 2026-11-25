@@ -5,7 +5,8 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../retry.js";
-import { errorMessage, nonEmpty, validateConcurrency } from "../schema.js";
+import { nonEmpty, validateConcurrency } from "../schema.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import type { RoleRunner } from "../types.js";
 import {
@@ -155,18 +156,22 @@ export async function runProbeCalibration(options: RunProbeCalibrationOptions): 
             input: params.wireInput,
           });
           lastRawOutput = output;
-          return { output, parsed: params.parse(output) };
+          try {
+            return { output, parsed: params.parse(output) };
+          } catch (error) {
+            throw toPublicError(error, "model_output_invalid");
+          }
         },
         onRetry: (attempt, max, error) => {
-          options.onProgress?.(`${params.tag} ${params.role} 失败（第 ${attempt}/${max} 次），重试：${errorMessage(error)}`);
+          options.onProgress?.(`${params.tag} ${params.role} 失败（第 ${attempt}/${max} 次），重试：${publicErrorMessage(error)}`);
         },
       });
       evalStore.finishCall(callId, { output: result.output });
       return { callId, output: result.output, parsed: result.parsed };
     } catch (error) {
-      const msg = errorMessage(error);
+      const msg = publicErrorMessage(error);
       evalStore.finishCall(callId, { output: lastRawOutput, error: msg });
-      throw new Error(msg);
+      throw toPublicError(error);
     }
   }
 
@@ -300,14 +305,14 @@ export async function runProbeCalibration(options: RunProbeCalibrationOptions): 
         );
       } catch (error) {
         errors++;
-        options.onProgress?.(`${tag} calibration error: ${errorMessage(error)}`);
+        options.onProgress?.(`${tag} calibration error: ${publicErrorMessage(error)}`);
       }
     });
 
     evalStore.finishRun(runId, "completed");
   } catch (error) {
-    evalStore.finishRun(runId, "failed", errorMessage(error));
-    throw error;
+    evalStore.finishRun(runId, "failed", publicErrorMessage(error));
+    throw toPublicError(error);
   }
 
   const totalCallsRow = evalStore.db.prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ?").get(runRef) as { c: number };

@@ -27,8 +27,10 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "./retry.js";
-import { errorMessage, nonEmpty, parseReview, validateConcurrency } from "./schema.js";
+import { nonEmpty, parseReview, validateConcurrency } from "./schema.js";
+import { publicErrorMessage, toPublicError } from "./shared/public-error.js";
 import type { Review, RoleRunner, Skill } from "./types.js";
+import { resolveApiEndpoint } from "./shared/api-config.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 export const DEFAULT_REASONING_WRITER_SKILL = join(ROOT, "skills/reasoning-writer/SKILL.md");
@@ -110,11 +112,18 @@ export function readReasoningPiConfigs(env: NodeJS.ProcessEnv = process.env): {
   writer: PiConfig;
   judge: PiConfig;
 } {
+  const writerEndpoint = resolveApiEndpoint({
+    baseUrl: env.REASONING_BASE_URL?.trim() || env.LLM_BASE_URL,
+    apiKey: env.REASONING_API_KEY,
+    fallbacks: [{ baseUrl: env.LLM_BASE_URL, apiKey: env.LLM_API_KEY }],
+    baseUrlLabel: "REASONING_BASE_URL / LLM_BASE_URL",
+    apiKeyLabel: "REASONING_API_KEY",
+  });
   const baseEnv: NodeJS.ProcessEnv = {
     ...env,
-    LLM_BASE_URL: env.REASONING_BASE_URL?.trim() || env.LLM_BASE_URL,
+    LLM_BASE_URL: writerEndpoint.baseUrl,
     LLM_MODEL: env.REASONING_MODEL?.trim() || env.LLM_MODEL,
-    LLM_API_KEY: env.REASONING_API_KEY?.trim() || env.LLM_API_KEY,
+    LLM_API_KEY: writerEndpoint.apiKey,
   };
   const writerBase = readPiConfig(baseEnv);
   const writerThinking = parseOptionalThinkingLevel(env.REASONING_THINKING_LEVEL, "REASONING_THINKING_LEVEL")
@@ -130,11 +139,21 @@ export function readReasoningPiConfigs(env: NodeJS.ProcessEnv = process.env): {
     roleThinkingLevels: { answer: writerThinking },
   };
 
+  const judgeEndpoint = resolveApiEndpoint({
+    baseUrl: env.REASONING_JUDGE_BASE_URL?.trim() || env.LLM_BASE_URL?.trim() || writerEndpoint.baseUrl,
+    apiKey: env.REASONING_JUDGE_API_KEY,
+    fallbacks: [
+      { baseUrl: env.LLM_BASE_URL, apiKey: env.LLM_API_KEY },
+      writerEndpoint,
+    ],
+    baseUrlLabel: "REASONING_JUDGE_BASE_URL / LLM_BASE_URL / REASONING_BASE_URL",
+    apiKeyLabel: "REASONING_JUDGE_API_KEY",
+  });
   const judgeEnv: NodeJS.ProcessEnv = {
     ...env,
-    LLM_BASE_URL: env.REASONING_JUDGE_BASE_URL?.trim() || env.LLM_BASE_URL || env.REASONING_BASE_URL,
+    LLM_BASE_URL: judgeEndpoint.baseUrl,
     LLM_MODEL: env.REASONING_JUDGE_MODEL?.trim() || env.LLM_MODEL || env.REASONING_MODEL,
-    LLM_API_KEY: env.REASONING_JUDGE_API_KEY?.trim() || env.LLM_API_KEY || env.REASONING_API_KEY,
+    LLM_API_KEY: judgeEndpoint.apiKey,
   };
   const judgeBase = readPiConfig(judgeEnv);
   const judgeThinking = parseOptionalThinkingLevel(env.REASONING_JUDGE_THINKING_LEVEL, "REASONING_JUDGE_THINKING_LEVEL")
@@ -451,7 +470,11 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
               systemPrompt: composedJudgePrompt,
               input: judgeInput,
             });
-            return parseReview(rawJudge);
+            try {
+              return parseReview(rawJudge);
+            } catch (error) {
+              throw toPublicError(error, "model_output_invalid");
+            }
           },
         });
         lastLlmReview = review;
@@ -510,7 +533,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
       completedCount++;
       options.onProgress?.({ completed: completedCount, total: options.candidates.length, turn, decision: finalDecision });
     } catch (error) {
-      const msg = errorMessage(error);
+      const msg = publicErrorMessage(error);
       options.store.completeTrace(traceId, {
         status: "error",
         decision: null,
@@ -547,8 +570,8 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
     await Promise.all(workers);
     options.store.finishReasoningRun(reasoningRunId, "completed");
   } catch (error) {
-    options.store.finishReasoningRun(reasoningRunId, "error", errorMessage(error));
-    throw error;
+    options.store.finishReasoningRun(reasoningRunId, "error", publicErrorMessage(error));
+    throw toPublicError(error);
   }
 
   return {

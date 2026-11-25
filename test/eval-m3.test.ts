@@ -457,6 +457,36 @@ test("OpenAI-compatible candidate client strips think blocks, rejects HTML, and 
   await assert.rejects(runner({ messages }), /HTML/);
 });
 
+test("candidate errors expose only fixed categories, numeric status and bounded finish reasons", async () => {
+  const marker = "privacy-user@example.invalid fixture-private-token";
+  const cfg = readCandidateConfig({ baseUrl: "http://127.0.0.1:8000/v1", modelId: "fixture", apiKey: "fixture-private-token" }, {});
+  const cases: Array<{ response: () => Response; expected: RegExp }> = [
+    { response: () => new Response(marker, { status: 503, statusText: "private-status-text" }), expected: /candidate_http_error.*HTTP 503/ },
+    { response: () => new Response(marker, { status: 200 }), expected: /candidate_invalid_json.*HTTP 200/ },
+    { response: () => new Response(`<html>${marker}</html>`, { status: 200, headers: { "content-type": "text/html" } }), expected: /candidate_html_response/ },
+    { response: () => new Response(JSON.stringify({ error: { message: marker } })), expected: /candidate_api_error/ },
+    { response: () => new Response(JSON.stringify({ choices: [{ finish_reason: marker, message: { content: "" } }] })), expected: /candidate_empty_output/ },
+  ];
+  for (const item of cases) {
+    const fetchFn = (async () => item.response()) as typeof fetch;
+    const runner = createOpenAiCandidateRunner({ ...cfg, fetchFn });
+    await assert.rejects(runner({ messages: [{ role: "user", content: "问题" }] }), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, item.expected);
+      for (const secret of [marker, "privacy-user@example.invalid", "fixture-private-token", "private-status-text"]) {
+        assert.equal(error.message.includes(secret), false);
+      }
+      return true;
+    });
+  }
+  const fetchFn = (async () => { throw new Error(marker, { cause: new Error(marker) }); }) as typeof fetch;
+  await assert.rejects(createOpenAiCandidateRunner({ ...cfg, fetchFn })({ messages: [] }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "候选模型请求失败 [candidate_request_failed]");
+    return true;
+  });
+});
+
 test("M3 candidate system prompt defaults to prompts/eval/candidate-system.md and preserves prompt across resume", async () => {
   const defaultPrompt = await loadDefaultCandidateSystemPrompt();
   assert.equal(

@@ -17,9 +17,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,10 +49,289 @@ EXPECTED_EVAL_KEYS = (
     "videoKey",
 )
 
-ABS_PATH_LEAK_RE = re.compile(
-    r"(?:[A-Za-z]:\\(?:Users|WorkSpace|Workspace|home)\\|/Users/|/home/)",
-    re.IGNORECASE,
+RELEASE_FILES = (
+    "README.md",
+    "data/cot_sft/train.jsonl",
+    "data/cot_sft/val.jsonl",
+    "data/eval/adv-main-v1.jsonl",
+    "data/eval/trap-main-v1.jsonl",
+    "manifests/cot-sft-manifest.json",
+    "manifests/adv-main-v1.manifest.json",
+    "manifests/trap-main-v1.manifest.json",
+    "manifests/SHA256SUMS.txt",
 )
+CHECKSUM_FILES = RELEASE_FILES[1:8]
+CACHE_NAME = ".ms_upload_cache"
+REVIEWABLE = frozenset({"email", "cn_mobile", "cn_id"})
+ABS_PATH_LEAK_RE = re.compile(
+    r"(?:\b[A-Za-z]:[\\/]|/(?:Users|home)/|\\\\[A-Za-z0-9_.-]+\\)", re.IGNORECASE
+)
+SECRET_PATTERNS = (
+    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")),
+    ("credential", re.compile(
+        r"\b(?:sk-(?:proj-|ant-api\d{2}-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}"
+        r"|github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|LTAI[A-Za-z0-9]{12,}"
+        r"|AIza[A-Za-z0-9_-]{30,}|hf_[A-Za-z0-9]{25,}|xox[baprs]-[A-Za-z0-9-]{20,})\b")),
+    ("credential", re.compile(r"\beyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\b")),
+    ("credential", re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@:]+:[^\s/@]+@")),
+    ("credential", re.compile(
+        r"(?i)(?:api[_-]?key|access[_-]?token|secret|passw[o]rd|authorization)\s*[\"']?\s*[:=]\s*"
+        r"[\"']?(?:Bearer\s+)?[A-Za-z0-9_+./=-]{12,}")),
+)
+EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9])")
+MOBILE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\+86[ -]?)?1[3-9]\d{9}(?![A-Za-z0-9])")
+ID_RE = re.compile(r"(?<![A-Za-z0-9])[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?![A-Za-z0-9])")
+PUBLIC_FIELDS = frozenset({
+    "messages", "role", "content", "difficulty", "expectedBehavior", "itemKey", "persona", "probeType",
+    "rubrics", "videoKey", "outSha256", "valSha256", "sha256", "sourceFiles", "train", "validation",
+    "packagedPath", "description", "source", "path", "metadata", "model", "baseUrl", "apiKey", "email",
+})
+
+
+class ReleaseValidationError(ValueError):
+    """A diagnostic containing only trusted labels, never source values or host paths."""
+
+
+def fail(label: str, category: str, line: int = 1, field: str = "$") -> None:
+    raise ReleaseValidationError(f"{label}: line={line} field={field} type={category}")
+
+
+def is_link(path: Path) -> bool:
+    info = path.lstat()
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+
+def check_path_components(path: Path) -> None:
+    """Check lexical components before resolve() can hide links or junctions."""
+    absolute = path.absolute()
+    for component in reversed((absolute, *absolute.parents)):
+        if component.exists() or component.is_symlink():
+            if is_link(component):
+                fail("release", "linked_path")
+
+
+def release_inventory(root: Path, *, require_complete: bool = True) -> list[Path]:
+    check_path_components(root)
+    if not root.is_dir():
+        if require_complete:
+            fail("release", "missing_directory")
+        return []
+    allowed_dirs = {str(Path(f).parent).replace("\\", "/") for f in RELEASE_FILES}
+    allowed_dirs |= {"data", "manifests", "data/cot_sft", "data/eval"}
+    found: set[str] = set()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        for name in [*dirs, *files]:
+            candidate = parent / name
+            rel = candidate.relative_to(root).as_posix()
+            if is_link(candidate):
+                fail("release", "linked_entry")
+            if candidate.resolve().is_relative_to(root.resolve()) is False:
+                fail("release", "outside_reference")
+            if rel == CACHE_NAME or rel.startswith(CACHE_NAME + "/"):
+                if not candidate.is_dir() and not stat.S_ISREG(candidate.stat().st_mode):
+                    fail("release", "invalid_cache")
+            elif candidate.is_dir():
+                if rel not in allowed_dirs:
+                    fail("release", "unexpected_directory")
+            elif rel in RELEASE_FILES and stat.S_ISREG(candidate.stat().st_mode):
+                if candidate.stat().st_nlink != 1:
+                    fail(rel, "hard_link")
+                found.add(rel)
+            else:
+                # An unexpected filename may itself contain a secret.
+                fail("release", "unexpected_file")
+    if require_complete:
+        for rel in RELEASE_FILES:
+            if rel not in found:
+                fail(rel, "missing_file")
+    return [root / rel for rel in RELEASE_FILES if rel in found]
+
+
+def configured_secrets(args: argparse.Namespace) -> tuple[str, ...]:
+    names = ("LLM_API_KEY", "REASONING_API_KEY", "REASONING_JUDGE_API_KEY", "EVAL_LLM_API_KEY",
+             "CANDIDATE_LLM_API_KEY", "MODELSCOPE_API_TOKEN")
+    values = [os.environ.get(name, "") for name in names]
+    values.append(getattr(args, "token", None) or "")
+    return tuple(value.strip() for value in values
+                 if value.strip() and value.strip() not in {"EMPTY", "replace-with-your-key"})
+
+
+def value_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def load_reviews(review_path: str | None, root: Path) -> set[tuple[str, int, str, str, str]]:
+    if not review_path:
+        return set()
+    path = Path(review_path)
+    try:
+        check_path_components(path)
+        if path.resolve().is_relative_to(root.resolve()):
+            fail("review", "review_must_be_outside_release")
+        obj = parse_json(path.read_text(encoding="utf-8"), "review")
+        if not isinstance(obj, dict) or set(obj) != {"version", "approvals"} or obj["version"] != 1:
+            fail("review", "invalid_format")
+        if not isinstance(obj["approvals"], list):
+            fail("review", "invalid_format")
+        result = set()
+        for item in obj["approvals"]:
+            if not isinstance(item, dict) or set(item) != {"file", "line", "field", "category", "sha256", "reason"}:
+                fail("review", "invalid_approval")
+            if (item["file"] not in RELEASE_FILES or type(item["line"]) is not int or item["line"] < 1
+                    or not isinstance(item["field"], str) or not item["field"].startswith("$")
+                    or item["category"] not in REVIEWABLE
+                    or not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
+                    or not isinstance(item["reason"], str) or len(item["reason"].strip()) < 8):
+                fail("review", "invalid_approval")
+            result.add((item["file"], item["line"], item["field"], item["category"], item["sha256"]))
+        return result
+    except ReleaseValidationError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        fail("review", "invalid_format")
+
+
+def valid_cn_id(value: str) -> bool:
+    import datetime
+    try:
+        datetime.datetime.strptime(value[6:14], "%Y%m%d")
+    except ValueError:
+        return False
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    return "10X98765432"[sum(int(n) * w for n, w in zip(value[:17], weights)) % 11] == value[-1].upper()
+
+
+def scan_string(value: str, label: str, line: int, field: str, reviews: set,
+                secrets: Iterable[str], *, paths: bool = True) -> None:
+    categories = {category for category, pattern in SECRET_PATTERNS if pattern.search(value)}
+    if any(secret in value for secret in secrets):
+        categories.add("configured_secret")
+    if paths and ABS_PATH_LEAK_RE.search(value):
+        categories.add("absolute_path")
+    if EMAIL_RE.search(value):
+        categories.add("email")
+    if MOBILE_RE.search(value):
+        categories.add("cn_mobile")
+    if any(valid_cn_id(m.group()) for m in ID_RE.finditer(value)):
+        categories.add("cn_id")
+    for category in sorted(categories):
+        approval = (label, line, field, category, value_fingerprint(value))
+        if category not in REVIEWABLE or approval not in reviews:
+            fail(label, category, line, field)
+
+
+def scan_value(value: Any, label: str, line: int, field: str, reviews: set,
+               secrets: Iterable[str], *, paths: bool = True, depth: int = 0) -> None:
+    if depth > 64:
+        fail(label, "nesting_limit", line)
+    if isinstance(value, str):
+        scan_string(value, label, line, field, reviews, secrets, paths=paths)
+    elif isinstance(value, int) and not isinstance(value, bool):
+        scan_string(str(value), label, line, field, reviews, secrets, paths=paths)
+    elif isinstance(value, float) and value.is_integer():
+        # JSON integer-valued literals are parsed exactly below. This branch also
+        # covers finite integral floats passed by in-process callers.
+        scan_string(str(int(value)), label, line, field, reviews, secrets, paths=paths)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            scan_value(child, label, line, f"{field}[{index}]", reviews, secrets, paths=paths, depth=depth + 1)
+    elif isinstance(value, dict):
+        for index, (key, child) in enumerate(value.items()):
+            # Scan keys too, but never echo arbitrary keys in diagnostic field paths.
+            scan_string(key, label, line, f"{field}[key:{index}]", reviews, secrets, paths=paths)
+            if (re.fullmatch(r"(?i)(?:.*api.?key|access.?token|refresh.?token|token|(?:client.?)?secret|passw[o]rd|authorization|cookie)", key)
+                    and child is not None and not isinstance(child, bool)):
+                present = (bool(child.strip()) and child.strip() not in {"EMPTY", "replace-with-your-key"}
+                           if isinstance(child, str) else isinstance(child, (int, float)) or bool(child))
+                if present:
+                    fail(label, "credential_field", line, f"{field}[value:{index}]")
+            safe_key = key if key in PUBLIC_FIELDS else "key:" + value_fingerprint(key)[:12]
+            scan_value(child, label, line, f"{field}.{safe_key}", reviews, secrets, paths=paths, depth=depth + 1)
+
+
+def parse_json(text: str, label: str, line: int = 1) -> Any:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                fail(label, "duplicate_json_key", line)
+            result[key] = value
+        return result
+    def exact_number(raw):
+        # Preserve numeric identities written as 110...010.0 or 1.10...e17;
+        # decoding through binary float first would lose their check digit.
+        number = Decimal(raw)
+        if number == number.to_integral_value():
+            if number and number.adjusted() >= 1024:
+                fail(label, "number_limit", line)
+            return int(number)
+        return float(raw)
+    try:
+        return json.loads(text, object_pairs_hook=unique_object, parse_float=exact_number)
+    except ReleaseValidationError:
+        raise
+    except (ValueError, RecursionError):
+        fail(label, "invalid_json", line)
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = parse_json(path.read_text(encoding="utf-8"), label)
+        if not isinstance(value, dict):
+            fail(label, "invalid_json_object")
+        return value
+    except ReleaseValidationError:
+        raise
+    except (OSError, ValueError, RecursionError):
+        fail(label, "invalid_json")
+
+
+def validate_release(root: Path, *, review_path: str | None = None,
+                     secrets: Iterable[str] = ()) -> list[Path]:
+    """Shared prepare/upload gate. Reads only; all diagnostics use fixed file labels."""
+    try:
+        files = release_inventory(root)
+        reviews = load_reviews(review_path, root)
+        for path in files:
+            label = path.relative_to(root).as_posix()
+            if path.suffix == ".json":
+                scan_value(read_json(path, label), label, 1, "$", reviews, secrets)
+            elif path.suffix == ".jsonl":
+                with path.open("r", encoding="utf-8") as stream:
+                    for line, text in enumerate(stream, 1):
+                        value = parse_json(text, label, line)
+                        scan_value(value, label, line, "$", reviews, secrets)
+                validate_jsonl(path, expected_keys=EXPECTED_COT_KEYS if "cot_sft/" in label else EXPECTED_EVAL_KEYS,
+                               require_think="cot_sft/" in label, label=label)
+            else:
+                for line, text in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                    scan_string(text, label, line, "$", reviews, secrets)
+
+        manifests = [("manifests/cot-sft-manifest.json", "outSha256", "data/cot_sft/train.jsonl"),
+                     ("manifests/cot-sft-manifest.json", "valSha256", "data/cot_sft/val.jsonl"),
+                     ("manifests/adv-main-v1.manifest.json", "sha256", "data/eval/adv-main-v1.jsonl"),
+                     ("manifests/trap-main-v1.manifest.json", "sha256", "data/eval/trap-main-v1.jsonl")]
+        for manifest, key, data in manifests:
+            expected = read_json(root / manifest, manifest).get(key)
+            if expected != sha256_file(root / data):
+                fail(manifest, "manifest_checksum", field=f"$.{key}")
+        sums: dict[str, str] = {}
+        for line in (root / RELEASE_FILES[-1]).read_text(encoding="utf-8").splitlines():
+            match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+            if not match or match[2] not in CHECKSUM_FILES or match[2] in sums:
+                fail(RELEASE_FILES[-1], "invalid_checksums")
+            sums[match[2]] = match[1]
+        if set(sums) != set(CHECKSUM_FILES):
+            fail(RELEASE_FILES[-1], "incomplete_checksums")
+        for label, expected in sums.items():
+            if sha256_file(root / label) != expected:
+                fail(label, "checksum_mismatch")
+        return files
+    except ReleaseValidationError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        fail("release", "unreadable_or_invalid_content")
 
 
 def sha256_file(path: Path) -> str:
@@ -73,68 +355,47 @@ def validate_jsonl(
     *,
     expected_keys: tuple[str, ...],
     require_think: bool = False,
+    label: str = "source.jsonl",
 ) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Source file not found: {path}")
-
     line_count = 0
     turn_dist: dict[int, int] = {}
     asst_lens: list[int] = []
-
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, raw_line in enumerate(f, start=1):
-            line = raw_line.strip()
-            if not line:
-                raise ValueError(f"{path.name}: empty line at line {line_no}")
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path.name}: invalid JSON at line {line_no}: {exc}") from exc
-
-            if not isinstance(obj, dict):
-                raise ValueError(f"{path.name}: line {line_no} is not a JSON object")
-
-            actual_keys = tuple(sorted(obj.keys()))
-            if actual_keys != expected_keys:
-                raise ValueError(
-                    f"{path.name}: schema mismatch at line {line_no}: "
-                    f"expected {expected_keys}, got {actual_keys}"
-                )
-
-            messages = obj.get("messages")
-            if not isinstance(messages, list) or len(messages) < 2:
-                raise ValueError(f"{path.name}: invalid messages at line {line_no}")
-
-            turn_dist[len(messages)] = turn_dist.get(len(messages), 0) + 1
-            last_msg = messages[-1]
-            if last_msg.get("role") != "assistant" or not isinstance(last_msg.get("content"), str):
-                raise ValueError(f"{path.name}: last message is not assistant string at line {line_no}")
-
-            content = last_msg["content"]
-            asst_lens.append(len(content))
-            if require_think:
-                if "<think>" not in content or "</think>" not in content:
-                    raise ValueError(
-                        f"{path.name}: missing <think>...</think> in assistant reply at line {line_no}"
-                    )
-            line_count += 1
-
-    if line_count == 0:
-        raise ValueError(f"{path.name}: file has 0 records")
-
-    asst_lens.sort()
-    return {
-        "lines": line_count,
-        "bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
-        "msg_len_dist": dict(sorted(turn_dist.items())),
-        "last_asst_chars": {
-            "min": asst_lens[0],
-            "p50": asst_lens[len(asst_lens) // 2],
-            "p95": asst_lens[int(len(asst_lens) * 0.95)],
-            "max": asst_lens[-1],
-        },
-    }
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line_no, raw_line in enumerate(f, start=1):
+                if not raw_line.strip():
+                    fail(label, "empty_line", line_no)
+                obj = parse_json(raw_line, label, line_no)
+                if not isinstance(obj, dict) or tuple(sorted(obj)) != expected_keys:
+                    fail(label, "schema_mismatch", line_no)
+                messages = obj.get("messages")
+                if not isinstance(messages, list) or len(messages) < 2:
+                    fail(label, "invalid_messages", line_no)
+                for message in messages:
+                    if (not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant"}
+                            or not isinstance(message.get("content"), str)):
+                        fail(label, "invalid_message", line_no)
+                if messages[-1]["role"] != "assistant":
+                    fail(label, "invalid_last_message", line_no)
+                content = messages[-1]["content"]
+                if require_think and ("<think>" not in content or "</think>" not in content):
+                    fail(label, "missing_think", line_no)
+                line_count += 1
+                turn_dist[len(messages)] = turn_dist.get(len(messages), 0) + 1
+                asst_lens.append(len(content))
+        if not line_count:
+            fail(label, "empty_file")
+        asst_lens.sort()
+        return {
+            "lines": line_count, "bytes": path.stat().st_size, "sha256": sha256_file(path),
+            "msg_len_dist": dict(sorted(turn_dist.items())),
+            "last_asst_chars": {"min": asst_lens[0], "p50": asst_lens[len(asst_lens) // 2],
+                               "p95": asst_lens[int(len(asst_lens) * 0.95)], "max": asst_lens[-1]},
+        }
+    except ReleaseValidationError:
+        raise
+    except (OSError, UnicodeError):
+        fail(label, "unreadable_content")
 
 
 def sanitize_value(value: Any, path_replacements: dict[str, str]) -> Any:
@@ -385,7 +646,10 @@ swift sft \\
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    release_dir = Path(args.release_dir).resolve()
+    release_dir = Path(args.release_dir).absolute()
+    release_inventory(release_dir, require_complete=False)
+    secrets = configured_secrets(args)
+    reviews = load_reviews(getattr(args, "privacy_review", None), release_dir)
     data_cot_dir = release_dir / "data" / "cot_sft"
     data_eval_dir = release_dir / "data" / "eval"
     manifests_dir = release_dir / "manifests"
@@ -416,9 +680,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ),
     }
 
-    cot_manifest_raw = json.loads(sources["cot_manifest"].read_text(encoding="utf-8"))
-    adv_manifest_raw = json.loads(sources["eval_adv_manifest"].read_text(encoding="utf-8"))
-    trap_manifest_raw = json.loads(sources["eval_trap_manifest"].read_text(encoding="utf-8"))
+    cot_manifest_raw = read_json(sources["cot_manifest"], "manifests/cot-sft-manifest.json")
+    adv_manifest_raw = read_json(sources["eval_adv_manifest"], "manifests/adv-main-v1.manifest.json")
+    trap_manifest_raw = read_json(sources["eval_trap_manifest"], "manifests/trap-main-v1.manifest.json")
+    # Path normalization is limited to metadata. Secrets/PII must never disappear through it.
+    for label, payload in (("manifests/cot-sft-manifest.json", cot_manifest_raw),
+                           ("manifests/adv-main-v1.manifest.json", adv_manifest_raw),
+                           ("manifests/trap-main-v1.manifest.json", trap_manifest_raw)):
+        scan_value(payload, label, 1, "$", reviews, secrets, paths=False)
 
     # Verify SHA-256 matches source manifests
     checks = [
@@ -428,13 +697,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ("eval_trap", stats["eval_trap"]["sha256"], trap_manifest_raw.get("sha256")),
     ]
     for label, actual_sha, expected_sha in checks:
-        if expected_sha and actual_sha != expected_sha:
-            raise ValueError(
-                f"SHA-256 mismatch for {label}: actual={actual_sha}, manifest={expected_sha}"
-            )
+        if actual_sha != expected_sha:
+            fail("source-manifest", "checksum_mismatch")
     print("  All 4 JSONL files passed schema, <think>, and manifest SHA-256 checks.")
 
-    print(f"[2/5] Assembling release directory: {release_dir}")
+    print("[2/5] Assembling release directory...")
     data_cot_dir.mkdir(parents=True, exist_ok=True)
     data_eval_dir.mkdir(parents=True, exist_ok=True)
     manifests_dir.mkdir(parents=True, exist_ok=True)
@@ -447,7 +714,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     ]
     for src, dst in copy_plan:
         shutil.copy2(src, dst)
-        print(f"  Copied {src.name} -> {dst.relative_to(release_dir)} ({format_size(dst.stat().st_size)})")
+        print(f"  Copied {dst.relative_to(release_dir).as_posix()} ({format_size(dst.stat().st_size)})")
 
     print("[3/5] Sanitizing and writing manifests...")
     replacements = {
@@ -458,8 +725,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     cot_manifest = sanitize_value(cot_manifest_raw, replacements)
     cot_manifest["sourceFiles"] = {
-        "train": sources["cot_train"].name,
-        "validation": sources["cot_val"].name,
+        "train": "data/cot_sft/train.jsonl",
+        "validation": "data/cot_sft/val.jsonl",
     }
     adv_manifest = sanitize_value(adv_manifest_raw, replacements)
     adv_manifest["packagedPath"] = "data/eval/adv-main-v1.jsonl"
@@ -505,116 +772,64 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         readme_path.write_text(readme_text, encoding="utf-8")
 
     print("[5/5] Running final release hygiene checks...")
-    leaks: list[str] = []
-    for p in [readme_path, *(d for d, _ in manifest_outputs), manifests_dir / "SHA256SUMS.txt"]:
-        txt = p.read_text(encoding="utf-8")
-        if ABS_PATH_LEAK_RE.search(txt):
-            leaks.append(p.relative_to(release_dir).as_posix())
-    if leaks:
-        raise RuntimeError(f"Detected local absolute path leak in: {leaks}")
-
-    total_bytes = sum(p.stat().st_size for p in release_dir.rglob("*") if p.is_file())
-    print(f"Release package ready at: {release_dir}")
+    files = validate_release(release_dir, review_path=getattr(args, "privacy_review", None), secrets=secrets)
+    total_bytes = sum(p.stat().st_size for p in files)
+    print("Release package ready.")
     print(f"Total size: {format_size(total_bytes)}")
     return 0
 
 
 def cmd_upload(args: argparse.Namespace) -> int:
-    release_dir = Path(args.release_dir).resolve()
-    if not release_dir.is_dir():
-        raise FileNotFoundError(
-            f"Release directory not found: {release_dir}. Run 'prepare' first."
-        )
-
+    release_dir = Path(args.release_dir).absolute()
+    secrets = configured_secrets(args)
+    review_path = getattr(args, "privacy_review", None)
+    files = validate_release(release_dir, review_path=review_path, secrets=secrets)
     repo_id = args.repo_id.strip()
-    if "/" not in repo_id or len(repo_id.split("/")) != 2 or not all(repo_id.split("/")):
-        raise ValueError(f"Invalid --repo-id '{repo_id}'. Expected format: <namespace>/<dataset-name>")
-
-    required_rel = [
-        "README.md",
-        "data/cot_sft/train.jsonl",
-        "data/cot_sft/val.jsonl",
-        "data/eval/adv-main-v1.jsonl",
-        "data/eval/trap-main-v1.jsonl",
-        "manifests/cot-sft-manifest.json",
-        "manifests/adv-main-v1.manifest.json",
-        "manifests/trap-main-v1.manifest.json",
-        "manifests/SHA256SUMS.txt",
-    ]
-    missing = [r for r in required_rel if not (release_dir / r).is_file()]
-    if missing:
-        raise FileNotFoundError(f"Release directory is incomplete; missing: {missing}")
-
-    # Optionally patch README placeholder repo_id before uploading
-    readme_path = release_dir / "README.md"
-    readme_text = readme_path.read_text(encoding="utf-8")
-    if "<your-namespace>/<dataset-name>" in readme_text:
-        if args.dry_run:
-            print(f"[dry-run] Note: README.md still contains '<your-namespace>/<dataset-name>'; "
-                  f"will be replaced with '{repo_id}' on upload.")
-        else:
-            readme_path.write_text(
-                readme_text.replace("<your-namespace>/<dataset-name>", repo_id),
-                encoding="utf-8",
-            )
-            print(f"Updated README.md dataset ID placeholder -> {repo_id}")
-
-    files = sorted(
-        p for p in release_dir.rglob("*")
-        if p.is_file() and ".ms_upload_cache" not in p.parts
-    )
-    total_bytes = sum(p.stat().st_size for p in files)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_id):
+        fail("upload", "invalid_repository_id")
+    for key in ("repo_id", "license", "chinese_name", "description", "commit_message", "revision"):
+        scan_string(str(getattr(args, key, "")), "upload", 1, "$", set(), secrets)
 
     print("=== ModelScope Upload Plan ===")
-    print(f"  Repo ID    : {repo_id} (repo_type=dataset)")
-    print(f"  Visibility : {args.visibility}")
-    print(f"  License    : {args.license}")
-    print(f"  Create repo: {args.create}")
-    print(f"  Source dir : {release_dir}")
-    print(f"  Files ({len(files)}, total {format_size(total_bytes)}):")
-    for f in files:
-        print(f"    - {f.relative_to(release_dir).as_posix()} ({format_size(f.stat().st_size)})")
-
+    print(f"  Files ({len(files)}, total {format_size(sum(p.stat().st_size for p in files))}):")
+    for path in files:
+        print(f"    - {path.relative_to(release_dir).as_posix()}")
     if args.dry_run:
-        print("\n[dry-run] Validation passed. No network requests were made.")
+        print("[dry-run] Validation passed. No network requests or release writes were made.")
         return 0
 
-    token = args.token or os.environ.get("MODELSCOPE_API_TOKEN")
-    from modelscope_hub.api import HubApi
-    from modelscope_hub.errors import AlreadyExistsError
+    # The SDK receives only a private copy of the nine validated files. Its recursive
+    # traversal can never reach source-directory extras, links, or the local cache.
+    with tempfile.TemporaryDirectory(prefix="modelscope-release-") as temporary:
+        snapshot = Path(temporary) / "release"
+        for rel in RELEASE_FILES:
+            destination = snapshot / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((release_dir / rel).read_bytes())
+        readme = snapshot / "README.md"
+        text = readme.read_text(encoding="utf-8")
+        readme.write_text(text.replace("<your-namespace>/<dataset-name>", repo_id), encoding="utf-8")
+        validate_release(snapshot, review_path=review_path, secrets=secrets)
 
-    api = HubApi(token=token)
-    if not token and not api._config.token:
-        raise RuntimeError(
-            "No ModelScope token found. Set MODELSCOPE_API_TOKEN, pass --token, "
-            "or run 'modelscope login --token <YOUR_TOKEN>' first."
+        token = args.token or os.environ.get("MODELSCOPE_API_TOKEN")
+        from modelscope_hub.api import HubApi
+        from modelscope_hub.errors import AlreadyExistsError
+
+        api = HubApi(token=token)
+        if not token and not api._config.token:
+            fail("upload", "missing_token")
+        if args.create:
+            try:
+                api.create_repo(repo_id=repo_id, repo_type="dataset", visibility=args.visibility,
+                                license=args.license, chinese_name=args.chinese_name, description=args.description)
+            except AlreadyExistsError:
+                pass
+        api.upload_folder(
+            repo_id=repo_id, repo_type="dataset", folder_path=snapshot,
+            commit_message=args.commit_message, revision=args.revision,
+            ignore_patterns=[CACHE_NAME, CACHE_NAME + "/*", CACHE_NAME + "/**"],
         )
-
-    if args.create:
-        print(f"\nCreating dataset repository '{repo_id}' (visibility={args.visibility})...")
-        try:
-            api.create_repo(
-                repo_id=repo_id,
-                repo_type="dataset",
-                visibility=args.visibility,
-                license=args.license,
-                chinese_name=args.chinese_name,
-                description=args.description,
-            )
-            print("  Repository created.")
-        except AlreadyExistsError:
-            print("  Repository already exists; continuing with upload.")
-
-    print(f"\nUploading folder to ModelScope dataset '{repo_id}'...")
-    api.upload_folder(
-        repo_id=repo_id,
-        repo_type="dataset",
-        folder_path=release_dir,
-        commit_message=args.commit_message,
-        ignore_patterns=[".ms_upload_cache/*", ".ms_upload_cache/**", "*.tmp", ".DS_Store", "Thumbs.db"],
-        revision=args.revision,
-    )
-    print(f"\nUpload complete! View dataset at: https://modelscope.cn/datasets/{repo_id}")
+    print("Upload complete.")
     return 0
 
 
@@ -628,6 +843,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_prep.add_argument("--release-dir", default=str(DEFAULT_RELEASE_DIR))
     p_prep.add_argument("--repo-id", default="", help="Optional namespace/dataset-name to embed in README examples")
     p_prep.add_argument("--keep-readme", action="store_true", help="Do not overwrite an existing README.md")
+    p_prep.add_argument("--privacy-review", help="External JSON v1 approvals: file/line/field/category/sha256/reason; PII only")
     p_prep.add_argument("--cot-train", default=str(DEFAULT_SOURCES["cot_train"]))
     p_prep.add_argument("--cot-val", default=str(DEFAULT_SOURCES["cot_val"]))
     p_prep.add_argument("--cot-manifest", default=str(DEFAULT_SOURCES["cot_manifest"]))
@@ -652,6 +868,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_up.add_argument("--commit-message", default="Upload CoT SFT (train/val) and frozen eval suites (adv-main-v1, trap-main-v1)")
     p_up.add_argument("--token", default=None, help="ModelScope Access Token (prefer MODELSCOPE_API_TOKEN env var)")
     p_up.add_argument("--dry-run", action="store_true", help="Verify package and print upload plan without network calls")
+    p_up.add_argument("--privacy-review", help="External JSON v1 approvals: file/line/field/category/sha256/reason; PII only")
     p_up.set_defaults(func=cmd_upload)
 
     return parser
@@ -660,7 +877,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ReleaseValidationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except Exception:
+        # Parser/OS/SDK exception messages may contain response bodies, paths or keys.
+        print("publish: type=operation_failed", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

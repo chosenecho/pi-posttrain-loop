@@ -6,7 +6,6 @@ import {
   validateCallRetryDelayMs,
 } from "./retry.js";
 import {
-  errorMessage,
   nonEmpty,
   parseEvalRubric,
   parseFollowup,
@@ -16,6 +15,7 @@ import {
   validateSplit,
 } from "./schema.js";
 import type { DatasetSplit, DialogueRole, RoleRunner } from "./types.js";
+import { publicErrorMessage, toPublicError } from "./shared/public-error.js";
 
 export interface LoadedQuestion {
   id: number;
@@ -259,24 +259,28 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             }),
           );
           lastRawOutput = output;
-          const parsed = params.parse(output);
-          return { callId, output, parsed };
+          try {
+            const parsed = params.parse(output);
+            return { callId, output, parsed };
+          } catch (error) {
+            throw toPublicError(error, "model_output_invalid");
+          }
         },
         onRetry: (attempt, max, error) => {
           const delayText = callRetryDelayMs % 1000 === 0
             ? `${callRetryDelayMs / 1000}s`
             : `${callRetryDelayMs}ms`;
           options.onProgress?.(
-            `${params.progressPrefix} ${params.role} 调用失败（第 ${attempt}/${max} 次），${delayText} 后重试：${errorMessage(error)}`,
+            `${params.progressPrefix} ${params.role} 调用失败（第 ${attempt}/${max} 次），${delayText} 后重试：${publicErrorMessage(error)}`,
           );
         },
       });
       return result;
     } catch (error) {
-      const rawMsg = errorMessage(error);
-      const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${rawMsg}` : rawMsg;
+      const publicMsg = publicErrorMessage(error);
+      const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${publicMsg}` : publicMsg;
       store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
-      throw new Error(finalMsg);
+      throw toPublicError(error);
     }
   }
 
@@ -347,7 +351,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             store.recordAttemptAnswer(attemptId, answerText);
           });
         } catch (error) {
-          const msg = errorMessage(error);
+          const msg = publicErrorMessage(error);
           store.transaction(() => {
             store.finishAttemptError(attemptId, msg);
             store.finishTurnNonPass(turnId, "error", { error: msg });
@@ -420,7 +424,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
           previousAnswer = answerText;
           feedback = review.feedback;
         } catch (error) {
-          const msg = errorMessage(error);
+          const msg = publicErrorMessage(error);
           store.transaction(() => {
             store.finishAttemptError(attemptId, msg);
             store.finishTurnNonPass(turnId, "error", { error: msg });
@@ -472,7 +476,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
           }
           currentUserContent = decision.user;
         } catch (error) {
-          const msg = errorMessage(error);
+          const msg = publicErrorMessage(error);
           store.transaction(() => {
             store.finishRunItemNonPass(runItemId, "error", { error: msg });
           });
@@ -523,11 +527,15 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
                 }),
               );
               lastOutput = out;
-              return { out, rubric: parseEvalRubric(out) };
+              try {
+                return { out, rubric: parseEvalRubric(out) };
+              } catch (error) {
+                throw toPublicError(error, "model_output_invalid");
+              }
             },
             onRetry: (attempt, max, error) => {
               options.onProgress?.(
-                `${rubricTag} rubric 抽取失败（第 ${attempt}/${max} 次），重试：${errorMessage(error)}`,
+                `${rubricTag} rubric 抽取失败（第 ${attempt}/${max} 次），重试：${publicErrorMessage(error)}`,
               );
             },
           });
@@ -543,7 +551,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
           rubricsExtracted++;
           options.onProgress?.(`${rubricTag} extracted (${parsedRubric.rubric.keyPoints.length} keyPoints)`);
         } catch (error) {
-          const msg = errorMessage(error);
+          const msg = publicErrorMessage(error);
           store.failEvalModelCall(callId, msg, { outputText: lastOutput ?? null });
           rubricErrors++;
           options.onProgress?.(`${rubricTag} rubric error: ${msg}`);

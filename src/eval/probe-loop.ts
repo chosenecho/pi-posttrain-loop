@@ -5,7 +5,8 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../retry.js";
-import { errorMessage, nonEmpty, validateConcurrency, validateMaxAttempts } from "../schema.js";
+import { nonEmpty, validateConcurrency, validateMaxAttempts } from "../schema.js";
+import { PublicError, publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import { createWarmupGate, runConcurrentPool } from "../shared/concurrency.js";
 import type { EvalRole, RoleRunner } from "../types.js";
 import {
@@ -229,18 +230,23 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             ? await exec()
             : await warmupGate.run(`${params.sourceMaterialId}:${params.role}`, concurrency > 1, exec);
           lastRawOutput = output;
-          return { output, parsed: params.parse(output) };
+          try {
+            return { output, parsed: params.parse(output) };
+          } catch {
+            throw new PublicError("model_output_invalid");
+          }
         },
         onRetry: (attempt, max, error) => {
-          options.onProgress?.(`${params.tag} ${params.role} 失败（第 ${attempt}/${max} 次），重试：${errorMessage(error)}`);
+          options.onProgress?.(`${params.tag} ${params.role} call:${callId} 失败（第 ${attempt}/${max} 次），重试：${publicErrorMessage(error)}`);
         },
       });
       evalStore.finishCall(callId, { output: result.output });
       return { callId, output: result.output, parsed: result.parsed };
     } catch (error) {
-      const msg = errorMessage(error);
+      const safeError = toPublicError(error, "model_request_failed");
+      const msg = publicErrorMessage(safeError);
       evalStore.finishCall(callId, { output: lastRawOutput, error: msg });
-      throw new Error(msg);
+      throw safeError;
     }
   }
 
@@ -317,7 +323,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
 
         if (batch.probes.length === 0) {
           skippedVideos++;
-          options.onProgress?.(`${tag} 出题员主动跳过本视频（0 题）：${batch.skipReason ?? "无适合跨期盲测的理论内容"}`);
+          options.onProgress?.(`${tag} 出题员主动跳过本视频（0 题）`);
           return;
         }
 
@@ -364,7 +370,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
         options.onProgress?.(`${tag} 自主规划并出题 ${batch.probes.length} 题（上限 ${maxProbesPerVideo}）`);
       } catch (error) {
         draftErrors++;
-        options.onProgress?.(`${tag} probe-writer 失败：${errorMessage(error)}`);
+        options.onProgress?.(`${tag} probe-writer 失败：${publicErrorMessage(error)}`);
       }
     });
 
@@ -544,9 +550,9 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             }
 
             if (review.decision === "reject") {
-              evalStore.setProbeStatus(probeId, "rejected", review.feedback || review.issues.join("; "));
+              evalStore.setProbeStatus(probeId, "rejected", "critic_rejected");
               latestQuestionsBySourceId.get(source.id)?.delete(probeId);
-              options.onProgress?.(`${makeTag()} critic reject: ${(review.feedback || review.issues[0] || "").slice(0, 60)}`);
+              options.onProgress?.(`${makeTag()} critic reject (round ${reviewSeq})`);
               return;
             }
 
@@ -554,7 +560,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
               evalStore.setProbeStatus(
                 probeId,
                 "rejected",
-                `审题改写达到上限（${maxCriticRevisions} 次）：${review.feedback}`,
+                `审题改写达到上限（${maxCriticRevisions} 次）`,
               );
               latestQuestionsBySourceId.get(source.id)?.delete(probeId);
               options.onProgress?.(`${makeTag()} critic exhausted after ${criticRevisions} revisions`);
@@ -648,10 +654,10 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             evalStore.setProbeStatus(
               probeId,
               "rejected",
-              `裸答对抗复检放弃：${bareReview.feedback || bareReview.issues.join("; ")}`,
+              "bare_check_rejected",
             );
             latestQuestionsBySourceId.get(source.id)?.delete(probeId);
-            options.onProgress?.(`${makeTag()} bare-check reject: ${(bareReview.feedback || "").slice(0, 60)}`);
+            options.onProgress?.(`${makeTag()} bare-check reject (round ${reviewSeq})`);
             return;
           }
 
@@ -659,7 +665,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             evalStore.setProbeStatus(
               probeId,
               "rejected",
-              `裸答对抗强化达到上限（${maxBareRefinements} 次）：${bareReview.feedback}`,
+              `裸答对抗强化达到上限（${maxBareRefinements} 次）`,
             );
             latestQuestionsBySourceId.get(source.id)?.delete(probeId);
             options.onProgress?.(`${makeTag()} bare-check exhausted after ${bareRefinements} refinements`);
@@ -787,7 +793,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
                 evalStore.setProbeStatus(
                   probeId,
                   "dropped",
-                  `Turn ${turnNo}（${draftAdv.tactic}）施压话术未通过审题：${pReview.feedback || pReview.issues.join("; ")}`,
+                  `Turn ${turnNo}（${draftAdv.tactic}）施压话术未通过审题`,
                 );
                 options.onProgress?.(`${makeTag()}[t${turnNo}:${draftAdv.tactic}] adversary dropped by critic`);
                 return;
@@ -894,8 +900,8 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
 
             if (ver.decision === "drop") {
               evalStore.finishTurn(activeTurnId, "dropped");
-              evalStore.setProbeStatus(probeId, "dropped", `Turn ${turnNo} 核验放弃：${ver.feedback || ver.issues.join("; ")}`);
-              options.onProgress?.(`${makeTag()}[t${turnNo}] verifier drop: ${(ver.feedback || ver.issues[0] || "").slice(0, 60)}`);
+              evalStore.setProbeStatus(probeId, "dropped", `Turn ${turnNo} 核验放弃`);
+              options.onProgress?.(`${makeTag()}[t${turnNo}] verifier drop (attempt ${attemptNo})`);
               return;
             }
 
@@ -909,7 +915,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             evalStore.setProbeStatus(
               probeId,
               "dropped",
-              `Turn ${turnNo} 参考答案核验返工达到上限（${maxAnswerAttempts} 次）：${feedback}`,
+              `Turn ${turnNo} 参考答案核验返工达到上限（${maxAnswerAttempts} 次）`,
             );
             options.onProgress?.(`${makeTag()}[t${turnNo}] verifier exhausted`);
             return;
@@ -980,7 +986,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
         );
       } catch (error) {
         probeErrors++;
-        const msg = errorMessage(error);
+        const msg = publicErrorMessage(error);
         if (activeTurnId !== undefined) {
           evalStore.finishTurn(activeTurnId, "error");
         }
@@ -991,8 +997,8 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
 
     evalStore.finishRun(runId, "completed");
   } catch (error) {
-    evalStore.finishRun(runId, "failed", errorMessage(error));
-    throw error;
+    evalStore.finishRun(runId, "failed", publicErrorMessage(error));
+    throw toPublicError(error);
   }
 
   const probes = evalStore.listProbes({ runId });

@@ -179,7 +179,7 @@ test("runDialogueBatch supports multi-turn pass, early followup stop, Turn 2 exh
     "SELECT status, output_text, error FROM model_calls WHERE role = 'followup' AND status = 'error'",
   ).get() as { status: string; output_text: string; error: string };
   assert.equal(failedFollowup.output_text, "not valid json");
-  assert.ok(failedFollowup.error.includes("JSON"));
+  assert.ok(failedFollowup.error.includes("model_output_invalid"));
 });
 
 test("runDialogueBatch executes questions concurrently up to limit, isolates errors, and exports deterministically", async (t) => {
@@ -671,12 +671,16 @@ test("runDialogueBatch retries transient empty/malformed model errors up to call
     "问题2：质检DSML串台重试后恢复",
   ]);
 
-  // Failed Q3 error message records 3 retries and zero running rows remain
+  // The item keeps a public code; the call audit keeps the controlled retry count.
   const failedItem = store.db.prepare(
     "SELECT status, error FROM run_items WHERE run_id = ? AND question_id = 3",
   ).get(summary.runId) as { status: string; error: string };
   assert.equal(failedItem.status, "error");
-  assert.match(failedItem.error, /重试 3 次后仍失败/);
+  assert.match(failedItem.error, /unexpected_error/);
+  const failedCall = store.db.prepare(
+    "SELECT error FROM model_calls WHERE run_id = ? AND status = 'error'",
+  ).get(summary.runId) as { error: string };
+  assert.match(failedCall.error, /重试 3 次后仍失败/);
   assert.ok(logs.some((l) => l.includes("调用失败（第 1/3 次）")));
   assert.ok(logs.some((l) => l.includes("已丢弃本题")));
 });

@@ -5,7 +5,8 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { DataMakerStore, normalizeText, sha256Hex } from "./db.js";
-import { errorMessage, nonEmpty, parseReview } from "./schema.js";
+import { asObject, errorMessage, nonEmpty, parseReview } from "./schema.js";
+import { normalizeApiBaseUrl } from "./shared/api-config.js";
 import { backfillProcessedTrainSplits } from "./splits.js";
 import type { Review } from "./types.js";
 
@@ -23,7 +24,7 @@ interface TrialRunManifest {
   questionCount: number;
   promptDirectory: string;
   systemPrompts: { answer: string; judge: string };
-  model: Record<string, unknown>;
+  model: unknown;
   reviewScope?: string;
 }
 
@@ -135,6 +136,54 @@ async function readJsonl<T>(path: string): Promise<T[]> {
   return rows;
 }
 
+const LEGACY_THINKING_LEVELS = ["off", "low", "medium", "high", "max"];
+const LEGACY_THINKING_ROLES = ["question", "answer", "judge", "followup", "rubric"];
+
+function legacyThinkingLevel(value: unknown, label: string): string {
+  if (typeof value !== "string" || !LEGACY_THINKING_LEVELS.includes(value)) {
+    throw new Error(`${label} 必须为 off、low、medium、high 或 max`);
+  }
+  return value;
+}
+
+function sanitizeLegacyModel(raw: unknown): Record<string, unknown> {
+  const model = asObject(raw, "旧运行 model");
+  const sanitized: Record<string, unknown> = {};
+
+  // Legacy snapshots may use either spelling and omit newer configuration fields.
+  for (const field of ["id", "modelId"] as const) {
+    if (model[field] !== undefined) sanitized[field] = nonEmpty(model[field], `旧运行 model.${field}`);
+  }
+  if (model.baseUrl !== undefined) {
+    if (typeof model.baseUrl !== "string") {
+      throw new Error("旧运行 model.baseUrl 必须是非空字符串");
+    }
+    sanitized.baseUrl = normalizeApiBaseUrl(model.baseUrl, "旧运行 model.baseUrl");
+  }
+  for (const field of ["maxTokens", "contextWindow", "timeoutMs"] as const) {
+    const value = model[field];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`旧运行 model.${field} 必须是正安全整数`);
+    }
+    sanitized[field] = value;
+  }
+  if (model.thinkingLevel !== undefined) {
+    sanitized.thinkingLevel = legacyThinkingLevel(model.thinkingLevel, "旧运行 model.thinkingLevel");
+  }
+  if (model.roleThinkingLevels !== undefined) {
+    const roles = asObject(model.roleThinkingLevels, "旧运行 model.roleThinkingLevels");
+    const sanitizedRoles: Record<string, string> = {};
+    for (const role of LEGACY_THINKING_ROLES) {
+      if (roles[role] !== undefined) {
+        sanitizedRoles[role] = legacyThinkingLevel(roles[role], `旧运行 model.roleThinkingLevels.${role}`);
+      }
+    }
+    sanitized.roleThinkingLevels = sanitizedRoles;
+  }
+  return sanitized;
+}
+
 function pairTraces(traces: TrialTraceLine[]): Map<string, PairedTrace> {
   const starts = new Map<string, TrialTraceLine>();
   const paired = new Map<string, PairedTrace>();
@@ -233,6 +282,9 @@ export async function migrateTrialToSqlite(options: MigrateOptions): Promise<Mig
       runId = existingRun.id;
     } else {
       runId = store.transaction(() => {
+        // Validate the allowlisted snapshot before importing any legacy records.
+        const sanitizedModel = sanitizeLegacyModel(runManifest.model);
+
         // 1. Upsert materials and verify normalized SHA-256
         const materialIdByVideo = new Map<string, number>();
         for (const mat of materials) {
@@ -265,11 +317,7 @@ export async function migrateTrialToSqlite(options: MigrateOptions): Promise<Mig
           questionById.set(record.id, { materialId, question: record.question });
         }
 
-        // 3. Create immutable run snapshot (sanitized: explicitly omit any credential field)
-        const sanitizedModel = { ...runManifest.model };
-        delete sanitizedModel.apiKey;
-        delete sanitizedModel.LLM_API_KEY;
-
+        // 3. Create immutable run snapshot using only validated model metadata.
         const createdRunId = store.createRun({
           kind: "answer_judge",
           status: summary.state === "completed" ? "completed" : "error",

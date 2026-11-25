@@ -32,6 +32,25 @@ LLM_TIMEOUT_MS=180000
 
 ---
 
+### 模型服务地址与密钥的绑定
+
+角色配置仅在 API 根地址一致时继承主密钥。协议、主机、端口、路径中的任一项改变，都需要显式设置该角色的专用密钥；主机大小写、默认端口与末尾斜杠会先归一化。`REASONING_*`、`REASONING_JUDGE_*`、`EVAL_LLM_*` 和候选模型均遵循此规则，配置错误会在请求前报告变量名。
+
+```dotenv
+# 同服务：省略专用密钥即可继承 LLM_API_KEY
+REASONING_BASE_URL=http://127.0.0.1:3425/v1
+
+# 独立服务：使用该服务自己的密钥
+EVAL_LLM_BASE_URL=https://grader.example.com/v1
+EVAL_LLM_API_KEY=<评测服务密钥>
+
+# 本地无认证服务：显式填写占位值，避免继承主密钥
+CANDIDATE_LLM_BASE_URL=http://127.0.0.1:8000/v1
+CANDIDATE_LLM_API_KEY=EMPTY
+```
+
+候选模型的 `EMPTY` 或显式空密钥会省略 `Authorization`；Pi 角色可用 `EMPTY` 作为无认证服务的占位密钥。模型客户端不自动跟随 HTTP 重定向，避免将输入或认证头转发到配置之外的接口。更换 API 路径也需要重配密钥，例如同一网关下从 `/v1` 切换到 `/other/v1`。模型名称、思考等级等非敏感参数继续按原规则回退。评测出题与批卷使用 `EVAL_LLM_*`，难度标定的裸答模型继续使用 `LLM_*`。
+
 ## 2. 日常生产与盲测操作流程
 
 ### 第一步：查看当前语料库、三分区与待质检进度（不调模型）
@@ -140,7 +159,7 @@ npm run eval -- freeze --name adv-main-v1 --profile adversarial --max-easy-ratio
 npm run eval -- freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
 
 # 4. 运行候选模型脱稿盲测（默认注入 prompts/eval/candidate-system.md）、整体语义批卷并输出对比报告
-npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --history-mode gold
+npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --history-mode gold
 npm run eval -- grade --run latest --concurrency 8
 npm run eval -- report --suites indist-v1,adv-main-v1,trap-main-v1 --candidates base,sft-v1 --out output/eval/report.md
 npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
@@ -148,7 +167,7 @@ npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-m
 
 ### 第七步（可选）：数据集校验脱敏与 ModelScope 打包发布
 
-仓库提供 [scripts/publish_modelscope.py](../scripts/publish_modelscope.py)，自动完成 JSONL 合法性与 schema 校验、清理清单中的本机绝对路径泄漏、生成 `README.md` Dataset Card 与 `SHA256SUMS.txt`，并上传至 ModelScope 数据集仓库：
+仓库提供 [scripts/publish_modelscope.py](../scripts/publish_modelscope.py)，完成 JSONL/schema 校验、清单路径整理、Dataset Card 与校验和生成。`prepare`、`upload --dry-run` 和正式上传共用发布检查：扫描全部正文与清单，只允许九个正式文件；额外文件、链接、凭据、本机路径及未审阅个人信息都会在远端操作前阻断。正式上传只将复验后的九文件临时副本交给 SDK，源目录的缓存和其它文件不会被上传。
 
 ```powershell
 # 1. 校验源文件并组装发布目录（默认 output/modelscope-release/）
@@ -170,7 +189,35 @@ python scripts/publish_modelscope.py upload --repo-id <namespace>/<dataset-name>
 
 ---
 
+### 发布检查命中后的处理
+
+诊断格式为相对文件、行号、字段路径和命中类别，省略原值。先在本地核查对应记录，删除或脱敏真实凭据与非公开个人信息，再重新 `prepare` 和 `upload --dry-run`。扫描覆盖常见凭据、显式配置的密钥、邮箱、中国手机号及通过日期和校验位检查的中国身份证候选；仍需结合数据来源做人工审阅。
+
+确需保留的公开联系信息可使用发布目录之外的审阅记录，例如 `output/privacy-review.json`，在 `prepare` 与每次 `upload` 时均传入 `--privacy-review output/privacy-review.json`：
+
+```json
+{
+  "version": 1,
+  "approvals": [
+    {
+      "file": "data/cot_sft/train.jsonl",
+      "line": 1,
+      "field": "$.messages[0].content",
+      "category": "email",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reason": "经核实为原文刻意公开的联系信息，保留以维持语义"
+    }
+  ]
+}
+```
+
+示例中的全零指纹需替换为实际字段的 SHA-256：对完整解码字符串的 UTF-8 字节计算，包含空格与换行，使用小写十六进制；数字值使用其规范十进制文本。JSONL 使用记录行号，普通 JSON 使用 `line: 1`，说明文档使用物理行号及 `field: "$"`。审阅仅适用于 `email`、`cn_mobile`、`cn_id`，理由至少八个字符。对应字段的内容或位置改变都会使原审阅失效；凭据和本机路径始终阻断。审阅记录应留在本地审计范围，九文件上传清单中没有审阅文件。
+
+`--dry-run` 只读且不创建远端仓库；正式上传会重新验证 schema、清单数据哈希及七条 `SHA256SUMS`，手工修改发布文件后应从源数据重新准备发布包。
+
 ## 3. 运行中监控与故障处理
+
+普通运行日志与错误字段只保留受控错误类型、HTTP 状态及调用编号，模型正文和上游错误正文不再拼入进度消息。排查时用调用编号关联数据库追溯记录。SQLite 的材料、输入消息、`output_text`、`raw_output` 等追溯字段仍可能包含完整原稿、问答和推理；数据库、备份及导出的追溯文件应仅向相应操作人员开放，并按需要清理留存。代码修复不会清除已有历史记录中的正文。
 
 - **只读查看实时进度**（WAL 模式下随时可安全只读查询 `data/data-maker.sqlite`）：
   ```sql

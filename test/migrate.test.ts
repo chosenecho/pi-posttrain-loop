@@ -7,7 +7,12 @@ import test from "node:test";
 import { DataMakerStore, normalizeText, sha256Hex } from "../src/db.js";
 import { migrateTrialToSqlite } from "../src/migrate.js";
 
-async function createMigrationFixtures(rootDir: string): Promise<{
+async function createMigrationFixtures(rootDir: string, model: unknown = {
+  baseUrl: "http://127.0.0.1:3425/v1",
+  modelId: "fixture-model",
+  apiKey: "should-be-stripped",
+  LLM_API_KEY: "should-be-stripped",
+}): Promise<{
   sourceQuestionsDbPath: string;
   trialDir: string;
 }> {
@@ -151,12 +156,7 @@ async function createMigrationFixtures(rootDir: string): Promise<{
     questionCount: 12,
     promptDirectory: "prompts/no-skill",
     systemPrompts: { answer: "回答系统提示词", judge: "质检系统提示词" },
-    model: {
-      baseUrl: "http://127.0.0.1:3425/v1",
-      modelId: "fixture-model",
-      apiKey: "should-be-stripped",
-      LLM_API_KEY: "should-be-stripped",
-    },
+    model,
     reviewScope: "no-skill-trial",
   };
 
@@ -192,6 +192,143 @@ async function createMigrationFixtures(rootDir: string): Promise<{
 
   return { sourceQuestionsDbPath, trialDir };
 }
+
+test("migration preserves allowlisted model metadata and drops arbitrary credential objects", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "data-maker-migrate-model-"));
+  const secret = "synthetic-migration-credential-marker";
+  try {
+    const { sourceQuestionsDbPath, trialDir } = await createMigrationFixtures(dir, {
+      id: "legacy-model-id",
+      modelId: "fixture-model",
+      baseUrl: "https://models.example.com/v1/",
+      maxTokens: 2048,
+      contextWindow: 32768,
+      timeoutMs: 90000,
+      thinkingLevel: "high",
+      roleThinkingLevels: {
+        question: "max",
+        answer: "high",
+        judge: "low",
+        followup: "off",
+        rubric: "medium",
+        Authorization: secret,
+        headers: { authorization: secret },
+      },
+      apiKey: secret,
+      LLM_API_KEY: secret,
+      api_key: secret,
+      Authorization: `Bearer ${secret}`,
+      headers: { authorization: secret },
+      auth: { token: secret },
+      provider: { credentials: secret },
+      unknown: secret,
+    });
+    const targetDbPath = join(dir, "data-maker.sqlite");
+    const migrated = await migrateTrialToSqlite({ targetDbPath, sourceQuestionsDbPath, trialDir });
+    const store = new DataMakerStore(targetDbPath, { readOnly: true });
+    try {
+      const row = store.db.prepare("SELECT config_json FROM runs WHERE id = ?").get(migrated.runId) as { config_json: string };
+      assert.equal(row.config_json.includes(secret), false);
+      assert.deepEqual(JSON.parse(row.config_json).model, {
+        id: "legacy-model-id",
+        modelId: "fixture-model",
+        baseUrl: "https://models.example.com/v1",
+        maxTokens: 2048,
+        contextWindow: 32768,
+        timeoutMs: 90000,
+        thinkingLevel: "high",
+        roleThinkingLevels: {
+          question: "max",
+          answer: "high",
+          judge: "low",
+          followup: "off",
+          rubric: "medium",
+        },
+      });
+    } finally {
+      store.close();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("migration accepts partial legacy model snapshots without inventing configuration", async (t) => {
+  for (const model of [{}, { id: "legacy-model" }, { modelId: "new-model" }]) {
+    await t.test(JSON.stringify(model), async () => {
+      const dir = await mkdtemp(join(tmpdir(), "data-maker-migrate-partial-"));
+      try {
+        const { sourceQuestionsDbPath, trialDir } = await createMigrationFixtures(dir, model);
+        const targetDbPath = join(dir, "data-maker.sqlite");
+        const migrated = await migrateTrialToSqlite({ targetDbPath, sourceQuestionsDbPath, trialDir });
+        const store = new DataMakerStore(targetDbPath, { readOnly: true });
+        try {
+          const row = store.db.prepare("SELECT config_json FROM runs WHERE id = ?").get(migrated.runId) as { config_json: string };
+          assert.deepEqual(JSON.parse(row.config_json).model, model);
+        } finally {
+          store.close();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("migration rejects malformed allowed fields and credential-bearing URLs before importing records", async (t) => {
+  const secret = "synthetic-migration-invalid-marker";
+  const cases: Array<{ name: string; model: unknown; field: string }> = [
+    { name: "null model", model: null, field: "model" },
+    { name: "array model", model: [secret], field: "model" },
+    { name: "string model", model: secret, field: "model" },
+    { name: "nested legacy id", model: { id: { secret } }, field: "model.id" },
+    { name: "nested modelId", model: { modelId: { secret } }, field: "model.modelId" },
+    { name: "nested baseUrl", model: { baseUrl: { secret } }, field: "model.baseUrl" },
+    { name: "string token limit", model: { maxTokens: secret }, field: "model.maxTokens" },
+    { name: "zero context window", model: { contextWindow: 0 }, field: "model.contextWindow" },
+    { name: "fractional timeout", model: { timeoutMs: 0.5 }, field: "model.timeoutMs" },
+    { name: "unsafe integer", model: { maxTokens: Number.MAX_SAFE_INTEGER + 1 }, field: "model.maxTokens" },
+    { name: "unknown thinking level", model: { thinkingLevel: secret }, field: "model.thinkingLevel" },
+    { name: "nested thinking level", model: { thinkingLevel: { secret } }, field: "model.thinkingLevel" },
+    { name: "array role levels", model: { roleThinkingLevels: [secret] }, field: "model.roleThinkingLevels" },
+    { name: "unknown role level", model: { roleThinkingLevels: { answer: secret } }, field: "model.roleThinkingLevels.answer" },
+    { name: "nested role level", model: { roleThinkingLevels: { judge: { secret } } }, field: "model.roleThinkingLevels.judge" },
+    { name: "malformed URL", model: { baseUrl: secret }, field: "model.baseUrl" },
+    { name: "non-HTTP URL", model: { baseUrl: `file:///${secret}` }, field: "model.baseUrl" },
+    { name: "username URL", model: { baseUrl: `https://${secret}@models.example.com/v1` }, field: "model.baseUrl" },
+    { name: "password URL", model: { baseUrl: `https://fixture:${secret}@models.example.com/v1` }, field: "model.baseUrl" },
+    { name: "query URL", model: { baseUrl: `https://models.example.com/v1?api_key=${secret}` }, field: "model.baseUrl" },
+    { name: "fragment URL", model: { baseUrl: `https://models.example.com/v1#${secret}` }, field: "model.baseUrl" },
+    { name: "completion endpoint", model: { baseUrl: "https://models.example.com/v1/chat/completions/" }, field: "model.baseUrl" },
+  ];
+  for (const { name, model, field } of cases) {
+    await t.test(name, async () => {
+      const dir = await mkdtemp(join(tmpdir(), "data-maker-migrate-invalid-"));
+      try {
+        const { sourceQuestionsDbPath, trialDir } = await createMigrationFixtures(dir, model);
+        const targetDbPath = join(dir, "data-maker.sqlite");
+        await assert.rejects(migrateTrialToSqlite({ targetDbPath, sourceQuestionsDbPath, trialDir }), (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.ok(error.message.includes(field));
+          assert.equal(error.message.includes(secret), false);
+          assert.equal(error.message.includes("models.example.com"), false);
+          return true;
+        });
+        const store = new DataMakerStore(targetDbPath, { readOnly: true });
+        try {
+          for (const table of ["materials", "questions", "runs", "run_items", "model_calls", "results", "video_splits"]) {
+            const row = store.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
+            assert.equal(row.count, 0, `${table} contains partial migration data`);
+          }
+        } finally {
+          store.close();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
 
 test("migrates questions.sqlite and database-trial-CkXhqo with exact counts, idempotency, and clean JSONL export", async () => {
   const dir = await mkdtemp(join(tmpdir(), "data-maker-migrate-"));
@@ -257,6 +394,11 @@ test("migrates questions.sqlite and database-trial-CkXhqo with exact counts, ide
       };
       assert.equal(runRow.config_json.includes("apiKey"), false);
       assert.equal(runRow.config_json.includes("LLM_API_KEY"), false);
+      assert.equal(runRow.config_json.includes("should-be-stripped"), false);
+      assert.deepEqual(JSON.parse(runRow.config_json).model, {
+        baseUrl: "http://127.0.0.1:3425/v1",
+        modelId: "fixture-model",
+      });
       assert.equal(runRow.skills_json, "[]");
 
       // Training JSONL export satisfies strict one-line {"messages": [...]} spec

@@ -169,7 +169,7 @@ npm run eval -- freeze --name adv-main-v1 --profile adversarial --max-easy-ratio
 npm run eval -- freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
 
 # 4. 对候选模型执行脱稿盲测（默认加载 prompts/eval/candidate-system.md）、整体语义批卷与跨模型对比报告
-npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --history-mode gold
+npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --history-mode gold
 npm run eval -- grade --run latest --concurrency 8
 npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
 ```

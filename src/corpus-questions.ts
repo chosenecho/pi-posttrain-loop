@@ -14,7 +14,8 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "./retry.js";
-import { errorMessage, validateConcurrency, validateSplit } from "./schema.js";
+import { validateConcurrency, validateSplit } from "./schema.js";
+import { PublicError, publicErrorMessage } from "./shared/public-error.js";
 import { ensureVideoSplit } from "./splits.js";
 import type { DatasetSplit } from "./types.js";
 
@@ -163,7 +164,7 @@ export async function runCorpusQuestionGeneration(
           });
           lastRawOutput = output;
           if (!receipt) {
-            throw new Error(`模型未调用保存工具，尚未入库。模型输出：${output}`);
+            throw new PublicError("model_save_tool_missing");
           }
           return output;
         },
@@ -172,7 +173,7 @@ export async function runCorpusQuestionGeneration(
             ? `${callRetryDelayMs / 1000}s`
             : `${callRetryDelayMs}ms`;
           options.onProgress?.(
-            `[${loaded.videoId}] 出题调用失败（第 ${attempt}/${max} 次），${delayText} 后重试：${errorMessage(error)}`,
+            `[${loaded.videoId}][question:call:${callId}] 出题调用失败（第 ${attempt}/${max} 次），${delayText} 后重试：${publicErrorMessage(error)}`,
           );
         },
       });
@@ -189,14 +190,14 @@ export async function runCorpusQuestionGeneration(
       );
       return "processed";
     } catch (error) {
-      const rawMsg = errorMessage(error);
+      const rawMsg = publicErrorMessage(error);
       const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${rawMsg}` : rawMsg;
       const callRow = store.db.prepare("SELECT status FROM model_calls WHERE id = ?").get(callId) as { status: string };
       if (callRow.status === "running") {
         store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
       }
       errors++;
-      options.onProgress?.(`[${loaded.videoId}] 错误${callMaxAttempts > 1 ? "（已丢弃本分块）" : ""}：${finalMsg}`);
+      options.onProgress?.(`[${loaded.videoId}][question:call:${callId}] 错误${callMaxAttempts > 1 ? "（已丢弃本分块）" : ""}：${finalMsg}`);
       return "error";
     }
   }
