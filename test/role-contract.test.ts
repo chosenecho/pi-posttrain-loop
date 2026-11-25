@@ -102,12 +102,14 @@ test("two revisions send only the latest answer and feedback while keeping role 
 
   const judges = calls.filter(({ role }) => role === "judge");
   assert.deepEqual(judges.map(({ input }) => Object.keys(input).sort()), [
-    ["answer", "question"], ["answer", "question"], ["answer", "question"],
+    ["answer", "material", "question"],
+    ["answer", "material", "question"],
+    ["answer", "material", "question"],
   ]);
   assert.deepEqual(judges.map(({ input }) => input), [
-    { question, answer: "第一版答案" },
-    { question, answer: "第二版答案" },
-    { question, answer: "第三版完整答案" },
+    { material: material.text, question, answer: "第一版答案" },
+    { material: material.text, question, answer: "第二版答案" },
+    { material: material.text, question, answer: "第三版完整答案" },
   ]);
   for (const request of judges) {
     assert.equal(request.systemPrompt, expectedJudgePrompt);

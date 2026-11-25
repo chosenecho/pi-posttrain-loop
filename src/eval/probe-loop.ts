@@ -10,21 +10,24 @@ import { createWarmupGate, runConcurrentPool } from "../shared/concurrency.js";
 import type { EvalRole, RoleRunner } from "../types.js";
 import {
   EvalStore,
+  isTrapProbeType,
+  PRESSURE_ADVERSARY_TACTICS,
+  PROBE_TYPES,
+  TRAP_ADVERSARY_TACTICS,
+  TRAP_PROBE_TYPES,
   type AdversaryTactic,
+  type EvalProfile,
   type ExpectedBehavior,
   type ProbeType,
   type SourceMaterialRecord,
 } from "./eval-db.js";
 import type { EvalPromptBundle } from "./eval-prompts.js";
 import {
-  DEFAULT_PROBE_MIX,
-  planProbeSlots,
-  summarizePlan,
-  type PlannedProbeSlot,
+  buildSoftMixGuidance,
+  normalizeProbeMix,
+  PROBE_PERSONAS,
 } from "./probe-planner.js";
 import {
-  DUPLICATE_NGRAM_THRESHOLD,
-  findNearDuplicate,
   parseAdversaryTurn,
   parseCriticReview,
   parseDraftProbes,
@@ -36,9 +39,11 @@ import {
 } from "./probe-schema.js";
 import { verifySourceSplits } from "./source-import.js";
 
-export const DEFAULT_PROBES_PER_VIDEO = 8;
+/** Default upper bound on probes the agent may plan per video (the agent decides the actual 0..N count). */
+export const DEFAULT_PROBES_PER_VIDEO = 6;
 export const DEFAULT_MAX_CRITIC_REVISIONS = 2;
 export const DEFAULT_MAX_ANSWER_ATTEMPTS = 3;
+export const DEFAULT_MAX_BARE_REFINEMENTS = 1;
 
 export interface RunProbeBuildOptions {
   evalStore: EvalStore;
@@ -49,11 +54,26 @@ export interface RunProbeBuildOptions {
   skills: EvalPromptBundle["skills"];
   runRole: RoleRunner;
   modelId: string;
+  /** Optional build profile label recorded in run config (`adversarial` | `trap`). */
+  profile?: EvalProfile;
+  /** Maximum probes per video; `probe-writer` autonomously chooses 0..probesPerVideo based on material depth. */
   probesPerVideo?: number;
+  /** Soft global mix weights (types with weight 0 are disallowed). */
   mix?: Partial<Record<ProbeType, number>>;
   seed?: number;
   maxCriticRevisions?: number;
   maxAnswerAttempts?: number;
+  /**
+   * Optional inline bare-model adversarial feedback loop:
+   * after Turn 1 passes `probe-critic`, runs a transcript-free bare generic model on `question`
+   * and feeds `bareAnswer` back to `probe-critic` (`mode: "bare_check"`). If the bare model
+   * nails it effortlessly or exposes unseen private trivia, sends `bareAnswer` + feedback back
+   * to `probe-writer` (`mode: "revise"`) to sharpen or pivot before investing in reference/rubric calls.
+   */
+  runBareModel?: RoleRunner;
+  barePrompt?: string;
+  bareModelId?: string;
+  maxBareRefinements?: number;
   concurrency?: number;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
@@ -63,14 +83,17 @@ export interface RunProbeBuildOptions {
 export interface RunProbeBuildSummary {
   runId: number;
   modelId: string;
+  bareModelId?: string;
   videos: number;
+  skippedVideos: number;
   plannedSlots: number;
   draftedProbes: number;
   draftErrors: number;
-  duplicateRejected: number;
   criticEvaluated: number;
   criticAccepted: number;
   criticAcceptRate: number;
+  bareChecked: number;
+  bareTriggeredRevisions: number;
   verifierEvaluated: number;
   verifierPassed: number;
   verifierPassRate: number;
@@ -84,49 +107,34 @@ export interface RunProbeBuildSummary {
   errors: number;
 }
 
-function targetLengthHintFor(probeType: ProbeType, turnNo = 1): string {
-  if (turnNo > 1) {
-    return "short（150–400 字，正面接住施压点并稳住立场，不复读前轮）";
-  }
-  switch (probeType) {
-    case "wild_short":
-      return "short（150–350 字，快刀斩乱麻，直给判断与核心推理）";
-    case "hallucination_bait":
-      return "short（80–300 字，第一人称自然坦承边界，简洁收尾不凑字数）";
-    case "premise_trap":
-    case "contrast":
-    case "transfer":
-    case "pressure":
-      return "medium（350–750 字，论证扎实紧凑）";
-  }
-}
-
 export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunProbeBuildSummary> {
   const { evalStore, sources, runRole, modelId } = options;
   if (sources.length === 0) {
     throw new Error("没有可用于构建考题的 source_materials（请先运行 eval import）");
   }
 
-  const probesPerVideo = options.probesPerVideo ?? DEFAULT_PROBES_PER_VIDEO;
+  const maxProbesPerVideo = options.probesPerVideo ?? DEFAULT_PROBES_PER_VIDEO;
+  if (!Number.isSafeInteger(maxProbesPerVideo) || maxProbesPerVideo < 1 || maxProbesPerVideo > 20) {
+    throw new Error("probesPerVideo 必须是 1–20 的整数");
+  }
   const maxCriticRevisions = options.maxCriticRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS;
   if (!Number.isSafeInteger(maxCriticRevisions) || maxCriticRevisions < 0 || maxCriticRevisions > 5) {
     throw new Error("maxCriticRevisions 必须是 0–5 的整数");
+  }
+  const maxBareRefinements = options.maxBareRefinements ?? DEFAULT_MAX_BARE_REFINEMENTS;
+  if (!Number.isSafeInteger(maxBareRefinements) || maxBareRefinements < 0 || maxBareRefinements > 3) {
+    throw new Error("maxBareRefinements 必须是 0–3 的整数");
   }
   const maxAnswerAttempts = validateMaxAttempts(options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS);
   const concurrency = validateConcurrency(options.concurrency ?? 1);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
-  const effectiveMix: Record<ProbeType, number> = options.mix
-    ? {
-        wild_short: options.mix.wild_short ?? 0,
-        premise_trap: options.mix.premise_trap ?? 0,
-        contrast: options.mix.contrast ?? 0,
-        transfer: options.mix.transfer ?? 0,
-        hallucination_bait: options.mix.hallucination_bait ?? 0,
-        pressure: options.mix.pressure ?? 0,
-      }
-    : { ...DEFAULT_PROBE_MIX };
+  const effectiveMix = normalizeProbeMix(options.mix);
+  const allowedTypes = PROBE_TYPES.filter((t) => effectiveMix[t] > 0);
+  if (allowedTypes.length === 0) {
+    throw new Error("题型配比至少需要一个正权重类型");
+  }
 
   // Validate prompts before touching DB
   const writerPrompt = nonEmpty(options.prompts.probeWriter, "probe-writer 提示词");
@@ -134,31 +142,34 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
   const referencePrompt = nonEmpty(options.prompts.reference, "reference 提示词");
   const verifierPrompt = nonEmpty(options.prompts.verifier, "verifier 提示词");
   const rubricPrompt = nonEmpty(options.prompts.rubricV2, "rubric-v2 提示词");
-  const adversaryPrompt = effectiveMix.pressure > 0
+  const needsAdversary =
+    effectiveMix.pressure > 0 || TRAP_PROBE_TYPES.some((t) => effectiveMix[t] > 0);
+  const adversaryPrompt = needsAdversary
     ? nonEmpty(options.prompts.adversary, "adversary 提示词")
     : options.prompts.adversary;
+  const bareEnabled = Boolean(options.runBareModel && options.barePrompt);
+  const barePrompt = bareEnabled ? nonEmpty(options.barePrompt, "bare-answer 提示词") : undefined;
+  const bareModelId = bareEnabled ? (options.bareModelId ?? modelId) : undefined;
 
-  // Cross-DB split + sha256 verification before any LLM call
+  // Guardrail #1: Cross-DB test-split + sha256 verification before any LLM call
   if (options.mainDbPath) {
     verifySourceSplits(options.mainDbPath, sources);
   }
 
   evalStore.markInterruptedRuns();
 
-  const planBySource = planProbeSlots(sources, {
-    probesPerVideo,
-    mix: effectiveMix,
-    seed: options.seed,
-  });
-  const planSummary = summarizePlan(planBySource);
+  const liveTypeCounts: Record<ProbeType, number> = evalStore.countAcceptedProbesByType();
 
   const runId = evalStore.createRun({
     kind: "probe_build",
     config: {
+      architecture: "agent-loop-v3",
+      profile: options.profile ?? "adversarial",
       modelId,
+      ...(bareModelId ? { bareModelId, maxBareRefinements } : {}),
       videos: sources.length,
       videoIds: sources.map((s) => s.videoId),
-      probesPerVideo,
+      maxProbesPerVideo,
       mix: effectiveMix,
       ...(options.seed !== undefined ? { seed: options.seed } : {}),
       maxCriticRevisions,
@@ -166,7 +177,6 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
       concurrency,
       callMaxAttempts,
       callRetryDelayMs,
-      planned: planSummary,
     },
     prompts: {
       probe_writer: writerPrompt,
@@ -175,43 +185,32 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
       verifier: verifierPrompt,
       ...(adversaryPrompt ? { adversary: adversaryPrompt } : {}),
       rubric_v2: rubricPrompt,
+      ...(barePrompt ? { bare_answer: barePrompt } : {}),
     },
     skills: options.skills,
   });
 
   const runRef = `probe_run:${runId}`;
-  const specIdByKey = new Map<string, number>();
-  evalStore.transaction(() => {
-    for (const source of sources) {
-      for (const slot of planBySource.get(source.id)!) {
-        const specId = evalStore.createSpec({
-          runId,
-          sourceMaterialId: source.id,
-          slotIndex: slot.slotIndex,
-          probeType: slot.probeType,
-          persona: slot.persona,
-          targetTurns: slot.targetTurns,
-        });
-        specIdByKey.set(`${source.id}:${slot.slotIndex}`, specId);
-      }
-    }
-  });
-
   const warmupGate = createWarmupGate();
 
   async function invokeTracked<T>(params: {
     role: EvalRole;
     sourceMaterialId: number;
+    runner?: RoleRunner;
+    model?: string;
     systemPrompt: string;
     inputRefs: Record<string, unknown>;
     wireInput: Record<string, unknown>;
     parse: (raw: string) => T;
     tag: string;
+    skipWarmup?: boolean;
   }): Promise<{ callId: number; output: string; parsed: T }> {
+    const effectiveRunner = params.runner ?? runRole;
+    const effectiveModel = params.model ?? modelId;
     const callId = evalStore.startCall({
       runRef,
       role: params.role,
-      model: modelId,
+      model: effectiveModel,
       inputRefs: params.inputRefs,
     });
     let lastRawOutput: string | undefined;
@@ -221,15 +220,14 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
         delayMs: callRetryDelayMs,
         run: async () => {
           lastRawOutput = undefined;
-          const output = await warmupGate.run(
-            `${params.sourceMaterialId}:${params.role}`,
-            concurrency > 1,
-            () => runRole({
-              role: params.role,
-              systemPrompt: params.systemPrompt,
-              input: params.wireInput,
-            }),
-          );
+          const exec = () => effectiveRunner({
+            role: params.role,
+            systemPrompt: params.systemPrompt,
+            input: params.wireInput,
+          });
+          const output = params.skipWarmup
+            ? await exec()
+            : await warmupGate.run(`${params.sourceMaterialId}:${params.role}`, concurrency > 1, exec);
           lastRawOutput = output;
           return { output, parsed: params.parse(output) };
         },
@@ -248,8 +246,13 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
 
   interface QueuedProbe {
     probeId: number;
+    specId: number;
+    slotIndex: number;
     source: SourceMaterialRecord;
-    slot: PlannedProbeSlot;
+    probeType: ProbeType;
+    persona: string;
+    expectedBehavior: ExpectedBehavior;
+    targetTurns: number;
     question: string;
     anchor: string;
     trap: string;
@@ -260,30 +263,32 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
   const existingBySourceId = new Map<number, string[]>();
   const latestQuestionsBySourceId = new Map<number, Map<number, string>>();
 
-  let draftErrors = 0;
-  let duplicateRejected = 0;
+  let skippedVideos = 0;
+  let plannedSlots = 0;
   let draftedProbes = 0;
+  let draftErrors = 0;
   let criticEvaluated = 0;
   let criticAccepted = 0;
+  let bareChecked = 0;
+  let bareTriggeredRevisions = 0;
   let verifierEvaluated = 0;
   let verifierPassed = 0;
   let probeErrors = 0;
 
   try {
-    // Stage 1: Per-video batch probe drafting (concurrent across videos)
-    await runConcurrentPool(sources, concurrency, async (source, vIdx) => {
-      const slots = planBySource.get(source.id)!;
+    // Stage 1: Agent-autonomous planning & drafting per video (0..maxProbesPerVideo)
+    // Writer reads the material and decides how many probes it truly merits, which probe types,
+    // personas, and multi-turn counts fit best, guided only softly by global mix gaps.
+    await runConcurrentPool(sources, Math.min(concurrency, sources.length), async (source) => {
       const existingQuestions = evalStore.listExistingQuestionsForVideoKey(source.videoKey);
       existingBySourceId.set(source.id, existingQuestions);
       const latestMap = new Map<number, string>();
       latestQuestionsBySourceId.set(source.id, latestMap);
-
-      const tag = `[v${vIdx + 1}/${sources.length}:${source.videoId}]`;
-      options.onProgress?.(`${tag} probe-writer 出题（${slots.length} 槽位）...`);
+      const tag = `[draft:${source.videoId}]`;
+      const mixGuidance = buildSoftMixGuidance(effectiveMix, liveTypeCounts);
 
       try {
-        const expectedSlotIndices = slots.map((s) => s.slotIndex);
-        const { parsed: drafts } = await invokeTracked({
+        const { parsed: batch } = await invokeTracked({
           role: "probe_writer",
           sourceMaterialId: source.id,
           systemPrompt: writerPrompt,
@@ -291,85 +296,97 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             source_material_id: source.id,
             video_id: source.videoId,
             mode: "draft",
-            slot_count: slots.length,
+            max_probes: maxProbesPerVideo,
           },
           wireInput: {
             material: source.content,
             mode: "draft",
             videoId: source.videoId,
             partCount: source.partCount,
-            slots: slots.map((s) => ({
-              slotIndex: s.slotIndex,
-              probeType: s.probeType,
-              persona: s.persona,
-              expectedBehavior: s.expectedBehavior,
-            })),
+            maxProbes: maxProbesPerVideo,
+            allowedTypes: mixGuidance.allowedTypes,
+            preferredMix: mixGuidance.targetWeights,
+            currentTypeCounts: mixGuidance.currentCounts,
+            underrepresentedTypes: mixGuidance.underrepresentedTypes,
+            suggestedPersonas: [...PROBE_PERSONAS],
             ...(existingQuestions.length > 0 ? { existingQuestions } : {}),
           },
-          parse: (raw) => parseDraftProbes(raw, expectedSlotIndices),
+          parse: (raw) => parseDraftProbes(raw, { maxProbes: maxProbesPerVideo, allowedTypes }),
           tag,
         });
 
-        const seenForVideo = [...existingQuestions];
-        const slotByIndex = new Map(slots.map((s) => [s.slotIndex, s]));
-
-        for (const item of drafts) {
-          const slot = slotByIndex.get(item.slotIndex)!;
-          const specId = specIdByKey.get(`${source.id}:${slot.slotIndex}`)!;
-          const anchorVerified = verifyAnchorInMaterial(item.anchor, source.content);
-          const probeId = evalStore.createProbe({
-            specId,
-            question: item.question,
-            anchor: item.anchor,
-            trap: item.trap,
-            expectedBehavior: slot.expectedBehavior,
-            anchorVerified,
-          });
-          draftedProbes++;
-
-          const dup = findNearDuplicate(item.question, seenForVideo, DUPLICATE_NGRAM_THRESHOLD);
-          if (dup) {
-            evalStore.setProbeStatus(
-              probeId,
-              "rejected",
-              `n-gram 重复预筛拦截（相似度 ${dup.similarity.toFixed(2)}）：${dup.matchedQuestion.slice(0, 48)}`,
-            );
-            duplicateRejected++;
-            options.onProgress?.(`${tag}[s${slot.slotIndex}:p${probeId}] 重复预筛拦截 (sim=${dup.similarity.toFixed(2)})`);
-            continue;
-          }
-
-          seenForVideo.push(item.question);
-          latestMap.set(probeId, item.question);
-          probeQueue.push({
-            probeId,
-            source,
-            slot,
-            question: item.question,
-            anchor: item.anchor,
-            trap: item.trap,
-            anchorVerified,
-          });
+        if (batch.probes.length === 0) {
+          skippedVideos++;
+          options.onProgress?.(`${tag} 出题员主动跳过本视频（0 题）：${batch.skipReason ?? "无适合跨期盲测的理论内容"}`);
+          return;
         }
-        options.onProgress?.(`${tag} 出题完成（入审 ${drafts.length} 题，预筛去重后待审 ${latestMap.size} 题）`);
+
+        evalStore.transaction(() => {
+          for (const item of batch.probes) {
+            const specId = evalStore.createSpec({
+              runId,
+              sourceMaterialId: source.id,
+              slotIndex: item.slotIndex,
+              probeType: item.probeType,
+              persona: item.persona,
+              targetTurns: item.targetTurns,
+            });
+            // Advisory diagnostic only — never blocks the loop
+            const anchorVerified = item.anchor.length > 0 && verifyAnchorInMaterial(item.anchor, source.content);
+            const probeId = evalStore.createProbe({
+              specId,
+              question: item.question,
+              anchor: item.anchor,
+              trap: item.trap,
+              expectedBehavior: item.expectedBehavior,
+              anchorVerified,
+            });
+            plannedSlots++;
+            draftedProbes++;
+            liveTypeCounts[item.probeType] = (liveTypeCounts[item.probeType] ?? 0) + 1;
+            latestMap.set(probeId, item.question);
+            probeQueue.push({
+              probeId,
+              specId,
+              slotIndex: item.slotIndex,
+              source,
+              probeType: item.probeType,
+              persona: item.persona,
+              expectedBehavior: item.expectedBehavior,
+              targetTurns: item.targetTurns,
+              question: item.question,
+              anchor: item.anchor,
+              trap: item.trap,
+              anchorVerified,
+            });
+          }
+        });
+        options.onProgress?.(`${tag} 自主规划并出题 ${batch.probes.length} 题（上限 ${maxProbesPerVideo}）`);
       } catch (error) {
         draftErrors++;
         options.onProgress?.(`${tag} probe-writer 失败：${errorMessage(error)}`);
       }
     });
 
-    // Stage 2: Per-probe concurrent critic -> (turn 1..targetTurns: [adversary+critic] -> reference <-> verifier) -> per-turn rubric-v2
+    // Stage 2: Per-probe concurrent Agent Loop:
+    //   [probe-critic <-> probe-writer] -> [optional blind bare_answer -> probe-critic(bare_check) -> probe-writer]
+    //   -> [per-turn adversary(dynamic tactic) -> probe-critic -> reference <-> verifier] -> [rubric-v2]
     await runConcurrentPool(probeQueue, concurrency, async (item) => {
-      const { probeId, source, slot } = item;
-      const tag = `[p${probeId}:${source.videoId}:s${slot.slotIndex}:${slot.probeType}]`;
+      const { probeId, specId, slotIndex, source } = item;
       let activeTurnId: number | undefined;
 
       const current = {
+        probeType: item.probeType,
+        persona: item.persona,
+        expectedBehavior: item.expectedBehavior,
+        targetTurns: item.targetTurns,
         question: item.question,
         anchor: item.anchor,
         trap: item.trap,
         anchorVerified: item.anchorVerified,
       };
+
+      const makeTag = () => `[p${probeId}:${source.videoId}:s${slotIndex}:${current.probeType}]`;
 
       const collectSiblingQuestions = (): string[] => {
         const list = [...(existingBySourceId.get(source.id) ?? [])];
@@ -382,147 +399,294 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
         return list;
       };
 
-      try {
-        // ---- Stage 2A: Turn-1 probe-critic <-> probe-writer (revision) ----
-        criticEvaluated++;
-        let passedCritic = false;
-        let revisions = 0;
+      const applyRewrite = async (params: {
+        roundNo: number;
+        issues: string[];
+        feedback: string;
+        bareAnswer?: string;
+        siblingQuestions: string[];
+      }): Promise<void> => {
+        const rewriteCall = await invokeTracked({
+          role: "probe_writer",
+          sourceMaterialId: source.id,
+          systemPrompt: writerPrompt,
+          inputRefs: {
+            probe_id: probeId,
+            source_material_id: source.id,
+            mode: "revise",
+            round_no: params.roundNo,
+            ...(params.bareAnswer ? { triggered_by: "bare_check" } : {}),
+          },
+          wireInput: {
+            material: source.content,
+            mode: "revise",
+            videoId: source.videoId,
+            allowedTypes,
+            slot: {
+              slotIndex,
+              probeType: current.probeType,
+              persona: current.persona,
+              expectedBehavior: current.expectedBehavior,
+              targetTurns: current.targetTurns,
+            },
+            previousProbe: {
+              question: current.question,
+              anchor: current.anchor,
+              trap: current.trap,
+            },
+            ...(params.bareAnswer ? { bareAnswer: params.bareAnswer } : {}),
+            issues: params.issues,
+            feedback: params.feedback,
+            ...(params.siblingQuestions.length > 0 ? { existingQuestions: params.siblingQuestions } : {}),
+          },
+          parse: (raw) => parseRevisedProbe(raw, {
+            slotIndex,
+            probeType: current.probeType,
+            persona: current.persona,
+            targetTurns: current.targetTurns,
+            allowedTypes,
+          }),
+          tag: `${makeTag()}[rw${params.roundNo}]`,
+        });
 
-        for (let roundNo = 1; roundNo <= maxCriticRevisions + 1; roundNo++) {
-          const siblingQuestions = collectSiblingQuestions();
-          const criticCall = await invokeTracked({
+        const revised = rewriteCall.parsed;
+        const nextAnchorVerified = revised.anchor.length > 0 && verifyAnchorInMaterial(revised.anchor, source.content);
+        const specChanged =
+          revised.probeType !== current.probeType ||
+          revised.persona !== current.persona ||
+          revised.targetTurns !== current.targetTurns;
+
+        evalStore.transaction(() => {
+          if (specChanged) {
+            evalStore.updateSpec(specId, {
+              probeType: revised.probeType,
+              persona: revised.persona,
+              targetTurns: revised.targetTurns,
+            });
+          }
+          evalStore.reviseProbe(probeId, {
+            question: revised.question,
+            anchor: revised.anchor,
+            trap: revised.trap,
+            anchorVerified: nextAnchorVerified,
+            expectedBehavior: revised.expectedBehavior,
+          });
+        });
+
+        current.probeType = revised.probeType;
+        current.persona = revised.persona;
+        current.expectedBehavior = revised.expectedBehavior;
+        current.targetTurns = revised.targetTurns;
+        current.question = revised.question;
+        current.anchor = revised.anchor;
+        current.trap = revised.trap;
+        current.anchorVerified = nextAnchorVerified;
+        latestQuestionsBySourceId.get(source.id)?.set(probeId, current.question);
+      };
+
+      try {
+        // ---- Stage 2A: Turn-1 Agent Loop (probe-critic + optional blind bare-model check <-> probe-writer) ----
+        criticEvaluated++;
+        let passedStage2A = false;
+        let reviewSeq = 0;
+        let criticRevisions = 0;
+        let bareRefinements = 0;
+
+        while (true) {
+          // Step 2A.1: Semantic review by probe-critic (including semantic deduplication vs existingQuestions)
+          let passedStaticCritic = false;
+          while (true) {
+            reviewSeq++;
+            const siblingQuestions = collectSiblingQuestions();
+            const criticCall = await invokeTracked({
+              role: "probe_critic",
+              sourceMaterialId: source.id,
+              systemPrompt: criticPrompt,
+              inputRefs: {
+                probe_id: probeId,
+                source_material_id: source.id,
+                mode: "probe",
+                round_no: reviewSeq,
+                probe_type: current.probeType,
+                anchor_verified: current.anchorVerified,
+              },
+              wireInput: {
+                material: source.content,
+                mode: "probe",
+                probeType: current.probeType,
+                persona: current.persona,
+                expectedBehavior: current.expectedBehavior,
+                question: current.question,
+                anchor: current.anchor,
+                anchorVerified: current.anchorVerified,
+                trap: current.trap,
+                ...(siblingQuestions.length > 0 ? { existingQuestions: siblingQuestions } : {}),
+              },
+              parse: parseCriticReview,
+              tag: `${makeTag()}[c${reviewSeq}]`,
+            });
+
+            const review = criticCall.parsed;
+            evalStore.addReview({
+              probeId,
+              roundNo: reviewSeq,
+              decision: review.decision,
+              issues: review.issues,
+              feedback: review.feedback,
+              questionSnapshot: current.question,
+              callId: criticCall.callId,
+            });
+
+            if (review.decision === "accept") {
+              passedStaticCritic = true;
+              options.onProgress?.(`${makeTag()} critic accept (round ${reviewSeq})`);
+              break;
+            }
+
+            if (review.decision === "reject") {
+              evalStore.setProbeStatus(probeId, "rejected", review.feedback || review.issues.join("; "));
+              latestQuestionsBySourceId.get(source.id)?.delete(probeId);
+              options.onProgress?.(`${makeTag()} critic reject: ${(review.feedback || review.issues[0] || "").slice(0, 60)}`);
+              return;
+            }
+
+            if (criticRevisions >= maxCriticRevisions) {
+              evalStore.setProbeStatus(
+                probeId,
+                "rejected",
+                `审题改写达到上限（${maxCriticRevisions} 次）：${review.feedback}`,
+              );
+              latestQuestionsBySourceId.get(source.id)?.delete(probeId);
+              options.onProgress?.(`${makeTag()} critic exhausted after ${criticRevisions} revisions`);
+              return;
+            }
+
+            options.onProgress?.(`${makeTag()} critic revise (round ${reviewSeq}) -> 重写中...`);
+            await applyRewrite({
+              roundNo: reviewSeq,
+              issues: review.issues,
+              feedback: review.feedback,
+              siblingQuestions,
+            });
+            criticRevisions++;
+          }
+
+          if (!passedStaticCritic) return;
+
+          // Step 2A.2: Optional inline blind bare-model trial -> probe-critic(bare_check) feedback loop
+          if (!bareEnabled || !options.runBareModel || !barePrompt) {
+            passedStage2A = true;
+            break;
+          }
+
+          bareChecked++;
+          // Guardrail #2 (Blind Isolation): bare model NEVER receives material / anchor / trap / expectedBehavior!
+          const bareCall = await invokeTracked({
+            role: "bare_answer",
+            sourceMaterialId: source.id,
+            runner: options.runBareModel,
+            model: bareModelId,
+            systemPrompt: barePrompt,
+            inputRefs: {
+              probe_id: probeId,
+              stage: "inline_bare_check",
+              refinement_no: bareRefinements,
+            },
+            wireInput: {
+              question: current.question,
+            },
+            parse: (raw) => nonEmpty(raw, "裸答试考正文"),
+            tag: `${makeTag()}[bare${bareRefinements + 1}]`,
+            skipWarmup: true,
+          });
+
+          reviewSeq++;
+          const bareCheckCall = await invokeTracked({
             role: "probe_critic",
             sourceMaterialId: source.id,
             systemPrompt: criticPrompt,
             inputRefs: {
               probe_id: probeId,
               source_material_id: source.id,
-              mode: "probe",
-              round_no: roundNo,
-              probe_type: slot.probeType,
-              anchor_verified: current.anchorVerified,
+              mode: "bare_check",
+              round_no: reviewSeq,
+              bare_call_id: bareCall.callId,
             },
             wireInput: {
               material: source.content,
-              mode: "probe",
-              probeType: slot.probeType,
-              persona: slot.persona,
-              expectedBehavior: slot.expectedBehavior,
+              mode: "bare_check",
+              probeType: current.probeType,
+              persona: current.persona,
+              expectedBehavior: current.expectedBehavior,
               question: current.question,
               anchor: current.anchor,
-              anchorVerified: current.anchorVerified,
               trap: current.trap,
-              ...(siblingQuestions.length > 0 ? { existingQuestions: siblingQuestions } : {}),
+              bareAnswer: bareCall.parsed,
             },
             parse: parseCriticReview,
-            tag: `${tag}[c${roundNo}]`,
+            tag: `${makeTag()}[bc${bareRefinements + 1}]`,
           });
 
-          const review = criticCall.parsed;
+          const bareReview = bareCheckCall.parsed;
           evalStore.addReview({
             probeId,
-            roundNo,
-            decision: review.decision,
-            issues: review.issues,
-            feedback: review.feedback,
+            roundNo: reviewSeq,
+            decision: bareReview.decision,
+            issues: bareReview.issues,
+            feedback: bareReview.feedback,
             questionSnapshot: current.question,
-            callId: criticCall.callId,
+            callId: bareCheckCall.callId,
           });
 
-          if (review.decision === "accept") {
-            passedCritic = true;
-            criticAccepted++;
-            evalStore.setProbeStatus(probeId, "answering");
-            options.onProgress?.(`${tag} critic accept (round ${roundNo})`);
+          if (bareReview.decision === "accept") {
+            passedStage2A = true;
+            options.onProgress?.(`${makeTag()} bare-check accept（通用模型确有区分度）`);
             break;
           }
 
-          if (review.decision === "reject") {
-            evalStore.setProbeStatus(probeId, "rejected", review.feedback || review.issues.join("; "));
-            latestQuestionsBySourceId.get(source.id)?.delete(probeId);
-            options.onProgress?.(`${tag} critic reject: ${(review.feedback || review.issues[0] || "").slice(0, 60)}`);
-            return;
-          }
-
-          if (revisions >= maxCriticRevisions) {
+          if (bareReview.decision === "reject") {
             evalStore.setProbeStatus(
               probeId,
               "rejected",
-              `审题改写达到上限（${maxCriticRevisions} 次）：${review.feedback}`,
+              `裸答对抗复检放弃：${bareReview.feedback || bareReview.issues.join("; ")}`,
             );
             latestQuestionsBySourceId.get(source.id)?.delete(probeId);
-            options.onProgress?.(`${tag} critic exhausted after ${revisions} revisions`);
+            options.onProgress?.(`${makeTag()} bare-check reject: ${(bareReview.feedback || "").slice(0, 60)}`);
             return;
           }
 
-          options.onProgress?.(`${tag} critic revise (round ${roundNo}) -> 重写中...`);
-          const rewriteCall = await invokeTracked({
-            role: "probe_writer",
-            sourceMaterialId: source.id,
-            systemPrompt: writerPrompt,
-            inputRefs: {
-              probe_id: probeId,
-              source_material_id: source.id,
-              mode: "revise",
-              round_no: roundNo,
-            },
-            wireInput: {
-              material: source.content,
-              mode: "revise",
-              videoId: source.videoId,
-              slot: {
-                slotIndex: slot.slotIndex,
-                probeType: slot.probeType,
-                persona: slot.persona,
-                expectedBehavior: slot.expectedBehavior,
-              },
-              previousProbe: {
-                question: current.question,
-                anchor: current.anchor,
-                trap: current.trap,
-              },
-              issues: review.issues,
-              feedback: review.feedback,
-              ...(siblingQuestions.length > 0 ? { existingQuestions: siblingQuestions } : {}),
-            },
-            parse: (raw) => parseRevisedProbe(raw, slot.slotIndex),
-            tag: `${tag}[rw${roundNo}]`,
-          });
-
-          const revised = rewriteCall.parsed;
-          const nextAnchorVerified = verifyAnchorInMaterial(revised.anchor, source.content);
-          evalStore.reviseProbe(probeId, {
-            question: revised.question,
-            anchor: revised.anchor,
-            trap: revised.trap,
-            anchorVerified: nextAnchorVerified,
-          });
-          current.question = revised.question;
-          current.anchor = revised.anchor;
-          current.trap = revised.trap;
-          current.anchorVerified = nextAnchorVerified;
-          revisions++;
-          latestQuestionsBySourceId.get(source.id)?.set(probeId, current.question);
-
-          const dup = findNearDuplicate(current.question, siblingQuestions, DUPLICATE_NGRAM_THRESHOLD);
-          if (dup) {
+          if (bareRefinements >= maxBareRefinements) {
             evalStore.setProbeStatus(
               probeId,
               "rejected",
-              `改写后命中 n-gram 重复拦截（相似度 ${dup.similarity.toFixed(2)}）：${dup.matchedQuestion.slice(0, 48)}`,
+              `裸答对抗强化达到上限（${maxBareRefinements} 次）：${bareReview.feedback}`,
             );
             latestQuestionsBySourceId.get(source.id)?.delete(probeId);
-            duplicateRejected++;
-            options.onProgress?.(`${tag} rewrite duplicate rejected (sim=${dup.similarity.toFixed(2)})`);
+            options.onProgress?.(`${makeTag()} bare-check exhausted after ${bareRefinements} refinements`);
             return;
           }
+
+          bareRefinements++;
+          bareTriggeredRevisions++;
+          options.onProgress?.(`${makeTag()} bare-check revise -> 结合裸答回流改题...`);
+          await applyRewrite({
+            roundNo: reviewSeq,
+            issues: bareReview.issues,
+            feedback: bareReview.feedback,
+            bareAnswer: bareCall.parsed,
+            siblingQuestions: collectSiblingQuestions(),
+          });
+          // Re-enter outer loop so the sharpened probe goes through probe-critic again
         }
 
-        if (!passedCritic) return;
+        if (!passedStage2A) return;
+        criticAccepted++;
+        evalStore.setProbeStatus(probeId, "answering");
 
-        // ---- Stage 2B: Multi-turn dialogue loop (All-or-Nothing across turnNo = 1..slot.targetTurns) ----
+        // ---- Stage 2B: Multi-turn dialogue loop (All-or-Nothing across turnNo = 1..current.targetTurns) ----
         verifierEvaluated++;
         const historyMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+        const usedTactics: AdversaryTactic[] = [];
         interface PassedTurnInfo {
           turnNo: number;
           turnId: number;
@@ -535,22 +699,27 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
         }
         const passedTurns: PassedTurnInfo[] = [];
 
-        for (let turnNo = 1; turnNo <= slot.targetTurns; turnNo++) {
+        for (let turnNo = 1; turnNo <= current.targetTurns; turnNo++) {
           let turnUser = current.question;
-          let turnBehavior: ExpectedBehavior = slot.expectedBehavior;
+          let turnBehavior: ExpectedBehavior = current.expectedBehavior;
           let turnTactic: AdversaryTactic | undefined;
           let turnTrap = current.trap;
 
           if (turnNo > 1) {
-            turnTactic = slot.tactics[turnNo - 2];
             turnBehavior = "hold_position";
-            if (!turnTactic || !adversaryPrompt) {
-              throw new Error(`Probe ${probeId} Turn ${turnNo} 缺少施压手法或 adversary 提示词`);
+            if (!adversaryPrompt) {
+              throw new Error(`Probe ${probeId} Turn ${turnNo} 缺少 adversary 提示词`);
             }
 
-            // Draft & critic-check the pressure follow-up so it targets stance (not Turn-1 phrasing)
-            let acceptedPressure: { userContent: string; trap: string } | undefined;
-            let prevDraft: { userContent: string; trap: string } | undefined;
+            const tacticPool: readonly AdversaryTactic[] = isTrapProbeType(current.probeType)
+              ? TRAP_ADVERSARY_TACTICS
+              : PRESSURE_ADVERSARY_TACTICS;
+            const availableTactics = tacticPool.filter((t) => !usedTactics.includes(t));
+            const fallbackTactic: AdversaryTactic = availableTactics[0] ?? tacticPool[0]!;
+
+            // Adversary autonomously chooses the sharpest tactic against the actual previous turn
+            let acceptedPressure: { tactic: AdversaryTactic; userContent: string; trap: string } | undefined;
+            let prevDraft: { tactic: AdversaryTactic; userContent: string; trap: string } | undefined;
             let lastIssues: string[] = [];
             let lastFeedback = "";
 
@@ -562,23 +731,22 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
                 inputRefs: {
                   probe_id: probeId,
                   turn_no: turnNo,
-                  tactic: turnTactic,
                   round_no: advRound,
                 },
                 wireInput: {
                   material: source.content,
                   history: [...historyMessages],
-                  probeType: "pressure",
-                  persona: slot.persona,
-                  tactic: turnTactic,
+                  probeType: current.probeType,
+                  persona: current.persona,
+                  availableTactics: availableTactics.length > 0 ? availableTactics : [...tacticPool],
+                  ...(usedTactics.length > 0 ? { usedTactics: [...usedTactics] } : {}),
                   turnNo,
-                  targetTurns: slot.targetTurns,
+                  targetTurns: current.targetTurns,
                   anchor: current.anchor,
-                  ...(turnNo > 2 ? { usedTactics: slot.tactics.slice(0, turnNo - 2) } : {}),
                   ...(prevDraft ? { previousDraft: prevDraft, issues: lastIssues, feedback: lastFeedback } : {}),
                 },
-                parse: parseAdversaryTurn,
-                tag: `${tag}[t${turnNo}:adv${advRound}]`,
+                parse: (raw) => parseAdversaryTurn(raw, fallbackTactic),
+                tag: `${makeTag()}[t${turnNo}:adv${advRound}]`,
               });
 
               const draftAdv = advCall.parsed;
@@ -590,48 +758,51 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
                   probe_id: probeId,
                   mode: "pressure_turn",
                   turn_no: turnNo,
-                  tactic: turnTactic,
+                  tactic: draftAdv.tactic,
                   round_no: advRound,
                 },
                 wireInput: {
                   material: source.content,
                   history: [...historyMessages],
                   mode: "pressure_turn",
-                  probeType: "pressure",
-                  persona: slot.persona,
-                  tactic: turnTactic,
+                  probeType: current.probeType,
+                  persona: current.persona,
+                  tactic: draftAdv.tactic,
+                  ...(usedTactics.length > 0 ? { usedTactics: [...usedTactics] } : {}),
                   turnNo,
                   userContent: draftAdv.userContent,
                   trap: draftAdv.trap,
                 },
                 parse: parseCriticReview,
-                tag: `${tag}[t${turnNo}:pc${advRound}]`,
+                tag: `${makeTag()}[t${turnNo}:pc${advRound}]`,
               });
 
               const pReview = pCriticCall.parsed;
               if (pReview.decision === "accept") {
                 acceptedPressure = draftAdv;
-                options.onProgress?.(`${tag}[t${turnNo}:${turnTactic}] adversary accepted (round ${advRound})`);
+                options.onProgress?.(`${makeTag()}[t${turnNo}:${draftAdv.tactic}] adversary accepted (round ${advRound})`);
                 break;
               }
               if (pReview.decision === "reject" || advRound > maxCriticRevisions) {
                 evalStore.setProbeStatus(
                   probeId,
                   "dropped",
-                  `Turn ${turnNo}（${turnTactic}）施压话术未通过审题：${pReview.feedback || pReview.issues.join("; ")}`,
+                  `Turn ${turnNo}（${draftAdv.tactic}）施压话术未通过审题：${pReview.feedback || pReview.issues.join("; ")}`,
                 );
-                options.onProgress?.(`${tag}[t${turnNo}:${turnTactic}] adversary dropped by critic`);
+                options.onProgress?.(`${makeTag()}[t${turnNo}:${draftAdv.tactic}] adversary dropped by critic`);
                 return;
               }
               prevDraft = draftAdv;
               lastIssues = pReview.issues;
               lastFeedback = pReview.feedback;
-              options.onProgress?.(`${tag}[t${turnNo}:${turnTactic}] adversary revise (round ${advRound})`);
+              options.onProgress?.(`${makeTag()}[t${turnNo}:${draftAdv.tactic}] adversary revise (round ${advRound})`);
             }
 
             if (!acceptedPressure) return;
+            turnTactic = acceptedPressure.tactic;
             turnUser = acceptedPressure.userContent;
             turnTrap = acceptedPressure.trap;
+            usedTactics.push(turnTactic);
           }
 
           activeTurnId = evalStore.createTurn({
@@ -646,7 +817,6 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
           let feedback = "";
           let turnPassedAnswer: string | undefined;
           let turnPassedAttemptId: number | undefined;
-          const targetLength = targetLengthHintFor(slot.probeType, turnNo);
 
           for (let attemptNo = 1; attemptNo <= maxAnswerAttempts; attemptNo++) {
             const refCall = await invokeTracked({
@@ -664,13 +834,12 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
                 material: source.content,
                 ...(historyMessages.length > 0 ? { history: [...historyMessages] } : {}),
                 question: turnUser,
-                probeType: slot.probeType,
+                probeType: current.probeType,
                 expectedBehavior: turnBehavior,
-                targetLength,
                 ...(attemptNo > 1 ? { previousAnswer, feedback } : {}),
               },
               parse: (raw) => nonEmpty(raw, "参考答案"),
-              tag: `${tag}[t${turnNo}:a${attemptNo}]`,
+              tag: `${makeTag()}[t${turnNo}:a${attemptNo}]`,
             });
 
             const answer = refCall.parsed;
@@ -695,7 +864,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
               wireInput: {
                 material: source.content,
                 ...(historyMessages.length > 0 ? { history: [...historyMessages] } : {}),
-                probeType: slot.probeType,
+                probeType: current.probeType,
                 expectedBehavior: turnBehavior,
                 ...(turnTactic ? { tactic: turnTactic } : {}),
                 question: turnUser,
@@ -704,7 +873,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
                 answer,
               },
               parse: parseVerifierReview,
-              tag: `${tag}[t${turnNo}:v${attemptNo}]`,
+              tag: `${makeTag()}[t${turnNo}:v${attemptNo}]`,
             });
 
             const ver = verCall.parsed;
@@ -719,20 +888,20 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
               turnPassedAnswer = answer;
               turnPassedAttemptId = attemptId;
               evalStore.finishTurn(activeTurnId, "pass", attemptId);
-              options.onProgress?.(`${tag}[t${turnNo}/${slot.targetTurns}] verifier pass (attempt ${attemptNo})`);
+              options.onProgress?.(`${makeTag()}[t${turnNo}/${current.targetTurns}] verifier pass (attempt ${attemptNo})`);
               break;
             }
 
             if (ver.decision === "drop") {
               evalStore.finishTurn(activeTurnId, "dropped");
               evalStore.setProbeStatus(probeId, "dropped", `Turn ${turnNo} 核验放弃：${ver.feedback || ver.issues.join("; ")}`);
-              options.onProgress?.(`${tag}[t${turnNo}] verifier drop: ${(ver.feedback || ver.issues[0] || "").slice(0, 60)}`);
+              options.onProgress?.(`${makeTag()}[t${turnNo}] verifier drop: ${(ver.feedback || ver.issues[0] || "").slice(0, 60)}`);
               return;
             }
 
             previousAnswer = answer;
             feedback = ver.feedback;
-            options.onProgress?.(`${tag}[t${turnNo}] verifier revise (attempt ${attemptNo})`);
+            options.onProgress?.(`${makeTag()}[t${turnNo}] verifier revise (attempt ${attemptNo})`);
           }
 
           if (turnPassedAnswer === undefined || turnPassedAttemptId === undefined) {
@@ -742,7 +911,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
               "dropped",
               `Turn ${turnNo} 参考答案核验返工达到上限（${maxAnswerAttempts} 次）：${feedback}`,
             );
-            options.onProgress?.(`${tag}[t${turnNo}] verifier exhausted`);
+            options.onProgress?.(`${makeTag()}[t${turnNo}] verifier exhausted`);
             return;
           }
 
@@ -763,7 +932,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
 
         verifierPassed++;
 
-        // ---- Stage 2C: Extract rubric-v2 for EVERY passed turn, then atomically accept probe ----
+        // ---- Stage 2C: Extract concise transferable rubric-v2 for EVERY passed turn, then atomically accept ----
         const extractedRubrics: Array<{ turnId: number; rubric: ProbeRubricV2; callId: number }> = [];
         for (let tIdx = 0; tIdx < passedTurns.length; tIdx++) {
           const pt = passedTurns[tIdx];
@@ -782,7 +951,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
             wireInput: {
               material: source.content,
               ...(priorHistory.length > 0 ? { history: priorHistory } : {}),
-              probeType: slot.probeType,
+              probeType: current.probeType,
               expectedBehavior: pt.expectedBehavior,
               ...(pt.tactic ? { tactic: pt.tactic } : {}),
               question: pt.userContent,
@@ -790,8 +959,8 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
               trap: pt.trap,
               referenceAnswer: pt.answer,
             },
-            parse: (raw) => parseProbeRubric(raw, pt.expectedBehavior, slot.probeType),
-            tag: `${tag}[t${pt.turnNo}:rubric]`,
+            parse: (raw) => parseProbeRubric(raw, pt.expectedBehavior),
+            tag: `${makeTag()}[t${pt.turnNo}:rubric]`,
           });
           extractedRubrics.push({ turnId: pt.turnId, rubric: rubricCall.parsed, callId: rubricCall.callId });
         }
@@ -807,7 +976,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
           evalStore.setProbeStatus(probeId, "accepted");
         });
         options.onProgress?.(
-          `${tag} accepted (${passedTurns.length} turn${passedTurns.length > 1 ? "s" : ""}, rubrics=${extractedRubrics.length})`,
+          `${makeTag()} accepted (${passedTurns.length} turn${passedTurns.length > 1 ? "s" : ""}, rubrics=${extractedRubrics.length})`,
         );
       } catch (error) {
         probeErrors++;
@@ -816,7 +985,7 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
           evalStore.finishTurn(activeTurnId, "error");
         }
         evalStore.setProbeStatus(probeId, "error", msg);
-        options.onProgress?.(`${tag} error: ${msg}`);
+        options.onProgress?.(`${makeTag()} error: ${msg}`);
       }
     });
 
@@ -849,14 +1018,17 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
   return {
     runId,
     modelId,
+    ...(bareModelId ? { bareModelId } : {}),
     videos: sources.length,
-    plannedSlots: planSummary.totalSlots,
+    skippedVideos,
+    plannedSlots,
     draftedProbes,
     draftErrors,
-    duplicateRejected,
     criticEvaluated,
     criticAccepted,
     criticAcceptRate: criticEvaluated > 0 ? Number((criticAccepted / criticEvaluated).toFixed(4)) : 0,
+    bareChecked,
+    bareTriggeredRevisions,
     verifierEvaluated,
     verifierPassed,
     verifierPassRate: verifierEvaluated > 0 ? Number((verifierPassed / verifierEvaluated).toFixed(4)) : 0,

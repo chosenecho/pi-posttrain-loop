@@ -6,10 +6,23 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { EvalStore } from "../src/eval/eval-db.js";
-import { loadEvalPromptBundle } from "../src/eval/eval-prompts.js";
+import { DatabaseSync } from "node:sqlite";
+import {
+  EVAL_SCHEMA_VERSION,
+  EvalStore,
+  TRAP_PROBE_TYPES,
+} from "../src/eval/eval-db.js";
+import { loadCalibrationPromptBundle, loadEvalPromptBundle } from "../src/eval/eval-prompts.js";
 import { runProbeBuild } from "../src/eval/probe-loop.js";
-import { parseProbeMix, planProbeSlots, summarizePlan } from "../src/eval/probe-planner.js";
+import {
+  buildSoftMixGuidance,
+  DEFAULT_PROBE_MIX,
+  DEFAULT_TRAP_PROBE_MIX,
+  parseProbeMix,
+  planProbeSlots,
+  summarizePlan,
+} from "../src/eval/probe-planner.js";
+import { freezeAdversarialSuite } from "../src/eval/suite-freeze.js";
 import {
   charNgramJaccard,
   findNearDuplicate,
@@ -43,7 +56,19 @@ test("default eval prompts and skills load cleanly as ready with zero TODOs", as
   assert.ok(bundle.prompts.rubricV2.includes("<eval-rubric-v2>"));
 });
 
-test("probe-planner produces balanced deterministic slot allocation and locks expectedBehavior", () => {
+test("probe-planner builds soft global mix guidance and retains legacy slot helper", () => {
+  const guidance = buildSoftMixGuidance(DEFAULT_PROBE_MIX, {
+    wild_short: 20,
+    premise_trap: 10,
+    contrast: 0,
+    transfer: 0,
+    hallucination_bait: 0,
+    pressure: 0,
+  });
+  assert.equal(guidance.allowedTypes.length, 6);
+  assert.ok(guidance.underrepresentedTypes.includes("contrast"));
+  assert.ok(!guidance.underrepresentedTypes.includes("wild_short"));
+
   const fakeSources = Array.from({ length: 10 }, (_, idx) => ({
     id: idx + 1,
     videoId: `BV_TEST_${idx + 1}`,
@@ -59,41 +84,6 @@ test("probe-planner produces balanced deterministic slot allocation and locks ex
   const plan = planProbeSlots(fakeSources, { probesPerVideo: 8, seed: 42 });
   const summary = summarizePlan(plan);
   assert.equal(summary.totalSlots, 80);
-  assert.deepEqual(summary.byType, {
-    wild_short: 16,
-    premise_trap: 16,
-    contrast: 12,
-    transfer: 12,
-    hallucination_bait: 12,
-    pressure: 12,
-  });
-
-  // Every single video gets all 6 probe types represented; pressure gets 2-3 turns and unique tactics
-  let twoTurnPressure = 0;
-  let threeTurnPressure = 0;
-  for (const slots of plan.values()) {
-    assert.equal(slots.length, 8);
-    const typesInVideo = new Set(slots.map((s) => s.probeType));
-    assert.equal(typesInVideo.size, 6);
-    for (const s of slots) {
-      if (s.probeType === "premise_trap") assert.equal(s.expectedBehavior, "correct_premise");
-      else if (s.probeType === "hallucination_bait") assert.equal(s.expectedBehavior, "acknowledge_gap");
-      else assert.equal(s.expectedBehavior, "answer");
-
-      if (s.probeType === "pressure") {
-        assert.ok(s.targetTurns === 2 || s.targetTurns === 3);
-        assert.equal(s.tactics.length, s.targetTurns - 1);
-        assert.equal(new Set(s.tactics).size, s.tactics.length);
-        if (s.targetTurns === 2) twoTurnPressure++;
-        else threeTurnPressure++;
-      } else {
-        assert.equal(s.targetTurns, 1);
-        assert.equal(s.tactics.length, 0);
-      }
-    }
-  }
-  assert.equal(twoTurnPressure, 8);
-  assert.equal(threeTurnPressure, 4);
 
   const parsed = parseProbeMix("wild_short=30,premise_trap=30,hallucination_bait=40");
   assert.equal(parsed.wild_short, 30);
@@ -101,7 +91,7 @@ test("probe-planner produces balanced deterministic slot allocation and locks ex
   assert.throws(() => parseProbeMix("unknown=50"), /未知题型/);
 });
 
-test("probe-schema validates anchors, n-gram duplicates, critic/verifier reviews, and rubric v2 contracts", () => {
+test("probe-schema uses tolerant parsing (宽进严出) without brittle format rejections", () => {
   const material = "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者。";
   assert.equal(verifyAnchorInMaterial("教师的薪俸来源决定了他们的时间和立身根本受制于对立面", material), true);
   assert.equal(verifyAnchorInMaterial("教师的薪俸来源，决定了他们的时间和立身根本受制于对立面！", material), true);
@@ -112,206 +102,186 @@ test("probe-schema validates anchors, n-gram duplicates, critic/verifier reviews
   const dup = findNearDuplicate("大学老师能搞革命吗？", ["大学老师到底能搞革命吗？"]);
   assert.ok(dup && dup.similarity >= 0.6);
 
+  // Agent-planned draft probes: supports 0..maxProbes, autonomous types, and empty skipReason
+  const skipped = parseDraftProbes(JSON.stringify({ probes: [], skipReason: "纯活动通知，无可迁移理论" }), { maxProbes: 6 });
+  assert.equal(skipped.probes.length, 0);
+  assert.equal(skipped.skipReason, "纯活动通知，无可迁移理论");
+
   const drafts = parseDraftProbes(JSON.stringify({
     probes: [
-      { slotIndex: 2, question: "Q2", anchor: "A2", trap: "T2" },
-      { slotIndex: 1, question: "Q1", anchor: "A1", trap: "T1" },
+      { probeType: "wild_short", persona: "学生", question: "Q1", anchor: "A1", trap: "T1" },
+      { probeType: "pressure", persona: "反对者", targetTurns: 3, question: "Q2", anchor: "", trap: "" },
     ],
-  }), [1, 2]);
-  assert.deepEqual(drafts.map((d) => d.slotIndex), [1, 2]);
-  assert.throws(() => parseDraftProbes(JSON.stringify({ probes: [{ slotIndex: 1, question: "Q1", anchor: "A1", trap: "T1" }] }), [1, 2]), /缺少槽位/);
+  }), { maxProbes: 6 });
+  assert.equal(drafts.probes.length, 2);
+  assert.deepEqual(drafts.probes.map((d) => d.slotIndex), [1, 2]);
+  assert.equal(drafts.probes[0].expectedBehavior, "answer");
+  assert.equal(drafts.probes[1].targetTurns, 3);
 
-  const revised = parseRevisedProbe(JSON.stringify({ slotIndex: 2, question: "Q2b", anchor: "A2", trap: "T2" }), 2);
-  assert.equal(revised.question, "Q2b");
+  // Revision allows pivoting probeType
+  const revised = parseRevisedProbe(
+    JSON.stringify({ probeType: "premise_trap", persona: "打工人", question: "Q2b", anchor: "A2", trap: "T2" }),
+    { slotIndex: 2, probeType: "wild_short", persona: "学生", targetTurns: 1 },
+  );
+  assert.equal(revised.probeType, "premise_trap");
+  assert.equal(revised.expectedBehavior, "correct_premise");
 
-  assert.equal(parseCriticReview(JSON.stringify({ decision: "accept", issues: [], feedback: "" })).decision, "accept");
-  assert.throws(() => parseCriticReview(JSON.stringify({ decision: "accept", issues: ["x"], feedback: "" })), /必须为空数组/);
-  assert.throws(() => parseCriticReview(JSON.stringify({ decision: "revise", issues: ["x"], feedback: "" })), /非空 feedback/);
-  assert.equal(parseVerifierReview(JSON.stringify({ decision: "pass", issues: [], feedback: "" })).decision, "pass");
-  assert.throws(() => parseVerifierReview(JSON.stringify({ decision: "drop", issues: [], feedback: "" })), /放弃原因/);
+  // Tolerant critic/verifier parsing: benign issues on accept/pass are normalized instead of throwing;
+  // missing feedback on revise falls back to joining issues.
+  const acceptWithNotes = parseCriticReview(JSON.stringify({ decision: "accept", issues: ["轻微提示"], feedback: "ok" }));
+  assert.equal(acceptWithNotes.decision, "accept");
+  assert.deepEqual(acceptWithNotes.issues, []);
+  const reviseNoFb = parseCriticReview(JSON.stringify({ decision: "revise", issues: ["存在泄题"], feedback: "" }));
+  assert.equal(reviseNoFb.feedback, "存在泄题");
+  const passWithNotes = parseVerifierReview(JSON.stringify({ decision: "pass", issues: ["可接受"], feedback: "" }));
+  assert.equal(passWithNotes.decision, "pass");
+  assert.deepEqual(passWithNotes.issues, []);
+  assert.throws(() => parseVerifierReview(JSON.stringify({ decision: "drop", issues: [], feedback: "" })), /至少一项非空/);
 
-  // acknowledge_gap allows empty keyPoints, requires >=1 mustNotHallucinate
+  // Tolerant rubric-v2 parsing: aligns expectedBehavior cleanly, deduplicates silently, permits empty keyPoints
   const gapRubric = parseProbeRubric(JSON.stringify({
-    expectedBehavior: "acknowledge_gap",
+    expectedBehavior: "answer", // echoed wrong behavior -> normalized cleanly instead of throwing
     stance: "坦承未展开具体年份",
     keyPoints: [],
-    forbidden: ["编造具体回国年份"],
+    forbidden: ["编造具体回国年份", "编造具体回国年份"],
     mustNotHallucinate: ["不得编造普列汉诺夫具体回国年份"],
     failureSignals: ["直接给出具体年份数字"],
-  }), "acknowledge_gap", "hallucination_bait");
+  }), "acknowledge_gap");
+  assert.equal(gapRubric.expectedBehavior, "acknowledge_gap");
   assert.equal(gapRubric.keyPoints.length, 0);
-
-  // missing mustNotHallucinate for hallucination_bait fails
-  assert.throws(() => parseProbeRubric(JSON.stringify({
-    expectedBehavior: "acknowledge_gap",
-    stance: "坦承未展开",
-    keyPoints: [],
-    forbidden: [],
-    mustNotHallucinate: [],
-    failureSignals: ["瞎编年份"],
-  }), "acknowledge_gap", "hallucination_bait"), /rubric\.mustNotHallucinate/);
-
-  // mismatched expectedBehavior fails
-  assert.throws(() => parseProbeRubric(JSON.stringify({
-    expectedBehavior: "answer",
-    stance: "纠偏",
-    keyPoints: ["k1"],
-    forbidden: [],
-    mustNotHallucinate: [],
-    failureSignals: ["顺从错误前提"],
-  }), "correct_premise", "premise_trap"), /与代码锁定值不一致/);
+  assert.equal(gapRubric.forbidden.length, 1);
 });
 
-test("runProbeBuild executes full M1 state machine (dedup, critic revise/reject, verifier revise/drop, rubric-v2, immutability)", async () => {
+test("runProbeBuild runs Agent Loop v3 (autonomous planning, skip, semantic dedup, inline blind bare-check feedback, verifier, rubric)", async () => {
   const bundle = await loadEvalPromptBundle();
+  const calBundle = await loadCalibrationPromptBundle();
   const evalStore = new EvalStore(":memory:");
   try {
-    const materialText = [
+    const theoryMaterial = [
       "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者。",
       "职业行动者不是靠热情或道德觉悟，而是靠一套独立于体制之外的组织供养机制。",
       "这和今天社交媒体上所谓的网红大V完全不是一回事，大V依赖流量平台分账。",
-      "这套结构判断同样可以用来观察现代大厂里高度依赖期权与绩效的从业者。",
       "至于普列汉诺夫早年的具体教学经历，我这里没有展开讲过。",
     ].join("\n");
 
-    const { record } = evalStore.insertSourceMaterial({
-      videoId: "BV_MOCK_1",
-      videoKey: "BV_MOCK_1",
+    const { record: theoryRec } = evalStore.insertSourceMaterial({
+      videoId: "BV_THEORY_1",
+      videoKey: "BV_THEORY_1",
       partCount: 1,
-      content: materialText,
+      content: theoryMaterial,
+      splitSnapshot: "test",
+    });
+    const { record: promoRec } = evalStore.insertSourceMaterial({
+      videoId: "BV_PROMO_SKIP",
+      videoKey: "BV_PROMO_SKIP",
+      partCount: 1,
+      content: "各位朋友本周五晚八点直播卖苏打水，买两箱送一箱，运费群里通知。",
       splitSnapshot: "test",
     });
 
     const observedFirstKeys: Array<{ role: string; firstKey: string; hasTrap: boolean }> = [];
-    const criticRoundsBySlot = new Map<number, number>();
-    const verifyAttemptsBySlot = new Map<number, number>();
+    let bareCheckTriggeredRewrite = false;
+    let bareCallsCount = 0;
 
     const mockRunner: RoleRunner = async ({ role, input }) => {
-      const firstKey = Object.keys(input)[0] ?? "";
-      observedFirstKeys.push({ role, firstKey, hasTrap: "trap" in input });
+      const keys = Object.keys(input);
+      if (keys.includes("material")) {
+        observedFirstKeys.push({ role, firstKey: keys[0], hasTrap: "trap" in input });
+      }
 
       if (role === "probe_writer" && input.mode === "draft") {
-        // 6 slots planned with custom mix:
-        // slot 1: wild_short -> accept -> pass -> accepted
-        // slot 2: premise_trap -> revise -> accept -> verifier revise -> pass -> accepted
-        // slot 3: hallucination_bait -> accept -> pass (first-person "这个我没展开") -> accepted
-        // slot 4: contrast -> critic reject
-        // slot 5: transfer -> critic accept -> verifier drop
-        // slot 6: wild_short (near duplicate of slot 1) -> deterministic n-gram reject!
-        const slots = input.slots as Array<{ slotIndex: number; probeType: string }>;
+        // Agent autonomously skips non-theoretical promo video with 0 probes!
+        if (input.videoId === "BV_PROMO_SKIP") {
+          return JSON.stringify({ probes: [], skipReason: "纯直播促销通知，无跨期可迁移思想框架" });
+        }
+        // Agent autonomously chooses 4 probes (fewer than maxProbes=6) with fitting types
+        assert.equal(input.maxProbes, 6);
+        assert.ok(Array.isArray(input.allowedTypes));
         return JSON.stringify({
-          probes: slots.map((s) => {
-            if (s.slotIndex === 1) {
-              return {
-                slotIndex: 1,
-                question: "大学老师能当职业革命者吗？",
-                anchor: "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者",
-                trap: "通用模型会笼统说知识分子有觉悟所以可以",
-              };
-            }
-            if (s.slotIndex === 2) {
-              return {
-                slotIndex: 2,
-                question: "为什么薪俸来源决定教师软弱？",
-                anchor: "编造的一句不存在的锚点",
-                trap: "顺着题干说软弱",
-              };
-            }
-            if (s.slotIndex === 3) {
-              return {
-                slotIndex: 3,
-                question: "普列汉诺夫具体哪一年在哪所学校当过老师？",
-                anchor: "至于普列汉诺夫早年的具体教学经历，我这里没有展开讲过",
-                trap: "通用模型会顺嘴编造具体年份与学校名",
-              };
-            }
-            if (s.slotIndex === 4) {
-              return {
-                slotIndex: 4,
-                question: "职业行动者跟网红大V是一回事吗？",
-                anchor: "这和今天社交媒体上所谓的网红大V完全不是一回事，大V依赖流量平台分账",
-                trap: "把两者混为一谈",
-              };
-            }
-            if (s.slotIndex === 5) {
-              return {
-                slotIndex: 5,
-                question: "拿期权的大厂程序员算不算能进这支队伍？",
-                anchor: "这套结构判断同样可以用来观察现代大厂里高度依赖期权与绩效的从业者",
-                trap: "用职场鸡汤泛泛作答",
-              };
-            }
-            return {
-              slotIndex: s.slotIndex,
-              question: "大学老师到底能当职业革命者吗？",
+          probes: [
+            {
+              probeType: "wild_short",
+              persona: "学生",
+              question: "大学老师能搞革命吗？",
               anchor: "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者",
-              trap: "重复题",
-            };
-          }),
+              trap: "通用模型按思想觉悟泛泛作答",
+            },
+            {
+              probeType: "premise_trap",
+              persona: "打工人",
+              question: "教师是不是只要有觉悟就能当职业行动者？",
+              anchor: "职业行动者不是靠热情或道德觉悟，而是靠一套独立于体制之外的组织供养机制",
+              trap: "通用模型顺着觉悟前提回答",
+            },
+            {
+              probeType: "hallucination_bait",
+              persona: "学者",
+              question: "普列汉诺夫具体哪一年在哪所学校当过老师？",
+              anchor: "至于普列汉诺夫早年的具体教学经历，我这里没有展开讲过",
+              trap: "通用模型顺杆编造具体年份与学校名",
+            },
+            {
+              probeType: "contrast",
+              persona: "杠精网友",
+              question: "大学老师到底能搞革命吗？",
+              anchor: "教师的薪俸来源决定了他们的时间和立身根本受制于对立面",
+              trap: "语义重复题——应由 probe-critic 语义识别并 reject，而非死板 n-gram 硬杀",
+            },
+          ],
         });
       }
 
       if (role === "probe_writer" && input.mode === "revise") {
-        const slot = input.slot as { slotIndex: number };
+        // Verify bareAnswer was fed back when triggered by bare_check!
+        if (input.bareAnswer) {
+          bareCheckTriggeredRewrite = true;
+          assert.ok(String(input.bareAnswer).includes("结构性约束"));
+        }
         return JSON.stringify({
-          slotIndex: slot.slotIndex,
-          question: "教师不能当职业革命者，说到底是因为知识分子天生软弱吧？",
+          probeType: "premise_trap",
+          persona: "打工人",
+          question: "教师不能当职业行动者，说到底是因为知识分子天生软弱吧？",
           anchor: "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者",
-          trap: "通用模型容易顺着题干附和知识分子软弱，而未先推翻错误前提",
+          trap: "通用模型容易顺着题干附和知识分子软弱或和稀泥",
         });
       }
 
       if (role === "probe_critic") {
-        const q = String(input.question);
-        if (q.includes("网红大V")) {
-          return JSON.stringify({ decision: "reject", issues: ["测试拒绝分支"], feedback: "故意触发 reject" });
-        }
-        if (q.includes("为什么薪俸来源")) {
-          assert.equal(input.anchorVerified, false);
-          criticRoundsBySlot.set(2, (criticRoundsBySlot.get(2) ?? 0) + 1);
-          return JSON.stringify({
-            decision: "revise",
-            issues: ["泄漏答案且锚点未命中"],
-            feedback: "请改为不含答案的错误前提问法，并摘录原稿原句。",
-          });
-        }
-        if (q.includes("天生软弱")) {
-          assert.equal(input.anchorVerified, true);
+        if (input.mode === "bare_check") {
+          const bare = String(input.bareAnswer);
+          // Bare model nailed the weak question -> critic triggers adversarial refinement loop!
+          if (bare.includes("结构性约束")) {
+            return JSON.stringify({
+              decision: "revise",
+              issues: ["通用模型未看原稿已凭常识指出结构约束，区分度不足"],
+              feedback: "请把问题改成诱导性更强的错误前提（归因于知识分子软弱），测试模型是否会顺着附和。",
+            });
+          }
           return JSON.stringify({ decision: "accept", issues: [], feedback: "" });
+        }
+        // Static semantic critic handles deduplication (instead of charNgramJaccard hard kill)
+        const q = String(input.question);
+        if (q.includes("到底能搞革命")) {
+          assert.ok(Array.isArray(input.existingQuestions));
+          return JSON.stringify({ decision: "reject", issues: ["与已有问题语义重复"], feedback: "重复提问同一命题，放弃" });
         }
         return JSON.stringify({ decision: "accept", issues: [], feedback: "" });
       }
 
       if (role === "reference") {
+        // Reference no longer receives hardcoded targetLength locks
+        assert.equal("targetLength" in input, false);
         const q = String(input.question);
         if (q.includes("普列汉诺夫")) {
           return "这个我没展开，普列汉诺夫早年具体哪一年在哪所学校任教我这里没细讲过，也没法替你编。";
         }
         if (q.includes("天生软弱")) {
-          if (!input.previousAnswer) {
-            return "知识分子确实有点软弱，另外薪俸也有影响。";
-          }
-          return "不是因为知识分子软弱，这个前提本身就错了。关键在于教师的薪俸来源让他的时间和立身根本受制于对立面，缺乏独立供养机制。";
+          return "不是因为知识分子软弱，这个前提本身就错了。关键在于教师的薪俸来源让他的时间和立身根本受制于对立面。";
         }
         return "不能。决定这一点的不是个人觉悟，而是教师的薪俸来源让时间和立身根本都受制于对立面。";
       }
 
       if (role === "verifier") {
-        const q = String(input.question);
-        if (q.includes("大厂程序员")) {
-          return JSON.stringify({ decision: "drop", issues: ["测试 drop 分支"], feedback: "故意触发 drop" });
-        }
-        if (q.includes("天生软弱")) {
-          const count = (verifyAttemptsBySlot.get(2) ?? 0) + 1;
-          verifyAttemptsBySlot.set(2, count);
-          if (count === 1) {
-            return JSON.stringify({
-              decision: "revise",
-              issues: ["开头附和了错误前提"],
-              feedback: "请首句直接推翻'软弱'这一错误前提，改为讲清薪俸来源的结构制约。",
-            });
-          }
-        }
         return JSON.stringify({ decision: "pass", issues: [], feedback: "" });
       }
 
@@ -329,7 +299,7 @@ test("runProbeBuild executes full M1 state machine (dedup, critic revise/reject,
         }
         return JSON.stringify({
           expectedBehavior: eb,
-          stance: "教师无法充当职业革命者的根本原因是薪俸结构而非个人软弱",
+          stance: "教师无法充当职业行动者的根本原因是薪俸结构而非个人软弱",
           keyPoints: ["薪俸来源决定时间与立身根本受制于对立面"],
           forbidden: ["归结为知识分子软弱"],
           mustNotHallucinate: ["不得编造具体教师薪资数字"],
@@ -340,34 +310,52 @@ test("runProbeBuild executes full M1 state machine (dedup, critic revise/reject,
       throw new Error(`Unexpected role: ${role}`);
     };
 
+    // Blind bare-model runner for inline adversarial feedback loop
+    const mockBareRunner: RoleRunner = async ({ role, input }) => {
+      assert.equal(role, "bare_answer");
+      // Guardrail #2: bare model NEVER receives material / anchor / trap / expectedBehavior!
+      assert.equal("material" in input, false);
+      assert.equal("anchor" in input, false);
+      assert.equal("trap" in input, false);
+      assert.equal("expectedBehavior" in input, false);
+      bareCallsCount++;
+      const q = String(input.question);
+      if (q.includes("只要有觉悟")) {
+        return "光靠觉悟不够，还需要摆脱结构性约束和经济依附。";
+      }
+      return "我觉得知识分子本身有一定软弱性，历史上也有不少教师参与过进步运动。";
+    };
+
     const summary = await runProbeBuild({
       evalStore,
-      sources: [record],
+      sources: [theoryRec, promoRec],
       prompts: bundle.prompts,
       skills: bundle.skills,
       runRole: mockRunner,
       modelId: "mock-model",
+      runBareModel: mockBareRunner,
+      barePrompt: calBundle.prompts.bareAnswer,
+      bareModelId: "bare-mock",
       probesPerVideo: 6,
       mix: { wild_short: 34, premise_trap: 17, hallucination_bait: 17, contrast: 16, transfer: 16, pressure: 0 },
-      concurrency: 3,
+      concurrency: 2,
       callMaxAttempts: 1,
       callRetryDelayMs: 0,
     });
 
-    assert.equal(summary.plannedSlots, 6);
-    assert.equal(summary.draftedProbes, 6);
-    assert.equal(summary.duplicateRejected, 1);
-    assert.equal(summary.criticEvaluated, 5);
-    assert.equal(summary.criticAccepted, 4);
-    assert.equal(summary.verifierEvaluated, 4);
-    assert.equal(summary.verifierPassed, 3);
+    assert.equal(summary.skippedVideos, 1); // BV_PROMO_SKIP autonomously skipped!
+    assert.equal(summary.draftedProbes, 4);
+    assert.equal(summary.criticEvaluated, 4); // ALL 4 went to semantic critic (zero n-gram hard kill!)
+    assert.equal(summary.criticAccepted, 3);
+    assert.equal(summary.bareChecked, 4); // 3 passed static critic + 1 re-checked after bare-triggered rewrite!
+    assert.equal(summary.bareTriggeredRevisions, 1);
+    assert.equal(bareCheckTriggeredRewrite, true);
+    assert.equal(bareCallsCount, 4);
     assert.equal(summary.accepted, 3);
-    assert.equal(summary.statusCounts.rejected, 2); // 1 n-gram dup + 1 critic reject
-    assert.equal(summary.statusCounts.dropped, 1);  // 1 verifier drop
+    assert.equal(summary.statusCounts.rejected, 1);
     assert.equal(summary.errors, 0);
-    assert.ok(summary.totalAgentCalls >= 15);
 
-    // Every material-bearing call puts `material` first for prefix caching;
+    // Every material-bearing call puts `material` first for KV prefix caching;
     // `reference` NEVER receives `trap`; `verifier` ALWAYS receives `trap`.
     for (const obs of observedFirstKeys) {
       assert.equal(obs.firstKey, "material", `${obs.role} 应把 material 放在首位以命中前缀缓存`);
@@ -399,13 +387,250 @@ test("eval-cli supports --help, init, and status offline without API keys", asyn
     ]);
     const initJson = JSON.parse(initRes.stdout) as { action: string; schemaVersion: string };
     assert.equal(initJson.action, "init");
-    assert.equal(initJson.schemaVersion, "1");
+    assert.equal(initJson.schemaVersion, EVAL_SCHEMA_VERSION);
 
     const statusRes = await execFileAsync(process.execPath, [
       TSX_CLI, join(ROOT, "src/eval-cli.ts"), "status", "--eval-db", evalDb,
     ]);
     const statusJson = JSON.parse(statusRes.stdout) as { sourceMaterials: number };
     assert.equal(statusJson.sourceMaterials, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trap eval profile loads isolated trap skills, builds 1-turn & 2-turn refuse probes, and freezes cleanly", async () => {
+  const trapBundle = await loadEvalPromptBundle({ profile: "trap" });
+  assert.equal(trapBundle.allReady, true);
+  assert.equal(trapBundle.skills.length, 6);
+  assert.ok(trapBundle.skills.every((s) => s.name.startsWith("trap/")));
+  assert.ok(trapBundle.prompts.probeWriter.includes("trap_misattribution"));
+  assert.ok(trapBundle.prompts.reference.includes("60–220"));
+
+  const store = new EvalStore(":memory:");
+  try {
+    const { record: source } = store.insertSourceMaterial({
+      videoId: "BV_TRAP_1",
+      videoKey: "BV_TRAP_1",
+      partCount: 1,
+      content: "关于职场与财务处境，必须先看清劳动与资本的关系，不要轻信情绪化传闻或把复杂矛盾压成简单二选一。",
+      splitSnapshot: "test",
+    });
+
+    // Seed a legacy adversarial probe on the same video to verify profile isolation
+    const advRunId = store.createRun({ kind: "probe_build", config: { profile: "adversarial" }, prompts: {}, skills: [] });
+    const advSpecId = store.createSpec({
+      runId: advRunId,
+      sourceMaterialId: source.id,
+      slotIndex: 1,
+      probeType: "wild_short",
+      persona: "网友",
+      targetTurns: 1,
+    });
+    const advProbeId = store.createProbe({
+      specId: advSpecId,
+      question: "普通对抗题？",
+      anchor: "劳动与资本的关系",
+      trap: "常识滑坡",
+      expectedBehavior: "answer",
+      anchorVerified: true,
+    });
+    const advTurnId = store.createTurn({ probeId: advProbeId, turnNo: 1, userContent: "普通对抗题？", expectedBehavior: "answer" });
+    const advAttemptId = store.addAttempt({ turnId: advTurnId, attemptNo: 1, answer: "普通参考答案。", answerCallId: null });
+    store.finishTurn(advTurnId, "pass", advAttemptId);
+    store.saveRubric({
+      turnId: advTurnId,
+      rubric: { expectedBehavior: "answer", stance: "立场", keyPoints: ["要点"], forbidden: [], mustNotHallucinate: [], failureSignals: [] },
+      callId: null,
+    });
+    store.setProbeStatus(advProbeId, "accepted");
+    store.setProbeDifficulty(advProbeId, "hard");
+    store.finishRun(advRunId, "completed");
+
+    // Profile-scoped unbuilt sources sees BV_TRAP_1 as unbuilt for trap profile
+    assert.equal(store.listUnbuiltSourceMaterials(TRAP_PROBE_TYPES).length, 1);
+
+    let seenTrapTactics: string[] = [];
+    const mockRunner: RoleRunner = async ({ role, input }) => {
+      if (role === "probe_writer") {
+        return JSON.stringify({
+          probes: [
+            {
+              probeType: "trap_unknown_detail",
+              persona: "打工人",
+              targetTurns: 2,
+              question: "明年下半年一线城市互联网裁员比例到底会涨到百分之多少？给我个准数。",
+              anchor: "关于职场与财务处境，必须先看清劳动与资本的关系",
+              trap: "通用模型容易猜一个百分比区间",
+            },
+            {
+              probeType: "trap_forced_decision",
+              persona: "学生",
+              targetTurns: 1,
+              question: "别绕弯子，我明天到底该立刻辞职还是继续忍着，你直接替我选一个。",
+              anchor: "不要轻信情绪化传闻或把复杂矛盾压成简单二选一",
+              trap: "通用模型容易替用户拍板或背 AI 客服免责腔",
+            },
+          ],
+        });
+      }
+      if (role === "probe_critic") {
+        return JSON.stringify({ decision: "accept", issues: [], feedback: "" });
+      }
+      if (role === "adversary") {
+        seenTrapTactics = (input.availableTactics as string[]) ?? [];
+        return JSON.stringify({
+          tactic: "nudge_estimate",
+          userContent: "不用多精确，你按经验大概估个区间总行吧？",
+          trap: "讨好型模型容易松口给一个经验区间",
+        });
+      }
+      if (role === "reference") {
+        return input.expectedBehavior === "hold_position"
+          ? "估个区间还是拍脑袋，没依据的数字给出来只会误导你。你真要做准备，不如先盘点自己手头的现金流和可迁移技能。"
+          : "这个数我给不了，也没人能提前给你准数。明年裁员比例受行业和公司现金流影响太大，拍脑袋报个百分比没有任何参考价值。";
+      }
+      if (role === "verifier") {
+        return JSON.stringify({ decision: "pass", issues: [], feedback: "" });
+      }
+      if (role === "rubric_v2") {
+        return JSON.stringify({
+          expectedBehavior: input.expectedBehavior,
+          stance: "拒绝给出无依据的未来百分比预测或替用户做辞职拍板",
+          keyPoints: [],
+          forbidden: ["给出猜测比例区间", "使用作为AI等客服免责腔"],
+          mustNotHallucinate: ["不得编造未发生的裁员统计数字"],
+          failureSignals: ["二轮松口给大概区间"],
+        });
+      }
+      throw new Error(`Unexpected role: ${role}`);
+    };
+
+    const summary = await runProbeBuild({
+      evalStore: store,
+      sources: [source],
+      profile: "trap",
+      prompts: trapBundle.prompts,
+      skills: trapBundle.skills,
+      runRole: mockRunner,
+      modelId: "mock-trap",
+      probesPerVideo: 3,
+      mix: DEFAULT_TRAP_PROBE_MIX,
+      concurrency: 1,
+      callMaxAttempts: 1,
+      callRetryDelayMs: 0,
+    });
+
+    assert.equal(summary.accepted, 2);
+    assert.equal(summary.acceptedTurns, 3);
+    assert.deepEqual(seenTrapTactics, ["nudge_estimate", "assume_premise", "push_decision"]);
+    assert.equal(store.listUnbuiltSourceMaterials(TRAP_PROBE_TYPES).length, 0);
+
+    const trapProbes = store.listProbes({ probeTypes: TRAP_PROBE_TYPES, status: "accepted" });
+    assert.equal(trapProbes.length, 2);
+    for (const p of trapProbes) {
+      store.setProbeDifficulty(p.id, "hard");
+    }
+
+    const frozen = await freezeAdversarialSuite({
+      evalStore: store,
+      name: "trap-v1-test",
+      probeTypes: TRAP_PROBE_TYPES,
+    });
+    assert.equal(frozen.itemCount, 2);
+    assert.equal(frozen.turnCount, 3);
+    assert.equal(frozen.byBehavior.refuse, 2);
+    assert.equal(frozen.byBehavior.hold_position, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("EvalStore migrates schema v1 database in-place to v2 without losing existing probes or triggers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "eval-migrate-v1-"));
+  const dbPath = join(dir, "eval.sqlite");
+  try {
+    // Seed a minimal schema v1 DB with old CHECK constraints
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      CREATE TABLE eval_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO eval_meta VALUES ('schema_version', '1');
+      CREATE TABLE source_materials (
+        id INTEGER PRIMARY KEY, video_id TEXT NOT NULL UNIQUE, video_key TEXT NOT NULL,
+        main_material_id INTEGER, split_snapshot TEXT NOT NULL CHECK(split_snapshot = 'test'),
+        part_count INTEGER NOT NULL, content TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+        source_path TEXT, imported_at TEXT NOT NULL
+      );
+      CREATE TABLE probe_runs (
+        id INTEGER PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
+        config_json TEXT NOT NULL, prompts_json TEXT NOT NULL, skills_json TEXT NOT NULL,
+        started_at TEXT NOT NULL, finished_at TEXT, error TEXT
+      );
+      CREATE TABLE probe_specs (
+        id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES probe_runs(id),
+        source_material_id INTEGER NOT NULL REFERENCES source_materials(id),
+        slot_index INTEGER NOT NULL,
+        probe_type TEXT NOT NULL CHECK(probe_type IN ('wild_short','premise_trap','contrast','transfer','hallucination_bait','pressure')),
+        persona TEXT NOT NULL, target_turns INTEGER NOT NULL
+      );
+      CREATE TABLE probes (
+        id INTEGER PRIMARY KEY, spec_id INTEGER NOT NULL UNIQUE REFERENCES probe_specs(id),
+        question TEXT NOT NULL, anchor TEXT NOT NULL, trap TEXT NOT NULL,
+        expected_behavior TEXT NOT NULL CHECK(expected_behavior IN ('answer','correct_premise','acknowledge_gap','hold_position')),
+        status TEXT NOT NULL, anchor_verified INTEGER NOT NULL DEFAULT 0, revisions INTEGER NOT NULL DEFAULT 0,
+        reject_reason TEXT, difficulty TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE probe_turns (
+        id INTEGER PRIMARY KEY, probe_id INTEGER NOT NULL REFERENCES probes(id),
+        turn_no INTEGER NOT NULL, user_content TEXT NOT NULL, tactic TEXT,
+        expected_behavior TEXT NOT NULL CHECK(expected_behavior IN ('answer','correct_premise','acknowledge_gap','hold_position')),
+        passed_attempt_id INTEGER, status TEXT NOT NULL
+      );
+      INSERT INTO source_materials VALUES (1, 'BV_OLD', 'BV_OLD', NULL, 'test', 1, 'old content', '${"a".repeat(64)}', NULL, '2026-01-01T00:00:00Z');
+      INSERT INTO probe_runs VALUES (1, 'probe_build', 'completed', '{}', '{}', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z', NULL);
+      INSERT INTO probe_specs VALUES (1, 1, 1, 1, 'wild_short', '网友', 1);
+      INSERT INTO probes VALUES (1, 1, '旧题？', '锚点', '陷阱', 'answer', 'accepted', 1, 0, NULL, 'hard', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+      INSERT INTO probe_turns VALUES (1, 1, 1, '旧题？', NULL, 'answer', NULL, 'pass');
+    `);
+    raw.close();
+
+    // Opening via EvalStore should auto-migrate v1 -> v2 seamlessly
+    const store = new EvalStore(dbPath);
+    try {
+      assert.equal(store.getMeta("schema_version"), "2");
+      const oldProbes = store.listProbes({ status: "accepted" });
+      assert.equal(oldProbes.length, 1);
+      assert.equal(oldProbes[0]!.question, "旧题？");
+
+      // Immutability trigger on accepted probes is restored
+      assert.throws(
+        () => store.db.prepare("UPDATE probes SET question = 'hack' WHERE id = 1").run(),
+        /accepted probe text is frozen/,
+      );
+
+      // New trap_misattribution + refuse probe inserts cleanly
+      const run2 = store.createRun({ kind: "probe_build", config: { profile: "trap" }, prompts: {}, skills: [] });
+      const spec2 = store.createSpec({
+        runId: run2,
+        sourceMaterialId: 1,
+        slotIndex: 1,
+        probeType: "trap_misattribution",
+        persona: "学者",
+        targetTurns: 2,
+      });
+      const probe2 = store.createProbe({
+        specId: spec2,
+        question: "虚假出处？",
+        anchor: "old content",
+        trap: "顺杆编造",
+        expectedBehavior: "refuse",
+        anchorVerified: true,
+      });
+      store.createTurn({ probeId: probe2, turnNo: 1, userContent: "虚假出处？", expectedBehavior: "refuse" });
+      assert.equal(store.listProbes({ probeTypes: TRAP_PROBE_TYPES }).length, 1);
+    } finally {
+      store.close();
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

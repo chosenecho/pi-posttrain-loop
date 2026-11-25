@@ -12,6 +12,7 @@ import {
   loadVideoChunks,
   loadVideoUnit,
   mergeVideoParts,
+  rankVideosCoreFirst,
   scanCorpusVideos,
   selectVideos,
   summarizeCorpusStatus,
@@ -303,21 +304,42 @@ test("batch-cli runs end-to-end video selection, question generation, 2-turn jud
   assert.match(second.stdout, /"selectedVideos": 0/);
 });
 
-test("computeQuestionQuota caps single-P by length and scales multi-P only by substantial parts", () => {
-  // Single-P tiers: <2500 -> 3, 2500..7999 -> 5, 8000..19999 -> 7, >=20000 -> 9
-  assert.equal(computeQuestionQuota(1400, 1), 3);
-  assert.equal(computeQuestionQuota(5000, 1), 5);
-  assert.equal(computeQuestionQuota(12000, 1), 7);
-  assert.equal(computeQuestionQuota(25000, 1), 9);
+test("computeQuestionQuota keeps compact v2 quotas (2-6) to maximize corpus video coverage", () => {
+  // Single-P tiers: <1500 -> 2, 1500..4999 -> 3, 5000..14999 -> 4, >=15000 -> 5
+  assert.equal(computeQuestionQuota(1200, 1), 2);
+  assert.equal(computeQuestionQuota(3500, 1), 3);
+  assert.equal(computeQuestionQuota(10000, 1), 4);
+  assert.equal(computeQuestionQuota(25000, 1), 5);
 
   // Tiny multi-P slices (9P totaling 3600 chars) do not get inflated bonus
-  assert.equal(computeQuestionQuota(3600, 9), 5);
+  assert.equal(computeQuestionQuota(3600, 9), 3);
 
-  // Substantial multi-P (4P totaling 11500 chars) gets +3 bonus -> 10
-  assert.equal(computeQuestionQuota(11500, 4), 10);
+  // Substantial multi-P (4P totaling 11500 chars -> effectiveParts=4 >= 3) gets +1 -> 5; >=15000 gets +1 -> 6
+  assert.equal(computeQuestionQuota(11500, 4), 5);
+  assert.equal(computeQuestionQuota(20000, 4), 6);
 
   // Manual maxCap override clamps result
-  assert.equal(computeQuestionQuota(25000, 4, 6), 6);
+  assert.equal(computeQuestionQuota(25000, 4, 4), 4);
+});
+
+test("rankVideosCoreFirst prioritizes substantial multi-P series, then substantial single-P lectures, demoting short clips", async (t) => {
+  const dir = await tempDir(t);
+  await mkdir(join(dir, "by_bv", "BV_SHORT"), { recursive: true });
+  await mkdir(join(dir, "by_bv", "BV_LONG_SINGLE"), { recursive: true });
+  await mkdir(join(dir, "by_bv", "BV_MULTI_SERIES"), { recursive: true });
+
+  await writeFile(join(dir, "by_bv", "BV_SHORT", "P001.md"), "短通知".repeat(100));
+  await writeFile(join(dir, "by_bv", "BV_LONG_SINGLE", "P001.md"), "长理论单篇".repeat(2000));
+  await writeFile(join(dir, "by_bv", "BV_MULTI_SERIES", "P001.md"), "系列课上".repeat(600));
+  await writeFile(join(dir, "by_bv", "BV_MULTI_SERIES", "P002.md"), "系列课下".repeat(600));
+
+  const units = await scanCorpusVideos(dir);
+  const ranked = await rankVideosCoreFirst(units);
+  assert.deepEqual(ranked.map((u) => u.videoId), [
+    "BV_MULTI_SERIES",
+    "BV_LONG_SINGLE",
+    "BV_SHORT",
+  ]);
 });
 
 test("loadVideoChunks keeps normal multi-P merged and splits oversized multi-P series along part boundaries", async (t) => {

@@ -50,8 +50,8 @@ test("all four default prompt files load cleanly with zero leftover TODO placeho
   assert.match(prompts.answer, /feedback/);
   assert.match(prompts.answer, /仅输出.*答案正文/);
   assert.match(prompts.answer, /数据库/);
-  assert.match(prompts.judge, /仅包含.*question.*answer/);
-  assert.match(prompts.judge, /原始材料.*未提供/);
+  assert.match(prompts.judge, /material.*question.*answer/);
+  assert.match(prompts.judge, /忠实度/);
   const examples = prompts.judge.match(/^\{"decision":.+\}$/gm) ?? [];
   assert.deepEqual(examples.map((text) => parseReview(text).decision), ["pass", "revise", "drop"]);
 });

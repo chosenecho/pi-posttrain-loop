@@ -10,6 +10,16 @@ export const DEFAULT_ANSWER_STYLE = fileURLToPath(new URL("../skills/answer-styl
 export const DEFAULT_QUALITY_JUDGE = fileURLToPath(new URL("../skills/quality-judge/SKILL.md", import.meta.url));
 export const DEFAULT_EVAL_RUBRIC_SKILL = fileURLToPath(new URL("../skills/eval-rubric/SKILL.md", import.meta.url));
 
+export const SHORT_QUESTION_SKILL = fileURLToPath(new URL("../skills/short/question-design/SKILL.md", import.meta.url));
+export const SHORT_FOLLOWUP_SKILL = fileURLToPath(new URL("../skills/short/followup-strategy/SKILL.md", import.meta.url));
+export const SHORT_ANSWER_STYLE = fileURLToPath(new URL("../skills/short/answer-style/SKILL.md", import.meta.url));
+export const SHORT_QUALITY_JUDGE = fileURLToPath(new URL("../skills/short/quality-judge/SKILL.md", import.meta.url));
+
+export const TRAP_QUESTION_SKILL = fileURLToPath(new URL("../skills/trap/question-design/SKILL.md", import.meta.url));
+export const TRAP_FOLLOWUP_SKILL = fileURLToPath(new URL("../skills/trap/followup-strategy/SKILL.md", import.meta.url));
+export const TRAP_ANSWER_STYLE = fileURLToPath(new URL("../skills/trap/answer-style/SKILL.md", import.meta.url));
+export const TRAP_QUALITY_JUDGE = fileURLToPath(new URL("../skills/trap/quality-judge/SKILL.md", import.meta.url));
+
 export async function readMaterials(path: string): Promise<Material[]> {
   const text = (await readFile(path, "utf8")).replace(/^\uFEFF/, "");
   const seen = new Set<string>();

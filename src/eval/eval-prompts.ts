@@ -4,9 +4,98 @@ import { fileURLToPath } from "node:url";
 import { DEFAULT_ANSWER_STYLE, isEvalSkillPath, readSkillFile } from "../io.js";
 import { nonEmpty } from "../schema.js";
 import type { Skill } from "../types.js";
+import type { EvalProfile } from "./eval-db.js";
 
 export const DEFAULT_EVAL_PROMPTS_DIR = fileURLToPath(new URL("../../prompts/eval", import.meta.url));
 export const DEFAULT_EVAL_SKILLS_DIR = fileURLToPath(new URL("../../skills/eval", import.meta.url));
+export const DEFAULT_CANDIDATE_SYSTEM_PROMPT_PATH = join(DEFAULT_EVAL_PROMPTS_DIR, "candidate-system.md");
+
+export async function loadDefaultCandidateSystemPrompt(
+  promptPath: string = DEFAULT_CANDIDATE_SYSTEM_PROMPT_PATH,
+): Promise<string> {
+  const raw = await readFile(promptPath, "utf8");
+  return nonEmpty(raw.replace(/^\uFEFF/, ""), "默认候选模型系统提示词（prompts/eval/candidate-system.md）");
+}
+
+export type CandidateSystemPromptSource =
+  | "cli"
+  | "cli_file"
+  | "env"
+  | "env_file"
+  | "default_file"
+  | "none"
+  | "resume_inherit";
+
+export interface ResolveCandidateSystemPromptOptions {
+  systemPrompt?: string;
+  systemPromptFile?: string;
+  noSystemPrompt?: boolean;
+  isResuming?: boolean;
+  env?: NodeJS.ProcessEnv;
+  defaultPromptPath?: string;
+}
+
+export interface ResolvedCandidateSystemPrompt {
+  /** `undefined` means inherit on resume (or none); `null` means explicitly disabled via `--no-system-prompt`. */
+  systemPrompt: string | null | undefined;
+  source: CandidateSystemPromptSource;
+}
+
+/**
+ * Resolves the system prompt passed to candidate models during `eval run`.
+ * Priority: CLI flags (`--no-system-prompt` / `--system-prompt` / `--system-prompt-file`)
+ * > resume inheritance (when `--resume-run` is set without CLI overrides)
+ * > env vars (`CANDIDATE_LLM_SYSTEM_PROMPT` / `CANDIDATE_LLM_SYSTEM_PROMPT_FILE`)
+ * > default prompt file (`prompts/eval/candidate-system.md`).
+ */
+export async function resolveCandidateSystemPrompt(
+  options: ResolveCandidateSystemPromptOptions = {},
+): Promise<ResolvedCandidateSystemPrompt> {
+  const cliCount =
+    Number(options.systemPrompt !== undefined) +
+    Number(options.systemPromptFile !== undefined) +
+    Number(Boolean(options.noSystemPrompt));
+  if (cliCount > 1) {
+    throw new Error("--system-prompt、--system-prompt-file 与 --no-system-prompt 不能同时指定");
+  }
+
+  if (options.noSystemPrompt) {
+    return { systemPrompt: null, source: "none" };
+  }
+  if (options.systemPrompt !== undefined) {
+    return { systemPrompt: nonEmpty(options.systemPrompt, "--system-prompt"), source: "cli" };
+  }
+  if (options.systemPromptFile !== undefined) {
+    const raw = await readFile(resolve(options.systemPromptFile), "utf8");
+    return {
+      systemPrompt: nonEmpty(raw.replace(/^\uFEFF/, ""), "--system-prompt-file"),
+      source: "cli_file",
+    };
+  }
+  if (options.isResuming) {
+    return { systemPrompt: undefined, source: "resume_inherit" };
+  }
+
+  const env = options.env ?? process.env;
+  const envPrompt = env.CANDIDATE_LLM_SYSTEM_PROMPT?.trim();
+  const envPromptFile = env.CANDIDATE_LLM_SYSTEM_PROMPT_FILE?.trim();
+  if (envPrompt && envPromptFile) {
+    throw new Error("CANDIDATE_LLM_SYSTEM_PROMPT 与 CANDIDATE_LLM_SYSTEM_PROMPT_FILE 不能同时设置");
+  }
+  if (envPrompt) {
+    return { systemPrompt: envPrompt, source: "env" };
+  }
+  if (envPromptFile) {
+    const raw = await readFile(resolve(envPromptFile), "utf8");
+    return {
+      systemPrompt: nonEmpty(raw.replace(/^\uFEFF/, ""), "CANDIDATE_LLM_SYSTEM_PROMPT_FILE"),
+      source: "env_file",
+    };
+  }
+
+  const defaultPrompt = await loadDefaultCandidateSystemPrompt(options.defaultPromptPath);
+  return { systemPrompt: defaultPrompt, source: "default_file" };
+}
 
 /** Training-only skills that MUST NEVER be loaded by the isolated eval probe pipeline. */
 const FORBIDDEN_TRAINING_SKILL_NAMES = new Set([
@@ -98,13 +187,23 @@ export function composeEvalGraderPrompt(systemPrompt: string, graderSkillBody: s
   return `${systemPrompt}\n\n<eval-grader>\n${graderSkillBody}\n</eval-grader>`;
 }
 
+export function composeTrapReferencePrompt(
+  systemPrompt: string,
+  trapProbeAnswerSkillBody: string,
+): string {
+  return `${systemPrompt}\n\n<probe-answer>\n${trapProbeAnswerSkillBody}\n</probe-answer>`;
+}
+
 export async function loadEvalPromptBundle(options: {
+  profile?: EvalProfile;
   promptsDir?: string;
   skillsDir?: string;
   answerStylePath?: string;
 } = {}): Promise<EvalPromptBundle> {
+  const profile: EvalProfile = options.profile ?? "adversarial";
   const promptsDir = options.promptsDir ?? DEFAULT_EVAL_PROMPTS_DIR;
-  const skillsDir = options.skillsDir ?? DEFAULT_EVAL_SKILLS_DIR;
+  const baseSkillsDir = options.skillsDir ?? DEFAULT_EVAL_SKILLS_DIR;
+  const skillsDir = profile === "trap" ? join(baseSkillsDir, "trap") : baseSkillsDir;
   const answerStylePath = options.answerStylePath ?? DEFAULT_ANSWER_STYLE;
 
   const probeDesignPath = join(skillsDir, "probe-design", "SKILL.md");
@@ -123,11 +222,11 @@ export async function loadEvalPromptBundle(options: {
     rubricBase,
     probeDesignSkill,
     probeCriticSkill,
-    answerStyleSkill,
     probeAnswerSkill,
     verifierSkill,
     adversarySkill,
     rubricV2Skill,
+    answerStyleSkill,
   ] = await Promise.all([
     readFile(join(promptsDir, "probe-writer.md"), "utf8").then((t) => nonEmpty(t, "probe-writer 系统提示词")),
     readFile(join(promptsDir, "probe-critic.md"), "utf8").then((t) => nonEmpty(t, "probe-critic 系统提示词")),
@@ -137,28 +236,33 @@ export async function loadEvalPromptBundle(options: {
     readFile(join(promptsDir, "rubric-v2.md"), "utf8").then((t) => nonEmpty(t, "rubric-v2 系统提示词")),
     readEvalSkill(probeDesignPath, "probe-design Skill"),
     readEvalSkill(probeCriticPath, "probe-critic Skill"),
-    readEvalSkill(answerStylePath, "answer-style Skill"),
     readEvalSkill(probeAnswerPath, "probe-answer Skill"),
     readEvalSkill(verifierSkillPath, "reference-verifier Skill"),
     readEvalSkill(adversarySkillPath, "adversary-tactics Skill"),
     readEvalSkill(rubricV2SkillPath, "eval-rubric-v2 Skill"),
+    profile === "trap" ? Promise.resolve(undefined) : readEvalSkill(answerStylePath, "answer-style Skill"),
   ]);
 
+  const prefix = profile === "trap" ? "trap/" : "";
   const skills: EvalSkillSnapshot[] = [
-    { name: "probe-design", path: probeDesignPath, status: probeDesignSkill.status, sha256: probeDesignSkill.sha256 },
-    { name: "probe-critic", path: probeCriticPath, status: probeCriticSkill.status, sha256: probeCriticSkill.sha256 },
-    { name: "answer-style", path: answerStylePath, status: answerStyleSkill.status, sha256: answerStyleSkill.sha256 },
-    { name: "probe-answer", path: probeAnswerPath, status: probeAnswerSkill.status, sha256: probeAnswerSkill.sha256 },
-    { name: "reference-verifier", path: verifierSkillPath, status: verifierSkill.status, sha256: verifierSkill.sha256 },
-    { name: "adversary-tactics", path: adversarySkillPath, status: adversarySkill.status, sha256: adversarySkill.sha256 },
-    { name: "eval-rubric-v2", path: rubricV2SkillPath, status: rubricV2Skill.status, sha256: rubricV2Skill.sha256 },
+    { name: `${prefix}probe-design`, path: probeDesignPath, status: probeDesignSkill.status, sha256: probeDesignSkill.sha256 },
+    { name: `${prefix}probe-critic`, path: probeCriticPath, status: probeCriticSkill.status, sha256: probeCriticSkill.sha256 },
+    ...(answerStyleSkill
+      ? [{ name: "answer-style", path: answerStylePath, status: answerStyleSkill.status, sha256: answerStyleSkill.sha256 }]
+      : []),
+    { name: `${prefix}probe-answer`, path: probeAnswerPath, status: probeAnswerSkill.status, sha256: probeAnswerSkill.sha256 },
+    { name: `${prefix}reference-verifier`, path: verifierSkillPath, status: verifierSkill.status, sha256: verifierSkill.sha256 },
+    { name: `${prefix}adversary-tactics`, path: adversarySkillPath, status: adversarySkill.status, sha256: adversarySkill.sha256 },
+    { name: `${prefix}eval-rubric-v2`, path: rubricV2SkillPath, status: rubricV2Skill.status, sha256: rubricV2Skill.sha256 },
   ];
 
   return {
     prompts: {
       probeWriter: composeProbeWriterPrompt(writerBase, probeDesignSkill.body),
       probeCritic: composeProbeCriticPrompt(criticBase, probeCriticSkill.body),
-      reference: composeReferencePrompt(refBase, answerStyleSkill.body, probeAnswerSkill.body),
+      reference: profile === "trap"
+        ? composeTrapReferencePrompt(refBase, probeAnswerSkill.body)
+        : composeReferencePrompt(refBase, answerStyleSkill!.body, probeAnswerSkill.body),
       verifier: composeVerifierPrompt(verifierBase, verifierSkill.body),
       adversary: composeAdversaryPrompt(adversaryBase, adversarySkill.body),
       rubricV2: composeRubricV2Prompt(rubricBase, rubricV2Skill.body),

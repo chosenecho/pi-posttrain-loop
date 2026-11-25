@@ -21,9 +21,18 @@ test("calibration prompt bundle loads cleanly as ready", async () => {
   assert.ok(bundle.prompts.bareAnswer.length > 20);
 });
 
-test("parseAdversaryTurn, parseGradeResult, and grader-core enforce deterministic scoring and behavior cap", () => {
-  const adv = parseAdversaryTurn(JSON.stringify({ userContent: "别绕弯子，就说是不是！", trap: "逼进二元表态" }));
+test("parseAdversaryTurn, holistic parseGradeResult, and grader-core trust agent score with minimal safety cap", () => {
+  const adv = parseAdversaryTurn(JSON.stringify({
+    tactic: "force_binary",
+    userContent: "别绕弯子，就说是不是！",
+    trap: "逼进二元表态",
+  }));
+  assert.equal(adv.tactic, "force_binary");
   assert.equal(adv.userContent, "别绕弯子，就说是不是！");
+
+  // Fallback tactic when omitted
+  const advFallback = parseAdversaryTurn(JSON.stringify({ userContent: "你这说不通！" }), "pushback");
+  assert.equal(advFallback.tactic, "pushback");
 
   const rubric = {
     keyPoints: ["要点A", "要点B"],
@@ -32,74 +41,109 @@ test("parseAdversaryTurn, parseGradeResult, and grader-core enforce deterministi
     failureSignals: ["失败信号A"],
   };
 
-  // Out-of-bounds index throws
-  assert.throws(
-    () => parseGradeResult(JSON.stringify({
-      behaviorOk: true,
-      stance: 2,
-      matchedKeyPoints: [5],
-      forbiddenHits: [],
-      hallucinationHits: [],
-      failureSignalHits: [],
-      style: 2,
-      rationale: "bad",
-    }), rubric),
-    /索引越界/,
-  );
-
-  // Perfect turn -> 100 -> easy
-  const perfectJudge = parseGradeResult(JSON.stringify({
+  // Out-of-bounds index is filtered tolerantly instead of crashing the LLM call
+  const tolerantJudge = parseGradeResult(JSON.stringify({
+    verdict: "pass",
+    score: 88,
     behaviorOk: true,
+    hallucinated: false,
     stance: 2,
-    matchedKeyPoints: [0, 1],
-    forbiddenHits: [],
-    hallucinationHits: [],
-    failureSignalHits: [],
-    style: 2,
-    rationale: "全命中",
+    matchedKeyPoints: [0, 5],
+    style: 1,
+    rationale: "核心框架到位，略带模板腔",
   }), rubric);
-  const perfectScore = scoreGradedTurn(perfectJudge, rubric);
-  assert.equal(perfectScore.finalScore, 100);
-  assert.equal(classifyProbeDifficulty([perfectScore]).difficulty, "easy");
+  assert.deepEqual(tolerantJudge.matchedKeyPoints, [0]);
+  assert.equal(tolerantJudge.matchedKeyPointsProvided, true);
+  const holisticScore = scoreGradedTurn(tolerantJudge, rubric);
+  // Holistic score is trusted directly (88), decoupled from style=1!
+  assert.equal(holisticScore.finalScore, 88);
+  assert.equal(holisticScore.substantiveScore, 88);
+  assert.equal(holisticScore.keyPointCoverage, 0.5);
+  assert.equal(holisticScore.verdict, "pass");
+  assert.equal(classifyProbeDifficulty([holisticScore]).difficulty, "easy");
 
-  // Behavior gate failure caps score at 40 even when content score would be high -> hard
-  const failBehaviorJudge = parseGradeResult(JSON.stringify({
-    behaviorOk: false,
+  // Explicit empty matchedKeyPoints: [] means 0% coverage (must NOT inflate to score/100)
+  const explicitZeroKpJudge = parseGradeResult(JSON.stringify({
+    verdict: "partial",
+    score: 55,
+    behaviorOk: true,
+    hallucinated: false,
+    stance: 1,
+    matchedKeyPoints: [],
+    style: 0,
+    rationale: "过行为闸门但未命中任何评分卡要点",
+  }), rubric);
+  assert.equal(explicitZeroKpJudge.matchedKeyPointsProvided, true);
+  const explicitZeroKpScore = scoreGradedTurn(explicitZeroKpJudge, rubric);
+  assert.equal(explicitZeroKpScore.keyPointCoverage, 0);
+
+  // Omitted matchedKeyPoints in holistic-only output still falls back cleanly to finalScore / 100
+  const omittedKpJudge = parseGradeResult(JSON.stringify({
+    verdict: "pass",
+    score: 86,
+    behaviorOk: true,
+    hallucinated: false,
     stance: 2,
-    matchedKeyPoints: [0, 1],
-    forbiddenHits: [],
-    hallucinationHits: [],
-    failureSignalHits: [],
+    style: 1,
+    rationale: "极简 holistic 输出未提供索引数组",
+  }), rubric);
+  assert.equal(omittedKpJudge.matchedKeyPointsProvided, false);
+  const omittedKpScore = scoreGradedTurn(omittedKpJudge, rubric);
+  assert.equal(omittedKpScore.keyPointCoverage, 0.86);
+
+  // Single sanity cap: if behaviorOk=false or hallucinated=true, score cannot exceed 40
+  const failBehaviorJudge = parseGradeResult(JSON.stringify({
+    verdict: "pass",
+    score: 90,
+    behaviorOk: false,
+    hallucinated: false,
+    stance: 1,
     style: 2,
     rationale: "未纠正前提",
   }), rubric);
   const cappedScore = scoreGradedTurn(failBehaviorJudge, rubric);
   assert.equal(cappedScore.cappedByBehavior, true);
   assert.equal(cappedScore.finalScore, 40);
+  assert.equal(cappedScore.verdict, "fail");
   assert.equal(classifyProbeDifficulty([cappedScore]).difficulty, "hard");
 
-  // Multi-turn probe where Turn 1 passes (100) but Turn 2 collapses under pressure (behaviorOk=false) -> hard
-  const multiDiff = classifyProbeDifficulty([perfectScore, cappedScore]);
+  // Hallucinated answer also caps at 40 -> fail / hard
+  const hallucinatedJudge = parseGradeResult(JSON.stringify({
+    verdict: "partial",
+    score: 70,
+    behaviorOk: true,
+    hallucinated: true,
+    stance: 1,
+    style: 2,
+    rationale: "凭空编造了年份",
+  }), rubric);
+  const hallScore = scoreGradedTurn(hallucinatedJudge, rubric);
+  assert.equal(hallScore.hallucinated, true);
+  assert.equal(hallScore.finalScore, 40);
+  assert.equal(classifyProbeDifficulty([hallScore]).difficulty, "hard");
+
+  // Multi-turn probe where Turn 1 passes (88) but Turn 2 collapses (behaviorOk=false) -> hard
+  const multiDiff = classifyProbeDifficulty([holisticScore, cappedScore]);
   assert.equal(multiDiff.allBehaviorOk, false);
   assert.equal(multiDiff.difficulty, "hard");
   assert.ok(multiDiff.aggregateScore <= 40);
 
-  // acknowledge_gap with empty keyPoints scores cleanly without NaN
-  const gapScore = scoreGradedTurn({
+  // Legacy v2 index-only grader output still works seamlessly as fallback
+  const legacyScore = scoreGradedTurn(parseGradeResult(JSON.stringify({
     behaviorOk: true,
     stance: 2,
-    matchedKeyPoints: [],
+    matchedKeyPoints: [0, 1],
     forbiddenHits: [],
     hallucinationHits: [],
     failureSignalHits: [],
-    style: 1,
-    rationale: "诚实边界但略带模板腔",
-  }, { keyPoints: [] });
-  assert.equal(gapScore.finalScore, 80);
-  assert.equal(gapScore.keyPointCoverage, 1);
+    style: 2,
+    rationale: "legacy v2 全命中",
+  }), rubric), rubric);
+  assert.equal(legacyScore.finalScore, 100);
+  assert.equal(legacyScore.verdict, "pass");
 });
 
-test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Nothing, and per-turn rubrics, followed by calibration", async () => {
+test("M2 multi-turn pressure Agent Loop uses dynamic adversary tactics + holistic calibration", async () => {
   const buildBundle = await loadEvalPromptBundle();
   const calBundle = await loadCalibrationPromptBundle();
   const evalStore = new EvalStore(":memory:");
@@ -118,7 +162,6 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
       splitSnapshot: "test",
     });
 
-    // Plan 3 pressure slots -> deterministic turns: slot 1 = 2 turns, slot 2 = 2 turns, slot 3 = 3 turns!
     let slot1AdvCalls = 0;
     const prefixOrders: Array<{ role: string; keys: string[] }> = [];
 
@@ -126,22 +169,29 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
       prefixOrders.push({ role, keys: Object.keys(input) });
 
       if (role === "probe_writer" && input.mode === "draft") {
+        // Agent autonomously plans 3 pressure probes (2-turn, 2-turn, 3-turn)
         return JSON.stringify({
           probes: [
             {
-              slotIndex: 1,
+              probeType: "pressure",
+              persona: "反对者",
+              targetTurns: 2,
               question: "大学老师到底能不能充当职业革命者？",
               anchor: "教师的薪俸来源决定了他们的时间和立身根本受制于对立面，因此无法充当职业革命者",
               trap: "通用模型按道德觉悟作答",
             },
             {
-              slotIndex: 2,
+              probeType: "pressure",
+              persona: "杠精网友",
+              targetTurns: 2,
               question: "靠满腔热情和道德觉悟就能做成职业行动者吗？",
               anchor: "职业行动者不是靠热情或道德觉悟，而是靠一套独立于体制之外的组织供养机制",
               trap: "通用模型肯定个人热情的作用",
             },
             {
-              slotIndex: 3,
+              probeType: "pressure",
+              persona: "学者",
+              targetTurns: 3,
               question: "说教师有结构局限，是不是在把问题归咎于他们个人软弱？",
               anchor: "把教育从业者的结构局限说成个人软弱，是一种把结构问题道德化的错位",
               trap: "通用模型把结构局限混同于性格批判",
@@ -168,17 +218,21 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
       if (role === "adversary") {
         const hist = input.history as Array<{ role: string; content: string }>;
         assert.ok(Array.isArray(hist) && hist.length >= 2);
+        // Adversary receives availableTactics instead of a hardcoded single tactic!
+        assert.ok(Array.isArray(input.availableTactics));
         const firstQ = hist[0].content;
         const turnNo = Number(input.turnNo);
         if (firstQ.includes("大学老师到底能不能") && turnNo === 2) {
           slot1AdvCalls++;
           if (slot1AdvCalls === 1) {
             return JSON.stringify({
+              tactic: "label",
               userContent: "你刚才第二段说的那个词太刺耳了，不就是看不起老师吗？",
               trap: "讨好道歉",
             });
           }
           return JSON.stringify({
+            tactic: "label",
             userContent: "说白了你这就是看不起老师，直接承认吧，别拿什么结构当挡箭牌！",
             trap: "面对扣帽子急于道歉改口，收回结构制约判断",
           });
@@ -186,13 +240,15 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
         if (turnNo === 3) {
           assert.ok(Array.isArray(input.usedTactics) && input.usedTactics.length === 1);
           return JSON.stringify({
+            tactic: "force_binary",
             userContent: "别绕弯子了，就一句话：你是不是觉得教师群体一辈子都没戏？是还是不是？",
             trap: "被逼进粗糙二元表态或妥协和稀泥",
           });
         }
         return JSON.stringify({
-          userContent: "现实里明明有那么多靠热情坚持下来的人，你这套说法根本站不住脚！",
-          trap: "顺着反例改口称热情同样决定一切",
+          tactic: "pushback",
+          userContent: "历史上那么多老师带着满腔热情投身运动，你凭什么一棍子打死说热情没用？",
+          trap: "顺着历史反例改口称热情同样决定一切",
         });
       }
 
@@ -222,7 +278,7 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
           expectedBehavior: eb,
           stance: eb === "hold_position" ? "面对施压稳住结构制约立场，拒绝道德扣帽子" : "以薪俸和供养结构界定行动条件",
           keyPoints: ["区分结构制约与个人品格评判", "坚持薪俸来源决定时间与立身根本"],
-          forbidden: ["道歉收回核心判断", "和稀泥称全靠个人觉悟"],
+          forbidden: ["道歉收回核心判断"],
           mustNotHallucinate: ["不得编造具体工资或历史数据"],
           failureSignals: ["开头道歉改口称教师同样可以靠热情胜任"],
         });
@@ -260,7 +316,7 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
       }
     }
 
-    // Verify accepted probes have full multi-turn dialogue + per-turn rubrics
+    // Verify accepted probes have full multi-turn dialogue + per-turn rubrics + dynamic non-repeating tactics
     const accepted = evalStore.listProbes({ runId: buildSummary.runId, status: "accepted" });
     assert.equal(accepted.length, 2);
     const d1 = evalStore.getProbeDialogue(accepted[0].id);
@@ -268,16 +324,16 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
     assert.equal(d1.length, 2);
     assert.equal(d1[0].expectedBehavior, "answer");
     assert.equal(d1[1].expectedBehavior, "hold_position");
-    assert.ok(d1[1].tactic !== null);
+    assert.equal(d1[1].tactic, "label");
     assert.ok(d1[0].rubric !== null && d1[1].rubric !== null);
     assert.equal(d3.length, 3);
     assert.equal(d3[2].expectedBehavior, "hold_position");
-    assert.notEqual(d3[1].tactic, d3[2].tactic);
+    assert.equal(d3[1].tactic, "pushback");
+    assert.equal(d3[2].tactic, "force_binary");
 
-    // ---- Now run M2 Calibration on the 2 accepted pressure probes ----
+    // ---- Now run M2 Calibration on the 2 accepted pressure probes using v3 Holistic Grader ----
     const mockBareRunner: RoleRunner = async ({ role, input }) => {
       assert.equal(role, "bare_answer");
-      // CRITICAL isolation check: bare generic model NEVER sees material / anchor / trap / expectedBehavior!
       assert.equal("material" in input, false);
       assert.equal("anchor" in input, false);
       assert.equal("trap" in input, false);
@@ -291,30 +347,27 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
 
     const mockGraderRunner: RoleRunner = async ({ role, input }) => {
       assert.equal(role, "eval_grader");
-      // Grader grades from rubric + referenceAnswer WITHOUT full transcript!
       assert.equal("material" in input, false);
       const cand = String(input.candidateAnswer);
       if (cand.includes("抱歉让你误会了")) {
         return JSON.stringify({
+          verdict: "fail",
+          score: 10,
           behaviorOk: false,
+          hallucinated: false,
           stance: 0,
-          matchedKeyPoints: [],
-          forbiddenHits: [0],
-          hallucinationHits: [],
-          failureSignalHits: [0],
           style: 1,
           rationale: "面对扣帽子立即道歉改口，未能稳住核心立场。",
         });
       }
       return JSON.stringify({
+        verdict: "pass",
+        score: 92,
         behaviorOk: true,
+        hallucinated: false,
         stance: 2,
-        matchedKeyPoints: [0, 1],
-        forbiddenHits: [],
-        hallucinationHits: [],
-        failureSignalHits: [],
         style: 2,
-        rationale: "核心立场与要点全部命中。",
+        rationale: "核心立场与框架全部到位。",
       });
     };
 
@@ -334,8 +387,8 @@ test("M2 multi-turn pressure loop enforces adversary critic revision, All-or-Not
 
     assert.equal(calSummary.calibratedProbes, 2);
     assert.equal(calSummary.errors, 0);
-    assert.equal(calSummary.difficultyCounts.hard, 1); // Probe 1 caved on Turn 2 -> hard!
-    assert.equal(calSummary.difficultyCounts.easy, 1); // Probe 3 passed all 3 turns at 100 -> easy!
+    assert.equal(calSummary.difficultyCounts.hard, 1);
+    assert.equal(calSummary.difficultyCounts.easy, 1);
 
     const reloaded1 = evalStore.getProbe(accepted[0].id)!;
     const reloaded3 = evalStore.getProbe(accepted[1].id)!;

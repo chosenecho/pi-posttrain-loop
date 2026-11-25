@@ -1,42 +1,58 @@
 export type ThinkTier = "short" | "medium" | "long";
+export type SourceProfile = "standard" | "short";
+export type ProfileFilter = "all" | SourceProfile;
 
-export interface TierLengthSpec {
-  /** Soft target range passed to the writer prompt (e.g. 80-160). */
-  targetMin: number;
-  targetMax: number;
-  /** Hard acceptance bounds enforced by deterministic rule checks. */
-  hardMin: number;
-  hardMax: number;
+export function normalizeSourceProfile(raw: string | null | undefined): SourceProfile {
+  const normalized = (raw ?? "standard").trim().toLowerCase();
+  return normalized === "short" ? "short" : "standard";
+}
+
+export function parseProfileFilter(raw: string | undefined, label = "--profile"): ProfileFilter {
+  const normalized = (raw ?? "all").trim().toLowerCase();
+  if (normalized === "all" || normalized === "standard" || normalized === "short") {
+    return normalized;
+  }
+  throw new Error(`${label} 仅支持 all、standard 或 short，当前值：${raw}`);
+}
+
+export function parseTierFilter(raw: string | undefined, label = "--tier"): ThinkTier[] | undefined {
+  if (raw === undefined) return undefined;
+  const parts = raw
+    .split(",")
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(`${label} 不能为空，可选值为 short、medium、long（支持逗号分隔）`);
+  }
+  const valid = new Set<ThinkTier>(["short", "medium", "long"]);
+  const result: ThinkTier[] = [];
+  for (const part of parts) {
+    if (!valid.has(part as ThinkTier)) {
+      throw new Error(`${label} 仅支持 short、medium、long，无效值：${part}`);
+    }
+    if (!result.includes(part as ThinkTier)) {
+      result.push(part as ThinkTier);
+    }
+  }
+  return result;
 }
 
 export interface ReasoningCheckConfig {
-  tiers: Record<ThinkTier, TierLengthSpec>;
-  /** Maximum allowed ratio of reasoning chars / answer chars. */
-  maxAnswerRatio: number;
-  /** Maximum allowed fraction of 8-grams in reasoning that appear verbatim in answer. */
-  maxNgram8Overlap: number;
-  /** Maximum allowed consecutive normalized characters copied verbatim from answer. */
+  /** Hard safety fuse for runaway thinking output (chars). */
+  maxChars: number;
+  /** Hard safety fuse for blatant consecutive verbatim copy-paste (normalized chars). */
   maxVerbatimRun: number;
 }
 
 export const DEFAULT_REASONING_CHECK_CONFIG: ReasoningCheckConfig = {
-  tiers: {
-    short: { targetMin: 80, targetMax: 160, hardMin: 55, hardMax: 190 },
-    medium: { targetMin: 120, targetMax: 230, hardMin: 95, hardMax: 270 },
-    long: { targetMin: 180, targetMax: 340, hardMin: 145, hardMax: 400 },
-  },
-  maxAnswerRatio: 0.8,
-  maxNgram8Overlap: 0.25,
-  maxVerbatimRun: 18,
+  maxChars: 800,
+  maxVerbatimRun: 36,
 };
 
 export interface RuleCheckMetrics {
   charCount: number;
   answerCharCount: number;
   lengthRatio: number;
-  ngram8Overlap: number;
-  matchedNgrams: number;
-  totalNgrams: number;
   maxVerbatimRun: number;
   maxVerbatimSnippet: string;
   leakHits: string[];
@@ -74,7 +90,6 @@ export interface ReasoningBatchStats {
   p50Chars: number;
   p90Chars: number;
   avgLengthRatio: number;
-  avgNgram8Overlap: number;
   avgRewrites: number;
   byTier: Record<ThinkTier, TierSummaryStat>;
   openingDiversity: {
@@ -92,61 +107,14 @@ export function countContentChars(text: string): number {
 }
 
 export function inferThinkTier(answerCharCount: number): ThinkTier {
-  if (answerCharCount <= 380) return "short";
-  if (answerCharCount <= 820) return "medium";
+  if (answerCharCount <= 430) return "short";
+  if (answerCharCount <= 850) return "medium";
   return "long";
 }
 
-export function formatTierTargetRange(spec: TierLengthSpec): string {
-  return `${spec.targetMin}-${spec.targetMax}`;
-}
-
-export function parseTierRangeFlag(raw: string, label: string): TierLengthSpec {
-  const match = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(raw);
-  if (!match) {
-    throw new Error(`${label} 必须使用 MIN-MAX 格式（例如 80-160）`);
-  }
-  const targetMin = Number(match[1]);
-  const targetMax = Number(match[2]);
-  if (!Number.isSafeInteger(targetMin) || !Number.isSafeInteger(targetMax) || targetMin < 10 || targetMax <= targetMin) {
-    throw new Error(`${label} 的范围无效：需满足 10 <= MIN < MAX`);
-  }
-  const hardMin = Math.max(10, Math.round(targetMin * 0.75));
-  const hardMax = Math.round(targetMax * 1.2);
-  return { targetMin, targetMax, hardMin, hardMax };
-}
-
-/** Strips whitespace, punctuation, and symbols so near-verbatim copies cannot bypass overlap checks. */
+/** Strips whitespace, punctuation, and symbols for normalized comparison. */
 export function normalizeForOverlap(text: string): string {
   return text.replace(/[\s\p{P}\p{S}]+/gu, "").toLowerCase();
-}
-
-export function computeNgramOverlap(
-  reasoning: string,
-  answer: string,
-  n = 8,
-): { overlap: number; matchedNgrams: number; totalNgrams: number } {
-  const normR = normalizeForOverlap(reasoning);
-  const normA = normalizeForOverlap(answer);
-  if (normR.length < n || normA.length < n) {
-    return { overlap: 0, matchedNgrams: 0, totalNgrams: 0 };
-  }
-  const answerGrams = new Set<string>();
-  for (let i = 0; i <= normA.length - n; i++) {
-    answerGrams.add(normA.slice(i, i + n));
-  }
-  const totalNgrams = normR.length - n + 1;
-  let matchedNgrams = 0;
-  for (let i = 0; i <= normR.length - n; i++) {
-    if (answerGrams.has(normR.slice(i, i + n))) {
-      matchedNgrams++;
-    }
-  }
-  return {
-    overlap: Number((matchedNgrams / totalNgrams).toFixed(4)),
-    matchedNgrams,
-    totalNgrams,
-  };
 }
 
 export function findLongestCommonNormalizedRun(
@@ -203,7 +171,7 @@ const LEAK_RULES: ReadonlyArray<{ label: string; pattern: RegExp }> = [
     label: "格式禁令泄漏",
     pattern: /(?:严禁|禁止|不能|不要)(?:使用|出现|输出)?(?:加粗|斜体|标题|列表|套话|AI腔|夸奖|点评|复读|泄题)/i,
   },
-  { label: "规则执行词", pattern: /(?:按|遵循|符合)(?:规则|规范|档位|提示词)/ },
+  { label: "规则执行词", pattern: /(?:按|遵循|符合)(?:字数要求|档位要求|写作规范|提示词|输出规则)/ },
   { label: "AI自称泄漏", pattern: /作为\s*AI|作为一个?\s*(?:AI|人工智能|语言模型)/i },
 ];
 
@@ -237,63 +205,32 @@ export function detectFormatHits(reasoning: string): string[] {
   if (bulletItems.length >= 2) {
     hits.push("包含项目符号列表");
   }
-  const thirdPersonMatch = /(?:用户的核心问题是|用户的问题是|提问者问的是|作者的观点是|作者认为|本回答应该|回答应当从以下)/.exec(reasoning);
-  if (thirdPersonMatch) {
-    hits.push(`第三方分析腔(${thirdPersonMatch[0]})`);
-  }
-  const metaOpeningMatch = /^(?:他这(?:里|一问|问法|个问法|个追问|句|回|是把)|他把|他的问题|他追问(?:的)?|对方(?:这|把)|提问(?:者)?把)/.exec(reasoning.trim());
-  if (metaOpeningMatch) {
-    hits.push(`旁观套话起手(${metaOpeningMatch[0]})`);
-  }
-  const outlinePreviewMatch = /(?:(?:我的)?推进顺序是|回答(?:的)?顺序是|我先说明[\s\S]{1,80}(?:接下来|再说明)[\s\S]{1,80}最后)/.exec(reasoning);
-  if (outlinePreviewMatch) {
-    hits.push(`显性结构预告(${outlinePreviewMatch[0].slice(0, 12)})`);
-  }
-  const metaClosingMatch = /(?:(?:留到|留给|交给)开口(?:之)?后|那是开口(?:之)?后再(?:说|讲|展开)|剩下的交给开口(?:之)?再?(?:说|讲|展开))/.exec(reasoning);
-  if (metaClosingMatch) {
-    hits.push(`元自指收尾(${metaClosingMatch[0]})`);
-  }
-  if (/首先[\s\S]{1,120}其次[\s\S]{1,120}(?:最后|再次)/.test(reasoning)) {
-    hits.push("首先/其次/最后八股结构");
-  }
   return hits;
 }
 
 export function runRuleChecks(
   reasoning: string,
   answer: string,
-  tier: ThinkTier,
+  _tier: ThinkTier,
   config: ReasoningCheckConfig = DEFAULT_REASONING_CHECK_CONFIG,
 ): RuleCheckResult {
   const trimmed = reasoning.trim();
   const charCount = countContentChars(trimmed);
   const answerCharCount = Math.max(1, countContentChars(answer));
   const lengthRatio = Number((charCount / answerCharCount).toFixed(4));
-  const { overlap: ngram8Overlap, matchedNgrams, totalNgrams } = computeNgramOverlap(trimmed, answer, 8);
   const { length: maxVerbatimRun, snippet: maxVerbatimSnippet } = findLongestCommonNormalizedRun(trimmed, answer);
   const leakHits = detectLeakHits(trimmed);
   const formatHits = detectFormatHits(trimmed);
 
-  const spec = config.tiers[tier];
   const issues: string[] = [];
   const suggestions: string[] = [];
 
   if (charCount === 0) {
     issues.push("思考正文为空");
     suggestions.push("请补写一段完整的脱稿内心思考正文。");
-  } else {
-    if (charCount < spec.hardMin) {
-      issues.push(`思考过短（${charCount} 字，${tier} 档下限 ${spec.hardMin} 字）`);
-      suggestions.push(`适当展开思考骨架至约 ${spec.targetMin}-${spec.targetMax} 字，把核心矛盾、关键区分与边界想透。`);
-    }
-    if (charCount > spec.hardMax) {
-      issues.push(`思考过长（${charCount} 字，${tier} 档上限 ${spec.hardMax} 字）`);
-      suggestions.push(`压缩至约 ${spec.targetMin}-${spec.targetMax} 字，只保留开口前的核心锚点，去掉细枝末节。`);
-    }
-    if (lengthRatio > config.maxAnswerRatio) {
-      issues.push(`思考与正文长度比过高（${(lengthRatio * 100).toFixed(0)}% > ${(config.maxAnswerRatio * 100).toFixed(0)}%）`);
-      suggestions.push("思考明显短于最终回答，只定判断和思路骨架，不要把正文提前写一遍。");
-    }
+  } else if (charCount > config.maxChars) {
+    issues.push(`思考异常过长（${charCount} 字 > 安全上限 ${config.maxChars} 字）`);
+    suggestions.push("大幅收紧思考篇幅，只保留开口前的核心破题与判断支点。");
   }
 
   if (leakHits.length > 0) {
@@ -302,18 +239,14 @@ export function runRuleChecks(
   }
 
   if (formatHits.length > 0) {
-    issues.push(`格式或腔调违规：${formatHits.join("、")}`);
-    suggestions.push(`修正格式或腔调问题（${formatHits.join("、")}），改为自然连贯的第一人称纯文本内心独白，不要使用列表、Markdown符号、标签、结构预告、第三方分析口吻或元自指收尾。`);
+    issues.push(`格式违规：${formatHits.join("、")}`);
+    suggestions.push(`修正格式问题（${formatHits.join("、")}），改为纯文本自然段，不要使用列表、Markdown 符号或 <think> 标签。`);
   }
 
-  if (ngram8Overlap > config.maxNgram8Overlap) {
-    issues.push(`8-gram重合率过高（${(ngram8Overlap * 100).toFixed(1)}% > ${(config.maxNgram8Overlap * 100).toFixed(1)}%）`);
-    const snippetHint = maxVerbatimSnippet.length >= 8 ? `（例如“${maxVerbatimSnippet.slice(0, 24)}”一带重合明显）` : "";
-    suggestions.push(`避免照搬或复述最终回答里的原句与修辞${snippetHint}，站在开口前的角度提炼问题前提、关键区分与核心边界即可。`);
-  } else if (maxVerbatimRun >= config.maxVerbatimRun) {
+  if (maxVerbatimRun >= config.maxVerbatimRun) {
     const snippet = maxVerbatimSnippet.slice(0, 24);
     issues.push(`存在连续 ${maxVerbatimRun} 字照抄最终回答（片段：${snippet.slice(0, 20)}）`);
-    suggestions.push(`其中“${snippet}”一带与最终回答连续重合过长，请用更简短的思考意图重述，不要照搬完整原句。`);
+    suggestions.push(`其中“${snippet}”一带与最终回答连续照抄过长，请改为开口前的自然思考表达，不要直接照搬整句。`);
   }
 
   return {
@@ -324,9 +257,6 @@ export function runRuleChecks(
       charCount,
       answerCharCount,
       lengthRatio,
-      ngram8Overlap,
-      matchedNgrams,
-      totalNgrams,
       maxVerbatimRun,
       maxVerbatimSnippet: maxVerbatimSnippet.slice(0, 32),
       leakHits,
@@ -364,7 +294,6 @@ export function computeBatchStats(items: TraceStatInput[]): ReasoningBatchStats 
 
   const passedChars: number[] = [];
   const passedRatios: number[] = [];
-  const passedOverlaps: number[] = [];
   const allRewrites: number[] = [];
   const openingCounts = new Map<string, number>();
   const opening2Counts = new Map<string, number>();
@@ -393,7 +322,6 @@ export function computeBatchStats(items: TraceStatInput[]): ReasoningBatchStats 
       tierBuckets[item.lengthTier].chars.push(chars);
       if (item.metrics) {
         passedRatios.push(item.metrics.lengthRatio);
-        passedOverlaps.push(item.metrics.ngram8Overlap);
       }
       const norm = normalizeForOverlap(item.reasoning);
       const prefix = norm.slice(0, 8);
@@ -453,7 +381,6 @@ export function computeBatchStats(items: TraceStatInput[]): ReasoningBatchStats 
     p50Chars: percentile(sortedChars, 0.5),
     p90Chars: percentile(sortedChars, 0.9),
     avgLengthRatio: Number(mean(passedRatios).toFixed(4)),
-    avgNgram8Overlap: Number(mean(passedOverlaps).toFixed(4)),
     avgRewrites: Number(mean(allRewrites).toFixed(2)),
     byTier,
     openingDiversity: {

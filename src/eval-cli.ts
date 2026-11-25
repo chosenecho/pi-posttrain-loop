@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -14,12 +14,18 @@ import { errorMessage, nonEmpty, validateConcurrency, validateMaxAttempts } from
 import {
   EvalStore,
   PROBE_TYPES,
+  probeTypesForProfile,
   type EvalHistoryMode,
+  type EvalProfile,
   type ProbeRecord,
   type ProbeStatus,
   type ProbeType,
 } from "./eval/eval-db.js";
-import { loadCalibrationPromptBundle, loadEvalPromptBundle } from "./eval/eval-prompts.js";
+import {
+  loadCalibrationPromptBundle,
+  loadEvalPromptBundle,
+  resolveCandidateSystemPrompt,
+} from "./eval/eval-prompts.js";
 import {
   renderCalibrationReportMarkdown,
   runProbeCalibration,
@@ -30,11 +36,12 @@ import { gradeEvalRun } from "./eval/eval-grader.js";
 import { runSuiteEvaluation } from "./eval/eval-runner.js";
 import {
   DEFAULT_MAX_ANSWER_ATTEMPTS,
+  DEFAULT_MAX_BARE_REFINEMENTS,
   DEFAULT_MAX_CRITIC_REVISIONS,
   DEFAULT_PROBES_PER_VIDEO,
   runProbeBuild,
 } from "./eval/probe-loop.js";
-import { parseProbeMix } from "./eval/probe-planner.js";
+import { DEFAULT_TRAP_PROBE_MIX, parseProbeMix } from "./eval/probe-planner.js";
 import { buildEvalReport, renderEvalReportMarkdown } from "./eval/report.js";
 import { importTestSources, mirrorMainVersion } from "./eval/source-import.js";
 import { DEFAULT_MAX_EASY_RATIO, freezeAdversarialSuite } from "./eval/suite-freeze.js";
@@ -51,10 +58,10 @@ const HELP = `独立评测库与对抗测试集生产 CLI（Probe Pipeline）
   status     查看评测库当前状态（材料快照、考题统计、难度分层、套卷版本、评测记录）
   mirror     从主库只读镜像冻结 test 版本到评测库（如 test-v1 -> indist-v1）
   import     从主库 test 分区只读导入视频文稿快照到评测库
-  build      运行对抗 Probe Agent Loop（含单轮 5 类与 M2 多轮施压 pressure）
-  calibrate  用通用模型无原稿裸答 + 评分卡 v2 打分，为已通过考题标定 easy/medium/hard 难度
-  freeze     [M3] 冻结不可变对抗测试套卷（如 adv-v1），执行难度占比控制、防泄漏核验与训练集相似度审计
-  run        [M3] 对冻结套卷运行候选模型脱稿盲测（原生多轮 Chat API，支持 gold/self 历史与断点续跑）
+  build      运行对抗 Probe Agent Loop（自主规划题量与题型、语义去重、内置裸答对抗回流与动态多轮施压）
+  calibrate  用通用模型无原稿裸答 + 整体语义批卷，为已通过考题标定 easy/medium/hard 难度
+  freeze     [M3] 冻结不可变对抗测试套卷（如 adv-v3），执行并发运行态守卫、防泄漏核验与训练集相似度审计
+  run        [M3] 对冻结套卷运行候选模型脱稿盲测（原生多轮 Chat API，默认加载 prompts/eval/candidate-system.md，支持 gold/self 历史与断点续跑）
   grade      [M3] 对候选模型预测结果执行脱稿批卷（兼容 indist-v1 与 adv-v1 评分卡）
   report     [M3] 按套卷 × 候选模型 × 题型 × 预期行为 × 难度汇总评测对比报告
   compare    [M3] 针对两个候选模型（--baseline vs --target）生成增量 Δ 与逐题胜负对比报告
@@ -64,8 +71,9 @@ const HELP = `独立评测库与对抗测试集生产 CLI（Probe Pipeline）
   npm run eval -- init
   npm run eval -- mirror --from-version test-v1 --as indist-v1
   npm run eval -- import --limit 10 --shuffle --seed 42 --exclude-used
-  npm run eval -- build --videos imported --probes-per-video 8 --concurrency 8 --call-attempts 3
-  npm run eval -- build --videos imported --probes-per-video 2 --mix pressure=100 --concurrency 8
+  npm run eval -- build --videos imported --probes-per-video 6 --concurrency 8 --call-attempts 3
+  npm run eval -- build --videos imported --probes-per-video 6 --bare-model <裸答模型> --max-bare-refinements 1
+  npm run eval -- build --videos imported --probes-per-video 6 --no-bare-check --concurrency 8
   npm run eval -- calibrate --run all --concurrency 8 --out output/eval/calibration-report.md
   npm run eval -- calibrate --run all --report-only --out output/eval/calibration-report.md
   npm run eval -- freeze --name adv-v1 --max-easy-ratio 0.2 --export output/eval/adv-v1.jsonl --manifest-out output/eval/adv-v1.manifest.json
@@ -102,6 +110,15 @@ function parseHistoryMode(raw: string | undefined): EvalHistoryMode {
     throw new Error(`--history-mode 必须是 gold 或 self（实际 ${mode}）`);
   }
   return mode;
+}
+
+function parseEvalProfile(raw: string | undefined): EvalProfile | undefined {
+  if (raw === undefined) return undefined;
+  const profile = raw.trim();
+  if (profile !== "adversarial" && profile !== "trap") {
+    throw new Error(`--profile 必须是 adversarial 或 trap（实际 ${profile}）`);
+  }
+  return profile;
 }
 
 function splitCsvOpt(raw: string | undefined): string[] | undefined {
@@ -416,12 +433,17 @@ async function main(): Promise<void> {
         "eval-db": { type: "string" },
         "main-db": { type: "string" },
         "skip-main-verify": { type: "boolean", default: false },
+        profile: { type: "string" },
         videos: { type: "string" },
         limit: { type: "string" },
+        shuffle: { type: "boolean", default: false },
         "probes-per-video": { type: "string" },
         mix: { type: "string" },
         seed: { type: "string" },
         "max-critic-revisions": { type: "string" },
+        "max-bare-refinements": { type: "string" },
+        "no-bare-check": { type: "boolean", default: false },
+        "bare-model": { type: "string" },
         "max-attempts": { type: "string" },
         concurrency: { type: "string" },
         "call-attempts": { type: "string" },
@@ -433,48 +455,77 @@ async function main(): Promise<void> {
     });
     if (values.help) { console.log(HELP); return; }
 
+    const profile: EvalProfile = parseEvalProfile(values.profile) ?? "adversarial";
     const evalDbPath = resolve(values["eval-db"] ?? DEFAULT_EVAL_DB);
     const mainDbPath = values["skip-main-verify"]
       ? undefined
       : resolve(values["main-db"] ?? DEFAULT_MAIN_DB);
     const videosSpec = (values.videos ?? "imported").trim();
     const limit = parseIntOpt(values.limit, "--limit");
-    const probesPerVideo = parseIntOpt(values["probes-per-video"], "--probes-per-video") ?? DEFAULT_PROBES_PER_VIDEO;
-    const mix = values.mix !== undefined ? parseProbeMix(values.mix) : undefined;
+    const defaultProbesPerVideo = profile === "trap" ? 3 : DEFAULT_PROBES_PER_VIDEO;
+    const probesPerVideo = parseIntOpt(values["probes-per-video"], "--probes-per-video") ?? defaultProbesPerVideo;
+    const mix = values.mix !== undefined
+      ? parseProbeMix(values.mix)
+      : profile === "trap"
+        ? { ...DEFAULT_TRAP_PROBE_MIX }
+        : undefined;
     const seed = parseIntOpt(values.seed, "--seed");
     const maxCriticRevisions = parseIntOpt(values["max-critic-revisions"], "--max-critic-revisions") ?? DEFAULT_MAX_CRITIC_REVISIONS;
+    const maxBareRefinements = parseIntOpt(values["max-bare-refinements"], "--max-bare-refinements") ?? DEFAULT_MAX_BARE_REFINEMENTS;
     const maxAnswerAttempts = validateMaxAttempts(parseIntOpt(values["max-attempts"], "--max-attempts") ?? DEFAULT_MAX_ANSWER_ATTEMPTS);
     const concurrency = validateConcurrency(parseIntOpt(values.concurrency, "--concurrency") ?? 1);
     const callMaxAttempts = validateCallMaxAttempts(parseIntOpt(values["call-attempts"], "--call-attempts") ?? DEFAULT_CALL_MAX_ATTEMPTS);
     const callRetryDelayMs = validateCallRetryDelayMs(parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms") ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
-    const bundle = await loadEvalPromptBundle();
+    const bundle = await loadEvalPromptBundle({ profile });
     if (!bundle.allReady) {
-      throw new Error("存在未就绪的 eval Skill，无法启动正式评测考题构建");
+      throw new Error(`存在未就绪的 eval Skill（profile=${profile}），无法启动正式评测考题构建`);
     }
     const config = readPiConfig();
     const runRole = createPiRunner(config);
 
+    const bareCheckEnabled = !values["no-bare-check"];
+    let runBareModel: ReturnType<typeof createPiRunner> | undefined;
+    let barePrompt: string | undefined;
+    let bareModelId: string | undefined;
+    if (bareCheckEnabled) {
+      const calBundle = await loadCalibrationPromptBundle();
+      barePrompt = calBundle.prompts.bareAnswer;
+      bareModelId = values["bare-model"]?.trim() || config.modelId;
+      runBareModel = createPiRunner({ ...config, modelId: bareModelId });
+    }
+
     const store = new EvalStore(evalDbPath);
     try {
       let sources = videosSpec === "imported"
-        ? store.listUnbuiltSourceMaterials()
+        ? store.listUnbuiltSourceMaterials(probeTypesForProfile(profile))
         : videosSpec === "all"
           ? store.listSourceMaterials()
           : store.listSourceMaterialsByVideoKeys(videosSpec.split(",").map((s) => s.trim()).filter(Boolean));
+      if (values.shuffle && sources.length > 1) {
+        const rng = seed !== undefined ? createSeededRng(seed) : Math.random;
+        sources = [...sources];
+        for (let i = sources.length - 1; i > 0; i--) {
+          const j = Math.floor(rng() * (i + 1));
+          [sources[i], sources[j]] = [sources[j]!, sources[i]!];
+        }
+      }
       if (limit !== undefined) {
         if (limit < 1) throw new Error("--limit 必须是正整数");
         sources = sources.slice(0, limit);
       }
       if (sources.length === 0) {
-        throw new Error(`未找到符合条件（--videos ${videosSpec}）的材料快照，请先运行 npm run eval -- import`);
+        throw new Error(`未找到符合条件（--profile ${profile}, --videos ${videosSpec}）的材料快照，请先运行 npm run eval -- import`);
       }
 
-      console.log(`=== 对抗考题构建（${sources.length} 份材料，每篇 ${probesPerVideo} 题，并发 ${concurrency}，模型 ${config.modelId}）===`);
+      console.log(
+        `=== 对抗考题 Agent Loop 构建（profile=${profile}，${sources.length} 份材料，单篇上限 ${probesPerVideo} 题，裸答回流=${bareCheckEnabled ? bareModelId : "off"}，并发 ${concurrency}，模型 ${config.modelId}）===`,
+      );
       const summary = await runProbeBuild({
         evalStore: store,
         sources,
         mainDbPath,
+        profile,
         prompts: bundle.prompts,
         skills: bundle.skills,
         runRole,
@@ -484,6 +535,7 @@ async function main(): Promise<void> {
         seed,
         maxCriticRevisions,
         maxAnswerAttempts,
+        ...(runBareModel && barePrompt ? { runBareModel, barePrompt, bareModelId, maxBareRefinements } : {}),
         concurrency,
         callMaxAttempts,
         callRetryDelayMs,
@@ -502,6 +554,7 @@ async function main(): Promise<void> {
       options: {
         "eval-db": { type: "string" },
         run: { type: "string" },
+        profile: { type: "string" },
         type: { type: "string" },
         "only-uncalibrated": { type: "boolean", default: false },
         "report-only": { type: "boolean", default: false },
@@ -523,6 +576,8 @@ async function main(): Promise<void> {
     if (!existsSync(evalDbPath)) {
       throw new Error(`评测库不存在：${evalDbPath}（请先运行 npm run eval -- init）`);
     }
+    const profileFilter = parseEvalProfile(values.profile);
+    const probeTypesFilter = profileFilter ? probeTypesForProfile(profileFilter) : undefined;
     const probeTypeFilter = values.type !== undefined ? (values.type.trim() as ProbeType) : undefined;
     if (probeTypeFilter !== undefined && !PROBE_TYPES.includes(probeTypeFilter)) {
       throw new Error(`未知题型 --type ${probeTypeFilter}（可选：${PROBE_TYPES.join(", ")}）`);
@@ -542,6 +597,7 @@ async function main(): Promise<void> {
           runId: runFilter,
           status: "accepted",
           probeType: probeTypeFilter,
+          probeTypes: probeTypesFilter,
         });
         if (limit !== undefined) {
           if (limit < 1) throw new Error("--limit 必须是正整数");
@@ -598,6 +654,7 @@ async function main(): Promise<void> {
         runId: runFilter,
         status: "accepted",
         probeType: probeTypeFilter,
+        probeTypes: probeTypesFilter,
         onlyUncalibrated: Boolean(values["only-uncalibrated"]),
       });
       if (limit !== undefined) {
@@ -651,8 +708,10 @@ async function main(): Promise<void> {
         "main-db": { type: "string" },
         name: { type: "string" },
         run: { type: "string" },
+        profile: { type: "string" },
         "max-easy-ratio": { type: "string" },
         "allow-uncalibrated": { type: "boolean", default: false },
+        "allow-active-runs": { type: "boolean", default: false },
         "skip-main-verify": { type: "boolean", default: false },
         "fail-on-train-sim": { type: "string" },
         export: { type: "string" },
@@ -669,6 +728,8 @@ async function main(): Promise<void> {
       throw new Error(`评测库不存在：${evalDbPath}`);
     }
     const name = nonEmpty(values.name, "--name");
+    const profileFilter = parseEvalProfile(values.profile);
+    const probeTypesFilter = profileFilter ? probeTypesForProfile(profileFilter) : undefined;
     const maxEasyRatio = parseFloatOpt(values["max-easy-ratio"], "--max-easy-ratio") ?? DEFAULT_MAX_EASY_RATIO;
     const failOnTrainSim = parseFloatOpt(values["fail-on-train-sim"], "--fail-on-train-sim");
     const mainDbPath = values["skip-main-verify"]
@@ -692,8 +753,10 @@ async function main(): Promise<void> {
         evalStore: store,
         name,
         runId,
+        probeTypes: probeTypesFilter,
         maxEasyRatio,
         allowUncalibrated: Boolean(values["allow-uncalibrated"]),
+        allowActiveRuns: Boolean(values["allow-active-runs"]),
         mainDbPath: mainDbPath && existsSync(mainDbPath) ? mainDbPath : undefined,
         failOnTrainSim,
         exportPath,
@@ -719,6 +782,7 @@ async function main(): Promise<void> {
         "history-mode": { type: "string" },
         "system-prompt": { type: "string" },
         "system-prompt-file": { type: "string" },
+        "no-system-prompt": { type: "boolean", default: false },
         temperature: { type: "string" },
         "max-tokens": { type: "string" },
         "timeout-ms": { type: "string" },
@@ -747,13 +811,22 @@ async function main(): Promise<void> {
     const callMaxAttempts = validateCallMaxAttempts(parseIntOpt(values["call-attempts"], "--call-attempts") ?? DEFAULT_CALL_MAX_ATTEMPTS);
     const callRetryDelayMs = validateCallRetryDelayMs(parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms") ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
-    let systemPrompt = values["system-prompt"];
-    if (values["system-prompt-file"]) {
-      if (systemPrompt !== undefined) {
-        throw new Error("--system-prompt 与 --system-prompt-file 不能同时指定");
-      }
-      systemPrompt = (await readFile(resolve(values["system-prompt-file"]), "utf8")).trim();
-    }
+    const resolvedPrompt = await resolveCandidateSystemPrompt({
+      systemPrompt: values["system-prompt"],
+      systemPromptFile: values["system-prompt-file"],
+      noSystemPrompt: values["no-system-prompt"],
+      isResuming: resumeRunId !== undefined,
+    });
+    const systemPrompt = resolvedPrompt.systemPrompt;
+    const promptSourceLabel: Record<typeof resolvedPrompt.source, string> = {
+      cli: "CLI(--system-prompt)",
+      cli_file: "CLI(--system-prompt-file)",
+      env: "ENV(CANDIDATE_LLM_SYSTEM_PROMPT)",
+      env_file: "ENV(CANDIDATE_LLM_SYSTEM_PROMPT_FILE)",
+      default_file: "默认(prompts/eval/candidate-system.md)",
+      none: "无(--no-system-prompt)",
+      resume_inherit: "继承原run",
+    };
 
     const candidateConfig = readCandidateConfig({
       baseUrl: values["base-url"],
@@ -768,7 +841,7 @@ async function main(): Promise<void> {
     const store = new EvalStore(evalDbPath);
     try {
       console.log(
-        `=== M3 候选模型脱稿评测（suite=${suiteName}, candidate=${candidate}, model=${candidateConfig.modelId}, history=${historyMode}, 并发 ${concurrency}）===`,
+        `=== M3 候选模型脱稿评测（suite=${suiteName}, candidate=${candidate}, model=${candidateConfig.modelId}, history=${historyMode}, systemPrompt=${promptSourceLabel[resolvedPrompt.source]}, 并发 ${concurrency}）===`,
       );
       const summary = await runSuiteEvaluation({
         evalStore: store,
@@ -958,6 +1031,7 @@ async function main(): Promise<void> {
       options: {
         "eval-db": { type: "string" },
         run: { type: "string" },
+        profile: { type: "string" },
         status: { type: "string" },
         type: { type: "string" },
         sample: { type: "string" },
@@ -974,6 +1048,8 @@ async function main(): Promise<void> {
     if (!existsSync(evalDbPath)) {
       throw new Error(`评测库不存在：${evalDbPath}`);
     }
+    const profileFilter = parseEvalProfile(values.profile);
+    const probeTypesFilter = profileFilter ? probeTypesForProfile(profileFilter) : undefined;
     const probeTypeFilter = values.type !== undefined ? (values.type.trim() as ProbeType) : undefined;
     if (probeTypeFilter !== undefined && !PROBE_TYPES.includes(probeTypeFilter)) {
       throw new Error(`未知题型 --type ${probeTypeFilter}（可选：${PROBE_TYPES.join(", ")}）`);
@@ -989,7 +1065,12 @@ async function main(): Promise<void> {
       const statusFilter = values.status && values.status !== "all"
         ? (values.status as ProbeStatus)
         : undefined;
-      const matched = store.listProbes({ runId, status: statusFilter, probeType: probeTypeFilter });
+      const matched = store.listProbes({
+        runId,
+        status: statusFilter,
+        probeType: probeTypeFilter,
+        probeTypes: probeTypesFilter,
+      });
       const sampleSize = parseIntOpt(values.sample, "--sample");
       const seed = parseIntOpt(values.seed, "--seed") ?? 42;
       const selected = sampleSize !== undefined ? stratifiedSampleProbes(matched, sampleSize, seed) : matched;

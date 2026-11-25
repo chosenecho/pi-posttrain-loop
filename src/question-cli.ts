@@ -5,10 +5,12 @@ import { parseArgs } from "node:util";
 import {
   extractVideoKey,
   queryProcessedVideoIndex,
+  rankVideosCoreFirst,
   resolveSingleVideoInput,
   scanCorpusVideos,
   selectVideos,
   summarizeCorpusStatus,
+  validateVideoSortMode,
   type VideoUnit,
 } from "./corpus.js";
 import { runCorpusQuestionGeneration } from "./corpus-questions.js";
@@ -51,8 +53,9 @@ const HELP = `视频文稿出题并写入统一 SQLite 数据库（同视频多 
   --split SPLIT         数据集分区：train（默认）| test | dpo（持久哈希注册）
   --status              仅统计 --input-dir 的总视频数/已处理/未处理进度（含分区统计），不调用模型
   --limit N             本次从 --input-dir 抽取的未处理视频数量（按视频计，多 P 算 1 个）
-  --shuffle             随机抽选未处理视频（默认按视频 ID 顺序）
-  --max-questions N     可选：手动覆盖单视频/分块出题上限（默认按字数与分P数动态封顶 3–10 题）
+  --sort MODE           抽选排序模式：id（默认按视频 ID）| core-first（优先多 P 系列课与长篇理论文稿，推荐）
+  --shuffle             随机抽选未处理视频（与 --sort core-first 互斥）
+  --max-questions N     可选：手动覆盖单视频/分块出题上限（默认按字数与分P数动态封顶 2–6 题）
   --concurrency N       批量出题并发数，默认 10，范围 1–500
   --call-attempts N     单次出题模型调用异常/未保存最多尝试次数（含重试），默认 3，范围 1–10
   --retry-delay-ms MS   单次调用重试间隔毫秒数，默认 3000（3 秒），范围 0–60000
@@ -72,6 +75,7 @@ async function main(): Promise<void> {
       split: { type: "string" },
       status: { type: "boolean", default: false },
       limit: { type: "string" },
+      sort: { type: "string" },
       shuffle: { type: "boolean", default: false },
       "max-questions": { type: "string" },
       concurrency: { type: "string" },
@@ -107,6 +111,10 @@ async function main(): Promise<void> {
   }
 
   const targetSplit = validateSplit(values.split ?? "train", "--split");
+  const sortMode = validateVideoSortMode(values.sort);
+  if (sortMode === "core-first" && values.shuffle) {
+    throw new Error("--sort core-first 不能与 --shuffle 同时指定");
+  }
   const limit = parsePositiveInt(values.limit, "--limit");
   const maxQuestionsPerVideo = parsePositiveInt(values["max-questions"], "--max-questions");
   const concurrency = validateConcurrency(Number(values.concurrency ?? 10));
@@ -162,12 +170,13 @@ async function main(): Promise<void> {
       const pool = values.force
         ? allUnits
         : allUnits.filter((u) => !processedVideoKeys.has(extractVideoKey(u.videoId)));
-      candidates = selectVideos(pool, {
-        limit,
+      const splitPool = selectVideos(pool, {
         shuffle: Boolean(values.shuffle),
         split: targetSplit,
         splitMap,
       });
+      const orderedPool = sortMode === "core-first" ? await rankVideosCoreFirst(splitPool) : splitPool;
+      candidates = limit !== undefined ? orderedPool.slice(0, limit) : orderedPool;
       if (candidates.length === 0) {
         console.log(JSON.stringify({
           db: dbPath,

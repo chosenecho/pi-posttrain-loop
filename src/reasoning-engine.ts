@@ -7,11 +7,11 @@ import { createPiRunner, readPiConfig, type PiConfig, type ThinkingLevel } from 
 import {
   computeBatchStats,
   DEFAULT_REASONING_CHECK_CONFIG,
-  formatTierTargetRange,
   runRuleChecks,
   type ReasoningBatchStats,
   type ReasoningCheckConfig,
   type RuleCheckMetrics,
+  type SourceProfile,
   type ThinkTier,
   type TraceStatInput,
 } from "./reasoning-checks.js";
@@ -119,7 +119,7 @@ export function readReasoningPiConfigs(env: NodeJS.ProcessEnv = process.env): {
   const writerBase = readPiConfig(baseEnv);
   const writerThinking = parseOptionalThinkingLevel(env.REASONING_THINKING_LEVEL, "REASONING_THINKING_LEVEL")
     ?? writerBase.thinkingLevel
-    ?? "medium";
+    ?? "high";
   const writer: PiConfig = {
     ...writerBase,
     maxTokens: parseOptionalInt(env.REASONING_MAX_TOKENS, "REASONING_MAX_TOKENS", 128, writerBase.contextWindow - 1)
@@ -139,7 +139,8 @@ export function readReasoningPiConfigs(env: NodeJS.ProcessEnv = process.env): {
   const judgeBase = readPiConfig(judgeEnv);
   const judgeThinking = parseOptionalThinkingLevel(env.REASONING_JUDGE_THINKING_LEVEL, "REASONING_JUDGE_THINKING_LEVEL")
     ?? judgeBase.roleThinkingLevels?.judge
-    ?? "low";
+    ?? judgeBase.thinkingLevel
+    ?? "high";
   const judge: PiConfig = {
     ...judgeBase,
     thinkingLevel: judgeThinking,
@@ -184,16 +185,26 @@ export function selectStratifiedTurns(
   if (limit >= candidates.length) return [...candidates];
 
   const rng = createSeededRng(seed);
+  const profileOrder: SourceProfile[] = ["standard", "short"];
   const tierOrder: ThinkTier[] = ["short", "medium", "long"];
   const turnNos = [...new Set(candidates.map((c) => c.turnNo))].sort((a, b) => a - b);
 
-  const buckets: CandidateTurn[][] = [];
-  for (const tier of tierOrder) {
-    for (const turnNo of turnNos) {
-      const group = candidates.filter((c) => c.lengthTier === tier && c.turnNo === turnNo);
-      if (group.length > 0) {
-        buckets.push(shuffleWithRng(group, rng));
+  // Build per-profile (tier x turnNo) bucket queues and interleave profiles on round-robin
+  const profileQueues: Array<{ buckets: CandidateTurn[][]; cursor: number }> = [];
+  for (const profile of profileOrder) {
+    const pBuckets: CandidateTurn[][] = [];
+    for (const tier of tierOrder) {
+      for (const turnNo of turnNos) {
+        const group = candidates.filter(
+          (c) => (c.sourceProfile ?? "standard") === profile && c.lengthTier === tier && c.turnNo === turnNo,
+        );
+        if (group.length > 0) {
+          pBuckets.push(shuffleWithRng(group, rng));
+        }
       }
+    }
+    if (pBuckets.length > 0) {
+      profileQueues.push({ buckets: pBuckets, cursor: 0 });
     }
   }
 
@@ -202,22 +213,31 @@ export function selectStratifiedTurns(
 
   while (selected.length < limit) {
     let progressed = false;
-    for (const bucket of buckets) {
+    for (const queue of profileQueues) {
       if (selected.length >= limit) break;
-      if (bucket.length === 0) continue;
+      let chosenBucket: CandidateTurn[] | undefined;
+      for (let step = 0; step < queue.buckets.length; step++) {
+        const idx = (queue.cursor + step) % queue.buckets.length;
+        if (queue.buckets[idx].length > 0) {
+          chosenBucket = queue.buckets[idx];
+          queue.cursor = (idx + 1) % queue.buckets.length;
+          break;
+        }
+      }
+      if (!chosenBucket) continue;
 
       // Prefer the candidate in this stratum whose videoKey has been sampled the fewest times
       let bestIdx = 0;
-      let bestCount = videoUseCounts.get(bucket[0].videoKey) ?? 0;
-      for (let i = 1; i < bucket.length; i++) {
-        const count = videoUseCounts.get(bucket[i].videoKey) ?? 0;
+      let bestCount = videoUseCounts.get(chosenBucket[0].videoKey) ?? 0;
+      for (let i = 1; i < chosenBucket.length; i++) {
+        const count = videoUseCounts.get(chosenBucket[i].videoKey) ?? 0;
         if (count < bestCount) {
           bestCount = count;
           bestIdx = i;
           if (bestCount === 0) break;
         }
       }
-      const [picked] = bucket.splice(bestIdx, 1);
+      const [picked] = chosenBucket.splice(bestIdx, 1);
       selected.push(picked);
       videoUseCounts.set(picked.videoKey, (videoUseCounts.get(picked.videoKey) ?? 0) + 1);
       progressed = true;
@@ -236,7 +256,6 @@ export interface AttemptAuditEntry {
   llmIssues: string[];
   feedback: string;
   charCount: number;
-  ngram8Overlap: number;
 }
 
 export interface ReasoningBackfillOptions {
@@ -353,13 +372,10 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
       const totalAttempts = maxRewrites + 1;
       for (let attemptNo = 1; attemptNo <= totalAttempts; attemptNo++) {
         rewriteCount = attemptNo - 1;
-        const spec = checkConfig.tiers[turn.lengthTier];
         const writerInput: Record<string, unknown> = {
           ...(turn.history.length > 0 ? { history: turn.history } : {}),
           question: turn.question,
           answer: turn.answer,
-          targetThinkTier: turn.lengthTier,
-          targetChars: formatTierTargetRange(spec),
           ...(previousReasoning !== undefined && feedback !== undefined
             ? { previousReasoning, feedback }
             : {}),
@@ -390,7 +406,6 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
             llmIssues: [],
             feedback: ruleResult.feedback,
             charCount: ruleResult.metrics.charCount,
-            ngram8Overlap: ruleResult.metrics.ngram8Overlap,
           });
           previousReasoning = candidateReasoning;
           feedback = ruleResult.feedback;
@@ -406,7 +421,6 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
             llmIssues: [],
             feedback: "",
             charCount: ruleResult.metrics.charCount,
-            ngram8Overlap: ruleResult.metrics.ngram8Overlap,
           });
           finalDecision = "pass";
           finalReasoning = candidateReasoning;
@@ -418,7 +432,14 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
           question: turn.question,
           answer: turn.answer,
           reasoning: candidateReasoning,
-          targetThinkTier: turn.lengthTier,
+          referenceMetrics: {
+            charCount: ruleResult.metrics.charCount,
+            answerCharCount: ruleResult.metrics.answerCharCount,
+            maxVerbatimRun: ruleResult.metrics.maxVerbatimRun,
+            ...(ruleResult.metrics.maxVerbatimRun >= 12
+              ? { maxVerbatimSnippet: ruleResult.metrics.maxVerbatimSnippet }
+              : {}),
+          },
         };
 
         const review = await runWithRetry({
@@ -443,7 +464,6 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
           llmIssues: review.issues,
           feedback: review.feedback,
           charCount: ruleResult.metrics.charCount,
-          ngram8Overlap: ruleResult.metrics.ngram8Overlap,
         });
 
         if (review.decision === "pass") {

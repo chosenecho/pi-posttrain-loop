@@ -9,6 +9,12 @@ import {
   DEFAULT_EVAL_RUBRIC_SKILL,
   DEFAULT_FOLLOWUP_SKILL,
   DEFAULT_QUALITY_JUDGE,
+  SHORT_ANSWER_STYLE,
+  SHORT_FOLLOWUP_SKILL,
+  SHORT_QUALITY_JUDGE,
+  TRAP_ANSWER_STYLE,
+  TRAP_FOLLOWUP_SKILL,
+  TRAP_QUALITY_JUDGE,
   readAnswerStyle,
   readEvalRubricSkill,
   readFollowupSkill,
@@ -34,6 +40,14 @@ import { errorMessage, nonEmpty, validateConcurrency, validateMaxAttempts, valid
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const NO_SKILL_PROMPTS_DIR = join(ROOT, "prompts/no-skill");
 
+type JudgeProfile = "standard" | "short" | "trap";
+
+function parseJudgeProfile(raw: string | undefined): JudgeProfile {
+  const value = (raw ?? "standard").trim().toLowerCase();
+  if (value === "standard" || value === "short" || value === "trap") return value;
+  throw new Error(`--profile 仅支持 standard、short 或 trap，当前值：${raw}`);
+}
+
 function parseQuestionIds(raw: string | undefined): number[] | undefined {
   if (raw === undefined) return undefined;
   const ids = raw.split(",").map((part) => Number(part.trim()));
@@ -56,10 +70,9 @@ async function main(): Promise<void> {
       "call-attempts": { type: "string" },
       "retry-delay-ms": { type: "string" },
       "max-turns": { type: "string" },
-      "fixed-turns": { type: "boolean", default: false },
-      "no-length-tier": { type: "boolean", default: false },
       concurrency: { type: "string" },
       split: { type: "string" },
+      profile: { type: "string" },
       "extract-rubric": { type: "boolean", default: false },
       "rubric-skill": { type: "string" },
       "video-id": { type: "string" },
@@ -77,7 +90,7 @@ async function main(): Promise<void> {
   if (values.help) {
     console.log(
       "基于统一 SQLite 执行单轮或多轮回答/质检循环（默认加载 answer-style / quality-judge / followup-strategy 正式 Skill）\n" +
-      "npm run judge -- [--db data/data-maker.sqlite] [--split train|test|dpo] [--max-attempts 3] [--call-attempts 3] [--retry-delay-ms 3000] [--max-turns 3] [--concurrency 10]\n" +
+      "npm run judge -- [--db data/data-maker.sqlite] [--split train|test|dpo] [--profile standard|short|trap] [--max-attempts 3] [--call-attempts 3] [--retry-delay-ms 3000] [--max-turns 3] [--concurrency 10]\n" +
       "                 [--video-id ID] [--question-ids 1,2,3] [--only-unjudged] [--extract-rubric [--rubric-skill PATH]]\n" +
       "                 [--prompts prompts] [--skill PATH] [--answer-style PATH] [--followup-skill PATH]\n" +
       "                 [--no-skill] [--export PATH [--system TEXT | --system-file PATH]]",
@@ -96,13 +109,13 @@ async function main(): Promise<void> {
   }
 
   const targetSplit = values.split !== undefined ? validateSplit(values.split, "--split") : undefined;
+  const profile = parseJudgeProfile(values.profile);
   const extractRubric = Boolean(values["extract-rubric"]);
   const maxAttempts = validateMaxAttempts(Number(values["max-attempts"] ?? 3));
   const callMaxAttempts = validateCallMaxAttempts(Number(values["call-attempts"] ?? DEFAULT_CALL_MAX_ATTEMPTS));
   const callRetryDelayMs = validateCallRetryDelayMs(Number(values["retry-delay-ms"] ?? DEFAULT_CALL_RETRY_DELAY_MS));
-  const maxTurns = validateMaxTurns(Number(values["max-turns"] ?? 3));
-  const distributeTurns = !values["fixed-turns"] && maxTurns > 1;
-  const distributeLength = !values["no-length-tier"];
+  const defaultMaxTurns = profile === "short" || profile === "trap" ? 2 : 3;
+  const maxTurns = validateMaxTurns(Number(values["max-turns"] ?? defaultMaxTurns));
   const concurrency = validateConcurrency(Number(values.concurrency ?? 10));
   const dbPath = resolve(values.db ?? join(ROOT, "data/data-maker.sqlite"));
   const noSkill = Boolean(values["no-skill"]);
@@ -118,23 +131,39 @@ async function main(): Promise<void> {
     ? await readRubricPrompt(promptDir).catch(() => readRubricPrompt(DEFAULT_PROMPTS_DIR))
     : undefined;
 
+  const defaultAnswerStyle = profile === "short"
+    ? SHORT_ANSWER_STYLE
+    : profile === "trap"
+      ? TRAP_ANSWER_STYLE
+      : DEFAULT_ANSWER_STYLE;
+  const defaultQualityJudge = profile === "short"
+    ? SHORT_QUALITY_JUDGE
+    : profile === "trap"
+      ? TRAP_QUALITY_JUDGE
+      : DEFAULT_QUALITY_JUDGE;
+  const defaultFollowupSkill = profile === "short"
+    ? SHORT_FOLLOWUP_SKILL
+    : profile === "trap"
+      ? TRAP_FOLLOWUP_SKILL
+      : DEFAULT_FOLLOWUP_SKILL;
+
   const skills: Array<Record<string, unknown>> = [];
   let rubricReady = false;
 
   if (!noSkill) {
-    const stylePath = resolve(values["answer-style"] ?? DEFAULT_ANSWER_STYLE);
+    const stylePath = resolve(values["answer-style"] ?? defaultAnswerStyle);
     const style = await readAnswerStyle(stylePath);
     answerSystemPrompt = answerPrompt(answerSystemPrompt, style.body);
     skills.push({ name: "answer-style", path: stylePath, status: style.status, body: style.body, sha256: style.sha256 });
 
-    const rubricPath = resolve(values.skill ?? DEFAULT_QUALITY_JUDGE);
+    const rubricPath = resolve(values.skill ?? defaultQualityJudge);
     const rubric = await readRubric(rubricPath);
     judgeSystemPrompt = judgePrompt(judgeSystemPrompt, rubric.body);
     rubricReady = rubric.status === "ready";
     skills.push({ name: "quality-judge", path: rubricPath, status: rubric.status, body: rubric.body, sha256: rubric.sha256 });
 
     if (maxTurns > 1 && followupSystemPrompt !== undefined) {
-      const followupSkillPath = resolve(values["followup-skill"] ?? DEFAULT_FOLLOWUP_SKILL);
+      const followupSkillPath = resolve(values["followup-skill"] ?? defaultFollowupSkill);
       const followupSkill = await readFollowupSkill(followupSkillPath);
       followupSystemPrompt = composeFollowupPrompt(followupSystemPrompt, followupSkill.body);
       skills.push({
@@ -214,8 +243,6 @@ async function main(): Promise<void> {
       concurrency,
       callMaxAttempts,
       callRetryDelayMs,
-      distributeTurns,
-      distributeLength,
       split: targetSplit,
       videoId: values["video-id"],
       questionIds,
@@ -223,6 +250,7 @@ async function main(): Promise<void> {
       config: {
         mode: noSkill ? "sqlite-judge-no-skill" : "sqlite-judge",
         ...(targetSplit ? { split: targetSplit } : {}),
+        profile,
         model: sanitizedModel,
         promptDirectory: promptDir,
         ...(extractRubric ? { extractRubric: true } : {}),

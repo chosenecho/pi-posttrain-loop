@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import { nonEmpty } from "../schema.js";
 
 export interface ChatMessage {
@@ -99,13 +101,99 @@ export function stripLeadingThinkBlock(text: string): string {
   return match ? match[1]!.trim() : text.trim();
 }
 
+interface RawHttpResponse {
+  status: number;
+  statusText: string;
+  contentType: string;
+  bodyText: string;
+}
+
+function formatErrorWithCause(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (!cause) return error.message;
+  if (cause instanceof Error) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    const detail = code ? `${code}: ${cause.message}` : cause.message;
+    return `${error.message} (${detail})`;
+  }
+  return `${error.message} (${String(cause)})`;
+}
+
+/**
+ * Uses `node:http` / `node:https` directly when no custom `fetchFn` is injected so long-running
+ * non-streaming micro-batched inference servers are not aborted by undici's hard-coded 300s headersTimeout.
+ */
+function postJsonViaNodeHttp(
+  endpoint: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number,
+): Promise<RawHttpResponse> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(endpoint);
+    const transport = url.protocol === "https:" ? https : http;
+    const payload = Buffer.from(body, "utf8");
+    let settled = false;
+    const finishError = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    };
+
+    const req = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port || undefined,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-length": String(payload.byteLength),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer | string) => {
+          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+        });
+        res.on("error", (err) => finishError(err));
+        res.on("end", () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          const ctHeader = res.headers["content-type"];
+          const contentType = Array.isArray(ctHeader) ? ctHeader.join(", ") : (ctHeader ?? "");
+          resolve({
+            status: res.statusCode ?? 0,
+            statusText: res.statusMessage ?? "",
+            contentType,
+            bodyText: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+
+    const timer = setTimeout(() => {
+      const err = new Error(`请求超时（${timeoutMs}ms）`);
+      req.destroy(err);
+      finishError(err);
+    }, timeoutMs);
+
+    req.on("error", (err) => finishError(err));
+    req.write(payload);
+    req.end();
+  });
+}
+
 /**
  * Native multi-turn OpenAI-compatible `/chat/completions` client for evaluating candidate models
  * (`base`, `sft-v1`, `dpo-v1`, etc.) in exact ChatML message format without transcript leakage.
  */
 export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): CandidateRunner {
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const fetchImpl = config.fetchFn ?? fetch;
 
   function redact(message: string): string {
     if (!config.apiKey || config.apiKey === "EMPTY") return message;
@@ -113,8 +201,6 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
   }
 
   return async ({ messages, temperature, maxTokens }) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`请求超时（${config.timeoutMs}ms）`)), config.timeoutMs);
     try {
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -122,26 +208,43 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
       if (config.apiKey && config.apiKey !== "EMPTY") {
         headers.authorization = `Bearer ${config.apiKey}`;
       }
-
-      const response = await fetchImpl(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: config.modelId,
-          messages,
-          temperature: temperature ?? config.temperature,
-          max_tokens: maxTokens ?? config.maxTokens,
-          stream: false,
-        }),
-        signal: controller.signal,
+      const body = JSON.stringify({
+        model: config.modelId,
+        messages,
+        temperature: temperature ?? config.temperature,
+        max_tokens: maxTokens ?? config.maxTokens,
+        stream: false,
       });
 
-      const contentType = response.headers.get("content-type") ?? "";
-      const bodyText = await response.text();
+      let rawResponse: RawHttpResponse;
+      if (config.fetchFn) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(new Error(`请求超时（${config.timeoutMs}ms）`)), config.timeoutMs);
+        try {
+          const response = await config.fetchFn(endpoint, {
+            method: "POST",
+            headers,
+            body,
+            signal: controller.signal,
+          });
+          rawResponse = {
+            status: response.status,
+            statusText: response.statusText,
+            contentType: response.headers.get("content-type") ?? "",
+            bodyText: await response.text(),
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      } else {
+        rawResponse = await postJsonViaNodeHttp(endpoint, headers, body, config.timeoutMs);
+      }
 
-      if (!response.ok) {
+      const { status, statusText, contentType, bodyText } = rawResponse;
+
+      if (status < 200 || status >= 300) {
         const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 240);
-        throw new Error(`HTTP ${response.status} ${response.statusText}: ${snippet || "(empty body)"}`);
+        throw new Error(`HTTP ${status} ${statusText}: ${snippet || "(empty body)"}`);
       }
 
       if (contentType.includes("text/html") || /^\s*<!doctype\s+html|^\s*<html/i.test(bodyText)) {
@@ -189,10 +292,7 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
       }
       return cleaned;
     } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      throw new Error(redact(msg));
-    } finally {
-      clearTimeout(timer);
+      throw new Error(redact(formatErrorWithCause(error)));
     }
   };
 }

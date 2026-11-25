@@ -2,7 +2,15 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { extractVideoKey, type DedupPolicy } from "./db.js";
-import { countContentChars, inferThinkTier, type ThinkTier } from "./reasoning-checks.js";
+import {
+  countContentChars,
+  inferThinkTier,
+  normalizeSourceProfile,
+  parseProfileFilter,
+  type ProfileFilter,
+  type SourceProfile,
+  type ThinkTier,
+} from "./reasoning-checks.js";
 import { nonEmpty, validateSplit } from "./schema.js";
 import type { DatasetSplit } from "./types.js";
 
@@ -49,6 +57,7 @@ export interface HistoryTurnMessage {
 export interface CandidateTurn {
   resultId: number;
   sourceRunId: number;
+  sourceProfile: SourceProfile;
   questionId: number;
   materialId: number;
   videoId: string;
@@ -68,6 +77,8 @@ export interface CandidateTurnQueryOptions {
   runIds?: number[];
   excludeRunIds?: number[];
   split?: DatasetSplit;
+  profile?: ProfileFilter;
+  tiers?: ThinkTier[];
   dedup?: DedupPolicy;
   minTurns?: number;
   maxTurns?: number;
@@ -78,6 +89,7 @@ export interface CandidateTurnQueryOptions {
 export interface TraceWithContext {
   trace: ReasoningTraceRecord;
   sourceRunId: number;
+  sourceProfile: SourceProfile;
   questionId: number;
   materialId: number;
   videoId: string;
@@ -88,10 +100,17 @@ export interface TraceWithContext {
   history: HistoryTurnMessage[];
 }
 
+export interface ProfileStatusCount {
+  results: number;
+  turns: number;
+  missingTurns: number;
+}
+
 export interface ReasoningStatusSummary {
   candidateResults: number;
   candidateTurns: number;
   missingTurns: number;
+  byProfile: Record<SourceProfile, ProfileStatusCount>;
   byTier: Record<ThinkTier, number>;
   byTurnNo: Record<number, number>;
   reasoningRuns: Array<{
@@ -158,6 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_reasoning_traces_result_turn ON reasoning_traces(
 interface RawResultTurnRow {
   result_id: number;
   run_id: number;
+  source_profile: string | null;
   question_id: number;
   material_id: number;
   video_id: string;
@@ -179,7 +199,7 @@ export class ReasoningStore {
     }
     this.db = new DatabaseSync(databasePath, { readOnly: this.readOnly });
     this.db.exec("PRAGMA foreign_keys = ON;");
-    this.db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 5000};`);
+    this.db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 15000};`);
     if (!this.readOnly) {
       if (databasePath !== ":memory:") {
         this.db.exec("PRAGMA journal_mode = WAL;");
@@ -415,6 +435,7 @@ export class ReasoningStore {
     }
     const allFormal = options.allFormal ?? (options.runIds === undefined || options.runIds.length === 0);
     const targetSplit = options.split !== undefined ? validateSplit(options.split) : undefined;
+    const profileFilter: ProfileFilter = parseProfileFilter(options.profile);
     const dedup: DedupPolicy = options.dedup ?? "latest";
     const excludeSet = new Set(options.excludeRunIds ?? []);
 
@@ -460,10 +481,11 @@ export class ReasoningStore {
     if (candidateRunIds.length === 0) return [];
 
     const placeholders = candidateRunIds.map(() => "?").join(", ");
-    const params: number[] = [...candidateRunIds];
+    const params: Array<number | string> = [...candidateRunIds];
     let sql = `
       SELECT r.id AS result_id,
              i.run_id,
+             COALESCE(json_extract(ru.config_json, '$.profile'), 'standard') AS source_profile,
              q.id AS question_id,
              q.material_id,
              m.video_id,
@@ -474,12 +496,17 @@ export class ReasoningStore {
              a.answer AS assistant_content
       FROM results r
       JOIN run_items i ON i.id = r.run_item_id
+      JOIN runs ru ON ru.id = i.run_id
       JOIN questions q ON q.id = i.question_id
       JOIN materials m ON m.id = q.material_id
       JOIN turns t ON t.run_item_id = i.id AND t.status = 'pass'
       JOIN attempts a ON a.id = t.passed_attempt_id
       WHERE i.run_id IN (${placeholders})
     `;
+    if (profileFilter !== "all") {
+      sql += " AND LOWER(COALESCE(json_extract(ru.config_json, '$.profile'), 'standard')) = ?";
+      params.push(profileFilter);
+    }
     if (options.minTurns !== undefined) {
       sql += " AND r.turn_count >= ?";
       params.push(options.minTurns);
@@ -536,6 +563,7 @@ export class ReasoningStore {
     }
 
     const passedMap = options.onlyMissing ? this.getPassedReasoningMap(options.missingAgainstRunId) : undefined;
+    const tierFilter = options.tiers && options.tiers.length > 0 ? new Set<ThinkTier>(options.tiers) : undefined;
     const candidates: CandidateTurn[] = [];
 
     for (const turns of selectedDialogues) {
@@ -544,10 +572,12 @@ export class ReasoningStore {
       for (const row of turns) {
         const attemptId = Number(row.attempt_id);
         const answerCharCount = countContentChars(row.assistant_content);
-        if (!passedMap || !passedMap.has(attemptId)) {
+        const lengthTier = inferThinkTier(answerCharCount);
+        if ((!passedMap || !passedMap.has(attemptId)) && (!tierFilter || tierFilter.has(lengthTier))) {
           candidates.push({
             resultId: Number(row.result_id),
             sourceRunId: Number(row.run_id),
+            sourceProfile: normalizeSourceProfile(row.source_profile),
             questionId: Number(row.question_id),
             materialId: Number(row.material_id),
             videoId: row.video_id,
@@ -558,7 +588,7 @@ export class ReasoningStore {
             question: row.user_content,
             answer: row.assistant_content,
             answerCharCount,
-            lengthTier: inferThinkTier(answerCharCount),
+            lengthTier,
             history: history.map((m) => ({ ...m })),
           });
         }
@@ -591,6 +621,7 @@ export class ReasoningStore {
       .prepare(
         `SELECT r.id AS result_id,
                 i.run_id,
+                COALESCE(json_extract(ru.config_json, '$.profile'), 'standard') AS source_profile,
                 q.id AS question_id,
                 q.material_id,
                 m.video_id,
@@ -601,6 +632,7 @@ export class ReasoningStore {
                 a.answer AS assistant_content
          FROM results r
          JOIN run_items i ON i.id = r.run_item_id
+         JOIN runs ru ON ru.id = i.run_id
          JOIN questions q ON q.id = i.question_id
          JOIN materials m ON m.id = q.material_id
          JOIN turns t ON t.run_item_id = i.id AND t.status = 'pass'
@@ -636,6 +668,7 @@ export class ReasoningStore {
       output.push({
         trace,
         sourceRunId: Number(currentRow.run_id),
+        sourceProfile: normalizeSourceProfile(currentRow.source_profile),
         questionId: Number(currentRow.question_id),
         materialId: Number(currentRow.material_id),
         videoId: currentRow.video_id,
@@ -655,15 +688,30 @@ export class ReasoningStore {
     const passedMap = this.getPassedReasoningMap();
     const byTier: Record<ThinkTier, number> = { short: 0, medium: 0, long: 0 };
     const byTurnNo: Record<number, number> = {};
+    const byProfile: Record<SourceProfile, ProfileStatusCount> = {
+      standard: { results: 0, turns: 0, missingTurns: 0 },
+      short: { results: 0, turns: 0, missingTurns: 0 },
+    };
+    const profileResultIds: Record<SourceProfile, Set<number>> = {
+      standard: new Set<number>(),
+      short: new Set<number>(),
+    };
     const resultIds = new Set<number>();
     let missingTurns = 0;
 
     for (const c of allCandidates) {
       resultIds.add(c.resultId);
+      profileResultIds[c.sourceProfile].add(c.resultId);
+      byProfile[c.sourceProfile].turns++;
       byTier[c.lengthTier]++;
       byTurnNo[c.turnNo] = (byTurnNo[c.turnNo] ?? 0) + 1;
-      if (!passedMap.has(c.attemptId)) missingTurns++;
+      if (!passedMap.has(c.attemptId)) {
+        missingTurns++;
+        byProfile[c.sourceProfile].missingTurns++;
+      }
     }
+    byProfile.standard.results = profileResultIds.standard.size;
+    byProfile.short.results = profileResultIds.short.size;
 
     const runs = this.listReasoningRuns();
     const reasoningRuns = runs.map((run) => {
@@ -696,6 +744,7 @@ export class ReasoningStore {
       candidateResults: resultIds.size,
       candidateTurns: allCandidates.length,
       missingTurns,
+      byProfile,
       byTier,
       byTurnNo,
       reasoningRuns,

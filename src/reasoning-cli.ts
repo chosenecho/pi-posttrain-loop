@@ -5,8 +5,11 @@ import { parseArgs } from "node:util";
 import { validateMaxTurns, type DedupPolicy } from "./db.js";
 import {
   DEFAULT_REASONING_CHECK_CONFIG,
-  parseTierRangeFlag,
+  parseProfileFilter,
+  parseTierFilter,
+  type ProfileFilter,
   type ReasoningCheckConfig,
+  type ThinkTier,
 } from "./reasoning-checks.js";
 import {
   createReasoningRunners,
@@ -94,26 +97,24 @@ const HELP = `脱稿逆向补写 CoT（<think>）并导出 ms-swift 训练 JSONL
   --runs ID1,ID2,...             仅针对指定 answer_judge run_id 补写/导出（默认全库正式训练运行）
   --exclude-runs IDs             排除指定 answer_judge run_id
   --split SPLIT                  分区过滤：train | test | dpo（全库正式默认过滤 train）
+  --profile MODE                 来源风格过滤：all（默认，同时包含 standard 与 short）| standard | short
+  --tier TIERS                   档位过滤：short | medium | long（支持逗号分隔，如 --tier long）
   --dedup POLICY                 同题多版本选版策略：latest（默认）| earliest | error
   --min-turns N                  仅处理对话轮数 >= N 的样本
   --max-turns N                  仅处理对话轮数 <= N 的样本
   --only-missing                 增量跳过已有 pass 补写记录的轮次
   --limit N                      限制本次补写轮数（如试点 30）
-  --stratified                   搭配 --limit 使用：按 (档位 × 轮次) 分层并跨视频分散抽样
+  --stratified                   搭配 --limit 使用：按 (来源风格 × 档位 × 轮次) 分层并跨视频分散抽样
   --seed N                       固定随机种子（用于 --stratified / --shuffle / --val-ratio）
   --concurrency N                并发数 1–500（默认 10）
   --max-rewrites N               单轮规则/质检不通过时最大重写次数 0–5（默认 3）
   --no-llm-judge                 跳过 LLM 一致性审查，仅执行确定性规则拦截
   --call-attempts N              单次模型调用最大尝试次数 1–10（默认 3）
   --retry-delay-ms N             单次模型调用失败重试间隔毫秒 0–60000（默认 3000）
-  --short-range MIN-MAX          覆盖 short 档目标字数（默认 80-160）
-  --medium-range MIN-MAX         覆盖 medium 档目标字数（默认 120-230）
-  --long-range MIN-MAX           覆盖 long 档目标字数（默认 180-340）
   --writer-thinking LEVEL        覆盖补写模型思考强度（off|low|medium|high|max）
   --judge-thinking LEVEL         覆盖评审模型思考强度（off|low|medium|high|max）
-  --max-ratio FLOAT              思考/正文最大字数比 (0, 1]（默认 0.8）
-  --max-overlap FLOAT            8-gram 最大重合率 (0, 1]（默认 0.25）
-  --max-verbatim N               连续照抄正文最大字数阈值（默认 18）
+  --max-chars N                  思考异常过长安全上限字数（默认 800）
+  --max-verbatim N               连续极端照抄安全上限字数（默认 36）
   --writer-skill PATH            自定义 reasoning-writer Skill 路径
   --judge-skill PATH             自定义 reasoning-judge Skill 路径
   --prompts DIR                  自定义提示词目录（默认 prompts）
@@ -141,6 +142,8 @@ async function main(): Promise<void> {
       runs: { type: "string" },
       "exclude-runs": { type: "string" },
       split: { type: "string" },
+      profile: { type: "string" },
+      tier: { type: "string" },
       dedup: { type: "string" },
       "min-turns": { type: "string" },
       "max-turns": { type: "string" },
@@ -153,13 +156,9 @@ async function main(): Promise<void> {
       "no-llm-judge": { type: "boolean", default: false },
       "call-attempts": { type: "string" },
       "retry-delay-ms": { type: "string" },
-      "short-range": { type: "string" },
-      "medium-range": { type: "string" },
-      "long-range": { type: "string" },
       "writer-thinking": { type: "string" },
       "judge-thinking": { type: "string" },
-      "max-ratio": { type: "string" },
-      "max-overlap": { type: "string" },
+      "max-chars": { type: "string" },
       "max-verbatim": { type: "string" },
       "writer-skill": { type: "string" },
       "judge-skill": { type: "string" },
@@ -206,6 +205,8 @@ async function main(): Promise<void> {
   const runIds = values.runs !== undefined ? parseRunIdList(values.runs, "--runs") : undefined;
   const excludeRunIds = values["exclude-runs"] !== undefined ? parseRunIdList(values["exclude-runs"], "--exclude-runs") : undefined;
   const split: DatasetSplit | undefined = values.split !== undefined ? validateSplit(values.split, "--split") : undefined;
+  const profile: ProfileFilter = parseProfileFilter(values.profile, "--profile");
+  const tiers: ThinkTier[] | undefined = parseTierFilter(values.tier, "--tier");
   const dedup = (values.dedup ?? "latest") as DedupPolicy;
   if (dedup !== "latest" && dedup !== "earliest" && dedup !== "error") {
     throw new Error("--dedup 必须为 latest、earliest 或 error");
@@ -235,6 +236,8 @@ async function main(): Promise<void> {
     runIds,
     excludeRunIds,
     split,
+    profile,
+    tiers,
     dedup,
     minTurns,
     maxTurns,
@@ -336,23 +339,9 @@ async function main(): Promise<void> {
 
   // Mode 3: Backfill CoT (+ optional review-md & export)
   const checkConfig: ReasoningCheckConfig = {
-    tiers: {
-      short: values["short-range"] !== undefined
-        ? parseTierRangeFlag(values["short-range"], "--short-range")
-        : { ...DEFAULT_REASONING_CHECK_CONFIG.tiers.short },
-      medium: values["medium-range"] !== undefined
-        ? parseTierRangeFlag(values["medium-range"], "--medium-range")
-        : { ...DEFAULT_REASONING_CHECK_CONFIG.tiers.medium },
-      long: values["long-range"] !== undefined
-        ? parseTierRangeFlag(values["long-range"], "--long-range")
-        : { ...DEFAULT_REASONING_CHECK_CONFIG.tiers.long },
-    },
-    maxAnswerRatio: values["max-ratio"] !== undefined
-      ? parseUnitFloat(values["max-ratio"], "--max-ratio")
-      : DEFAULT_REASONING_CHECK_CONFIG.maxAnswerRatio,
-    maxNgram8Overlap: values["max-overlap"] !== undefined
-      ? parseUnitFloat(values["max-overlap"], "--max-overlap")
-      : DEFAULT_REASONING_CHECK_CONFIG.maxNgram8Overlap,
+    maxChars: values["max-chars"] !== undefined
+      ? parsePositiveInt(values["max-chars"], "--max-chars")
+      : DEFAULT_REASONING_CHECK_CONFIG.maxChars,
     maxVerbatimRun: values["max-verbatim"] !== undefined
       ? parsePositiveInt(values["max-verbatim"], "--max-verbatim")
       : DEFAULT_REASONING_CHECK_CONFIG.maxVerbatimRun,
@@ -442,12 +431,14 @@ async function main(): Promise<void> {
           : {}),
         stratified: Boolean(values.stratified),
         onlyMissing: Boolean(values["only-missing"]),
+        profile,
+        ...(tiers ? { tiers } : {}),
         ...(limit !== undefined ? { limit } : {}),
         ...(seed !== undefined ? { seed } : {}),
       },
       onProgress: ({ completed, total, turn, decision }) => {
         process.stderr.write(
-          `[reasoning ${completed}/${total}] result=${turn.resultId} turn=${turn.turnNo}/${turn.turnCount} tier=${turn.lengthTier} -> ${decision}\n`,
+          `[reasoning ${completed}/${total}] result=${turn.resultId} turn=${turn.turnNo}/${turn.turnCount} profile=${turn.sourceProfile} tier=${turn.lengthTier} -> ${decision}\n`,
         );
       },
     });
@@ -473,9 +464,10 @@ async function main(): Promise<void> {
     }
 
     if (values.export !== undefined) {
+      const exportReasoningRunId = values["only-missing"] ? undefined : backfill.reasoningRunId;
       const exportResult = buildReasoningExportDataset(store, {
         ...queryOptions,
-        reasoningRunId: backfill.reasoningRunId,
+        reasoningRunId: exportReasoningRunId,
         expandTurns,
         format,
         systemPrompt,
@@ -503,7 +495,7 @@ async function main(): Promise<void> {
         trainJsonl,
         valOutPath,
         valJsonl,
-        reasoningRunId: backfill.reasoningRunId,
+        reasoningRunId: exportReasoningRunId,
         hasSystemPrompt: systemPrompt !== undefined,
         shuffled: Boolean(values.shuffle),
         seed,

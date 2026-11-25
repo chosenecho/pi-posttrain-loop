@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { DataMakerStore, formatSamplesJsonl, sha256Hex, validateMaxTurns, type DedupPolicy } from "./db.js";
@@ -7,6 +7,16 @@ import { assertNoEvalLeak, readEvalVideoKeys } from "./eval-guard.js";
 import { errorMessage, nonEmpty, validateSplit } from "./schema.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+function formatLocalTimestamp(date: Date = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function appendTimestampToPath(filePath: string, timestamp: string): string {
+  const parsed = parse(filePath);
+  return join(parsed.dir, `${parsed.name}-${timestamp}${parsed.ext}`);
+}
 
 function parseRunIdList(raw: string, label: string): number[] {
   const ids = raw.split(",").map((part) => Number(part.trim()));
@@ -22,10 +32,10 @@ const HELP = `从统一 SQLite 导出训练 JSONL（严格单行一条 {"message
   npm run export -- --run 8 --out output/run-8.jsonl
 
 一键汇总全库所有正式样本（自动排除 training_enabled=false，同题默认取最新 run）：
-  npm run export -- --all-formal --out output/train-all.jsonl
+  npm run export -- --all-formal --out output/train-all.jsonl --timestamp
 
 显式合并多个运行 + 打乱 + 按视频切分验证集 + 注入系统提示词 + 写审计清单：
-  npm run export -- --runs 3,5,6,8 --out output/train.jsonl --val-out output/val.jsonl --val-ratio 0.1 --shuffle --seed 42 --manifest output/manifest.json --system "你的系统提示词"
+  npm run export -- --runs 3,5,6,8 --out output/train.jsonl --val-out output/val.jsonl --val-ratio 0.1 --shuffle --seed 42 --manifest output/manifest.json --timestamp --system "你的系统提示词"
 
 参数：
   --run ID               导出单个 run_id（与 --runs、--all-formal、--version 互斥）
@@ -44,6 +54,7 @@ const HELP = `从统一 SQLite 导出训练 JSONL（严格单行一条 {"message
   --val-out PATH         可选：验证集 JSONL 输出路径（需搭配 --val-ratio，按视频整块切分防泄漏）
   --val-ratio FLOAT      可选：验证集视频比例，(0, 1) 之间的小数（如 0.1）
   --manifest PATH        可选：将本次导出溯源与统计清单另存为 JSON 文件
+  --timestamp            可选：自动为 --out、--val-out、--manifest 文件名附加本地日期时间戳（-YYYYMMDD-HHmmss）
   --system TEXT          可选：每条样本前统一注入一条 system 消息
   --system-file PATH     可选：从文件读取训练 system 提示词（与 --system 互斥）
   --db PATH              统一 SQLite 路径，默认 data/data-maker.sqlite
@@ -71,6 +82,7 @@ async function main(): Promise<void> {
       "val-out": { type: "string" },
       "val-ratio": { type: "string" },
       manifest: { type: "string" },
+      timestamp: { type: "boolean", default: false },
       system: { type: "string" },
       "system-file": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
@@ -109,7 +121,13 @@ async function main(): Promise<void> {
     }
   }
 
-  const outPath = resolve(nonEmpty(values.out, "--out"));
+  const exportTimestamp = values.timestamp ? formatLocalTimestamp() : undefined;
+  const resolveExportPath = (rawPath: string): string => {
+    const resolved = resolve(rawPath);
+    return exportTimestamp ? appendTimestampToPath(resolved, exportTimestamp) : resolved;
+  };
+
+  const outPath = resolveExportPath(nonEmpty(values.out, "--out"));
   const dbPath = resolve(values.db ?? join(ROOT, "data/data-maker.sqlite"));
 
   let runIds: number[] | undefined;
@@ -199,15 +217,20 @@ async function main(): Promise<void> {
     let valOutPath: string | undefined;
     let valSha256: string | undefined;
     if (values["val-out"] !== undefined) {
-      valOutPath = resolve(nonEmpty(values["val-out"], "--val-out"));
+      valOutPath = resolveExportPath(nonEmpty(values["val-out"], "--val-out"));
       const valJsonl = formatSamplesJsonl(merged.val.map((r) => r.sample));
       await mkdir(dirname(valOutPath), { recursive: true });
       await writeFile(valOutPath, valJsonl, "utf8");
       valSha256 = sha256Hex(valJsonl);
     }
 
+    const manifestPath = values.manifest !== undefined
+      ? resolveExportPath(nonEmpty(values.manifest, "--manifest"))
+      : undefined;
+
     const report = {
       exportedAt: new Date().toISOString(),
+      ...(exportTimestamp ? { timestamp: exportTimestamp } : {}),
       db: dbPath,
       mode: values.version !== undefined
         ? "version"
@@ -236,10 +259,10 @@ async function main(): Promise<void> {
       out: outPath,
       outSha256: sha256Hex(trainJsonl),
       ...(valOutPath ? { valOut: valOutPath, valSha256 } : {}),
+      ...(manifestPath ? { manifest: manifestPath } : {}),
     };
 
-    if (values.manifest !== undefined) {
-      const manifestPath = resolve(nonEmpty(values.manifest, "--manifest"));
+    if (manifestPath !== undefined) {
       await mkdir(dirname(manifestPath), { recursive: true });
       await writeFile(manifestPath, JSON.stringify(report, null, 2) + "\n", "utf8");
     }

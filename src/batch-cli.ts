@@ -5,9 +5,11 @@ import { parseArgs } from "node:util";
 import {
   extractVideoKey,
   queryProcessedVideoIndex,
+  rankVideosCoreFirst,
   scanCorpusVideos,
   selectVideos,
   summarizeCorpusStatus,
+  validateVideoSortMode,
 } from "./corpus.js";
 import { runCorpusQuestionGeneration } from "./corpus-questions.js";
 import { DataMakerStore, validateMaxTurns } from "./db.js";
@@ -19,6 +21,14 @@ import {
   DEFAULT_FOLLOWUP_SKILL,
   DEFAULT_QUALITY_JUDGE,
   DEFAULT_QUESTION_SKILL,
+  SHORT_ANSWER_STYLE,
+  SHORT_FOLLOWUP_SKILL,
+  SHORT_QUALITY_JUDGE,
+  SHORT_QUESTION_SKILL,
+  TRAP_ANSWER_STYLE,
+  TRAP_FOLLOWUP_SKILL,
+  TRAP_QUALITY_JUDGE,
+  TRAP_QUESTION_SKILL,
   readAnswerStyle,
   readEvalRubricSkill,
   readFollowupSkill,
@@ -58,10 +68,20 @@ function parsePositiveInt(raw: string | undefined, label: string): number | unde
   return value;
 }
 
+type BatchProfile = "standard" | "short" | "trap";
+
+function parseBatchProfile(raw: string | undefined): BatchProfile {
+  const value = (raw ?? "standard").trim().toLowerCase();
+  if (value === "standard" || value === "short" || value === "trap") return value;
+  throw new Error(`--profile 仅支持 standard、short 或 trap，当前值：${raw}`);
+}
+
 const HELP = `一条命令完成全流程批量生产：选未处理视频（多 P 自动合并防重）→ 并发出题 → 单/多轮问答质检 → 可选导出 JSONL
 
 快速用法：
   npm run batch -- --limit 10 --shuffle --export output/train-batch.jsonl
+  npm run batch -- --profile short --limit 20 --shuffle --export output/train-short.jsonl
+  npm run batch -- --profile trap --limit 20 --shuffle --export output/train-trap.jsonl
 
 查看语料库进度（不调用模型）：
   npm run batch -- --status
@@ -69,12 +89,12 @@ const HELP = `一条命令完成全流程批量生产：选未处理视频（多
 参数：
   --input-dir PATH       语料目录，默认 data/weimingzi-semantic
   --split SPLIT          数据集分区：train（默认）| test | dpo（持久哈希注册，防测试集泄漏）
+  --profile MODE         训练风格预设：standard（默认中长深挖，默认 3 轮）| short（极短/短答专职 Skill，默认 2 轮）| trap（陷阱识别与作者口吻拒答 Skill，默认 2 轮、单视频上限 3 题）
   --limit N              本次抽取未处理视频数（按视频计，多 P 算 1 个），默认 10
-  --shuffle              随机抽选未处理视频（默认按视频 ID 顺序）
-  --max-questions N      可选：手动覆盖单视频/分块出题上限（默认按字数与分P数动态封顶 3–10 题）
-  --max-turns N          每条样本对话轮上限，默认 3（搭配默认 1轮30%:2轮50%:3轮20% 比例分配），范围 1–20
-  --fixed-turns          禁用按比例分配轮数，所有问题固定跑满 --max-turns 轮上限
-  --no-length-tier       禁用短/中/长（25%:50%:25%）回答篇幅档位控制
+  --sort MODE            抽选排序模式：id（默认按视频 ID）| core-first（优先多 P 系列课与长篇理论文稿，推荐）
+  --shuffle              随机抽选未处理视频（与 --sort core-first 互斥）
+  --max-questions N      可选：手动覆盖单视频/分块出题上限（默认按字数与分P数动态封顶 2–6 题）
+  --max-turns N          每条样本对话轮上限，默认 3（由追问 Agent 按话题余量自主决定继续或提前结束），范围 1–20
   --max-attempts N       每对话轮质检返工上限，默认 3，范围 1–10
   --call-attempts N      单次模型调用异常/解析失败最多尝试次数（含重试），默认 3，范围 1–10（仍失败则丢弃该题）
   --retry-delay-ms MS    单次模型调用重试间隔毫秒数，默认 3000（3 秒），范围 0–60000
@@ -102,12 +122,12 @@ async function main(): Promise<void> {
     options: {
       "input-dir": { type: "string" },
       split: { type: "string" },
+      profile: { type: "string" },
       limit: { type: "string" },
+      sort: { type: "string" },
       shuffle: { type: "boolean", default: false },
       "max-questions": { type: "string" },
       "max-turns": { type: "string" },
-      "fixed-turns": { type: "boolean", default: false },
-      "no-length-tier": { type: "boolean", default: false },
       "max-attempts": { type: "string" },
       "call-attempts": { type: "string" },
       "retry-delay-ms": { type: "string" },
@@ -141,7 +161,11 @@ async function main(): Promise<void> {
   if (values.system !== undefined && values["system-file"] !== undefined) {
     throw new Error("--system 与 --system-file 不能同时指定");
   }
+  const profile = parseBatchProfile(values.profile);
   const noSkill = Boolean(values["no-skill"]);
+  if (noSkill && profile !== "standard") {
+    throw new Error(`--no-skill 不能与 --profile ${profile} 同时指定`);
+  }
   if (
     noSkill
     && (values["question-skill"] !== undefined || values["followup-skill"] !== undefined || values["answer-style"] !== undefined || values.skill !== undefined || values["rubric-skill"] !== undefined)
@@ -150,6 +174,10 @@ async function main(): Promise<void> {
   }
 
   const targetSplit = validateSplit(values.split ?? "train", "--split");
+  const sortMode = validateVideoSortMode(values.sort);
+  if (sortMode === "core-first" && values.shuffle) {
+    throw new Error("--sort core-first 不能与 --shuffle 同时指定");
+  }
   if (values["freeze-version"] !== undefined && targetSplit === "train") {
     throw new Error("--freeze-version 仅适用于 --split test 或 --split dpo");
   }
@@ -157,10 +185,9 @@ async function main(): Promise<void> {
   const inputDir = resolve(values["input-dir"] ?? DEFAULT_CORPUS_DIR);
   const dbPath = resolve(values.db ?? DEFAULT_DB);
   const limit = parsePositiveInt(values.limit ?? "10", "--limit")!;
-  const maxQuestionsPerVideo = parsePositiveInt(values["max-questions"], "--max-questions");
-  const maxTurns = validateMaxTurns(Number(values["max-turns"] ?? 3));
-  const distributeTurns = !values["fixed-turns"] && maxTurns > 1;
-  const distributeLength = !values["no-length-tier"];
+  const maxQuestionsPerVideo = parsePositiveInt(values["max-questions"], "--max-questions") ?? (profile === "trap" ? 3 : undefined);
+  const defaultMaxTurns = profile === "standard" ? 3 : 2;
+  const maxTurns = validateMaxTurns(Number(values["max-turns"] ?? defaultMaxTurns));
   const maxAttempts = validateMaxAttempts(Number(values["max-attempts"] ?? 3));
   const callMaxAttempts = validateCallMaxAttempts(Number(values["call-attempts"] ?? DEFAULT_CALL_MAX_ATTEMPTS));
   const callRetryDelayMs = validateCallRetryDelayMs(Number(values["retry-delay-ms"] ?? DEFAULT_CALL_RETRY_DELAY_MS));
@@ -211,24 +238,45 @@ async function main(): Promise<void> {
     let rubricReady = false;
 
     if (!noSkill) {
-      const qSkillPath = resolve(values["question-skill"] ?? DEFAULT_QUESTION_SKILL);
+      const defaultQuestionSkill = profile === "short"
+        ? SHORT_QUESTION_SKILL
+        : profile === "trap"
+          ? TRAP_QUESTION_SKILL
+          : DEFAULT_QUESTION_SKILL;
+      const defaultAnswerStyle = profile === "short"
+        ? SHORT_ANSWER_STYLE
+        : profile === "trap"
+          ? TRAP_ANSWER_STYLE
+          : DEFAULT_ANSWER_STYLE;
+      const defaultQualityJudge = profile === "short"
+        ? SHORT_QUALITY_JUDGE
+        : profile === "trap"
+          ? TRAP_QUALITY_JUDGE
+          : DEFAULT_QUALITY_JUDGE;
+      const defaultFollowupSkill = profile === "short"
+        ? SHORT_FOLLOWUP_SKILL
+        : profile === "trap"
+          ? TRAP_FOLLOWUP_SKILL
+          : DEFAULT_FOLLOWUP_SKILL;
+
+      const qSkillPath = resolve(values["question-skill"] ?? defaultQuestionSkill);
       const qSkill = await readQuestionSkill(qSkillPath);
       questionSystemPrompt = questionPrompt(questionBasePrompt, qSkill.body);
       questionSkills.push({ name: "question-design", path: qSkillPath, status: qSkill.status, body: qSkill.body, sha256: qSkill.sha256 });
 
-      const stylePath = resolve(values["answer-style"] ?? DEFAULT_ANSWER_STYLE);
+      const stylePath = resolve(values["answer-style"] ?? defaultAnswerStyle);
       const style = await readAnswerStyle(stylePath);
       answerSystemPrompt = answerPrompt(answerSystemPrompt, style.body);
       dialogueSkills.push({ name: "answer-style", path: stylePath, status: style.status, body: style.body, sha256: style.sha256 });
 
-      const rubricPath = resolve(values.skill ?? DEFAULT_QUALITY_JUDGE);
+      const rubricPath = resolve(values.skill ?? defaultQualityJudge);
       const rubric = await readRubric(rubricPath);
       judgeSystemPrompt = judgePrompt(judgeSystemPrompt, rubric.body);
       rubricReady = rubric.status === "ready";
       dialogueSkills.push({ name: "quality-judge", path: rubricPath, status: rubric.status, body: rubric.body, sha256: rubric.sha256 });
 
       if (maxTurns > 1 && followupSystemPrompt !== undefined) {
-        const fSkillPath = resolve(values["followup-skill"] ?? DEFAULT_FOLLOWUP_SKILL);
+        const fSkillPath = resolve(values["followup-skill"] ?? defaultFollowupSkill);
         const fSkill = await readFollowupSkill(fSkillPath);
         followupSystemPrompt = composeFollowupPrompt(followupSystemPrompt, fSkill.body);
         dialogueSkills.push({ name: "followup-strategy", path: fSkillPath, status: fSkill.status, body: fSkill.body, sha256: fSkill.sha256 });
@@ -266,18 +314,19 @@ async function main(): Promise<void> {
     const splitMap = syncCorpusSplits(store, allUnits);
     const { processedVideoKeys } = queryProcessedVideoIndex(store);
     const unprocessedPool = allUnits.filter((u) => !processedVideoKeys.has(extractVideoKey(u.videoId)));
-    const selectedVideos = selectVideos(unprocessedPool, {
-      limit,
+    const splitPool = selectVideos(unprocessedPool, {
       shuffle: Boolean(values.shuffle),
       split: targetSplit,
       splitMap,
     });
+    const orderedPool = sortMode === "core-first" ? await rankVideosCoreFirst(splitPool) : splitPool;
+    const selectedVideos = orderedPool.slice(0, limit);
 
     let questionSummary;
     let targetQuestionIds: number[] = [];
 
     if (selectedVideos.length > 0) {
-      console.log(`=== 阶段 1/2：出题（分区 ${targetSplit}，选中 ${selectedVideos.length} 个未处理视频，并发 ${concurrency}，模型 ${config.modelId}）===`);
+      console.log(`=== 阶段 1/2：出题（分区 ${targetSplit}，profile=${profile}，选中 ${selectedVideos.length} 个未处理视频，并发 ${concurrency}，模型 ${config.modelId}）===`);
       questionSummary = await runCorpusQuestionGeneration({
         store,
         config,
@@ -286,6 +335,7 @@ async function main(): Promise<void> {
         candidates: selectedVideos,
         concurrency,
         split: targetSplit,
+        profile,
         callMaxAttempts,
         callRetryDelayMs,
         maxQuestionsPerVideo,
@@ -335,13 +385,12 @@ async function main(): Promise<void> {
       concurrency,
       callMaxAttempts,
       callRetryDelayMs,
-      distributeTurns,
-      distributeLength,
       split: targetSplit,
       questionIds: targetQuestionIds,
       config: {
         mode: noSkill ? "sqlite-batch-no-skill" : "sqlite-batch",
         split: targetSplit,
+        profile,
         model: sanitizedModel,
         promptDirectory: promptDir,
         questionRunId: questionSummary?.runId ?? null,
@@ -401,6 +450,7 @@ async function main(): Promise<void> {
       db: dbPath,
       inputDir,
       split: targetSplit,
+      profile,
       questionRunId: questionSummary?.runId ?? null,
       selectedVideos: selectedVideos.length,
       processedVideos: questionSummary?.processedVideos ?? 0,
@@ -411,8 +461,6 @@ async function main(): Promise<void> {
       maxTurns,
       maxAttempts,
       concurrency,
-      ...(dialogueSummary.plannedTurnDistribution ? { plannedTurnDistribution: dialogueSummary.plannedTurnDistribution } : {}),
-      ...(dialogueSummary.plannedLengthDistribution ? { plannedLengthDistribution: dialogueSummary.plannedLengthDistribution } : {}),
       outcomes: dialogueSummary.outcomes,
       results: dialogueSummary.results,
       judgeErrors: dialogueSummary.errors,

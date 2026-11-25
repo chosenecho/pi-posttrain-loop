@@ -408,8 +408,21 @@ function reconstructScoredTurn(cal: CalibrationTurnRecord): ScoredTurn {
   const detailScored = cal.detail?.scored as Partial<ScoredTurn> | undefined;
   const stance = (cal.stance === 0 || cal.stance === 1 || cal.stance === 2 ? cal.stance : 0) as 0 | 1 | 2;
   const style = (cal.style === 0 || cal.style === 1 || cal.style === 2 ? cal.style : 0) as 0 | 1 | 2;
+  const finalScore = typeof detailScored?.finalScore === "number" ? detailScored.finalScore : cal.score;
+  const hallucinated = typeof detailScored?.hallucinated === "boolean"
+    ? detailScored.hallucinated
+    : cal.hallucinationHits > 0;
+  const verdict = detailScored?.verdict === "pass" || detailScored?.verdict === "partial" || detailScored?.verdict === "fail"
+    ? detailScored.verdict
+    : !cal.behaviorOk || hallucinated || finalScore < 50
+      ? "fail"
+      : finalScore >= 80
+        ? "pass"
+        : "partial";
   return {
+    verdict,
     behaviorOk: cal.behaviorOk,
+    hallucinated,
     stance,
     keyPointCoverage: cal.keyPointCoverage,
     forbiddenHits: cal.forbiddenHits,
@@ -420,7 +433,9 @@ function reconstructScoredTurn(cal: CalibrationTurnRecord): ScoredTurn {
     penalty: typeof detailScored?.penalty === "number" ? detailScored.penalty : 0,
     rawScore: typeof detailScored?.rawScore === "number" ? detailScored.rawScore : cal.score,
     cappedByBehavior: typeof detailScored?.cappedByBehavior === "boolean" ? detailScored.cappedByBehavior : false,
-    finalScore: typeof detailScored?.finalScore === "number" ? detailScored.finalScore : cal.score,
+    finalScore,
+    substantiveScore:
+      typeof detailScored?.substantiveScore === "number" ? detailScored.substantiveScore : cal.score,
   };
 }
 

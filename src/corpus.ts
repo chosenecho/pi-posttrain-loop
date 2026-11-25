@@ -39,7 +39,8 @@ export const DEFAULT_MAX_CHUNK_CHARS = 32_000;
 
 /**
  * Computes per-material question generation quota based on character count and merged part count.
- * Prevents over-extracting short videos while giving multi-P merged transcripts a proportional allowance.
+ * v2 keeps per-video quotas compact (2–6) so the same question budget covers 70%–100% of corpus videos
+ * rather than concentrating 7–10 questions onto a small subset of videos.
  */
 export function computeQuestionQuota(
   charCount: number,
@@ -47,21 +48,21 @@ export function computeQuestionQuota(
   maxCap?: number,
 ): number {
   let base: number;
-  if (charCount < 2_500) {
+  if (charCount < 1_500) {
+    base = 2;
+  } else if (charCount < 5_000) {
     base = 3;
-  } else if (charCount < 8_000) {
-    base = 5;
-  } else if (charCount < 20_000) {
-    base = 7;
+  } else if (charCount < 15_000) {
+    base = 4;
   } else {
-    base = 9;
+    base = 5;
   }
   const normalizedParts = Math.max(1, partCount);
   const effectiveParts = normalizedParts > 1
     ? Math.min(normalizedParts, Math.max(1, Math.floor(charCount / 2_000)))
     : 1;
-  const partBonus = Math.min(3, Math.max(0, effectiveParts - 1));
-  const computed = Math.min(10, base + partBonus);
+  const partBonus = effectiveParts >= 3 ? 1 : 0;
+  const computed = Math.min(6, base + partBonus);
   if (maxCap !== undefined) {
     return Math.max(1, Math.min(maxCap, computed));
   }
@@ -395,6 +396,47 @@ export function summarizeCorpusStatus(units: VideoUnit[], store: DataMakerStore)
     unprocessedVideos: unprocessed.length,
     unprocessed,
   };
+}
+
+export type VideoSortMode = "id" | "core-first";
+
+export function validateVideoSortMode(raw: string | undefined): VideoSortMode {
+  if (raw === undefined || raw === "id") return "id";
+  if (raw === "core-first") return "core-first";
+  throw new Error("--sort 必须是 id 或 core-first");
+}
+
+/**
+ * Ranks videos to prioritize core theoretical series and dense long-form transcripts first:
+ * - Tier 2: substantial multi-P lecture series (partPaths.length >= 2 && totalBytes >= 6_000)
+ * - Tier 1: substantial single-P lectures (totalBytes >= 6_000)
+ * - Tier 0: short clips / announcements (demoted to the tail)
+ * Within each tier, videos are ordered by totalBytes descending, then videoId ascending.
+ */
+export async function rankVideosCoreFirst(units: VideoUnit[]): Promise<VideoUnit[]> {
+  const scored = await Promise.all(
+    units.map(async (unit) => {
+      let totalBytes = 0;
+      for (const partPath of unit.partPaths) {
+        try {
+          totalBytes += (await stat(partPath)).size;
+        } catch {
+          // Ignore unreadable/missing part during stat ranking
+        }
+      }
+      const tier = totalBytes >= 6_000
+        ? (unit.partPaths.length >= 2 ? 2 : 1)
+        : 0;
+      return { unit, tier, totalBytes };
+    }),
+  );
+
+  scored.sort((a, b) =>
+    b.tier - a.tier
+    || b.totalBytes - a.totalBytes
+    || NATURAL_COLLATOR.compare(a.unit.videoId, b.unit.videoId),
+  );
+  return scored.map((item) => item.unit);
 }
 
 export function selectVideos(

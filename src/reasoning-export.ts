@@ -2,8 +2,10 @@ import { createSeededRng, sha256Hex, type DedupPolicy } from "./db.js";
 import {
   computeBatchStats,
   countContentChars,
+  type ProfileFilter,
   type ReasoningBatchStats,
   type RuleCheckMetrics,
+  type SourceProfile,
   type ThinkTier,
   type TraceStatInput,
 } from "./reasoning-checks.js";
@@ -31,6 +33,7 @@ export interface ReasoningTrainingSampleLine {
 export interface ReasoningExportRecord {
   resultId: number;
   sourceRunId: number;
+  sourceProfile: SourceProfile;
   questionId: number;
   materialId: number;
   videoKey: string;
@@ -49,6 +52,8 @@ export interface ReasoningExportOptions {
   runIds?: number[];
   excludeRunIds?: number[];
   split?: DatasetSplit;
+  profile?: ProfileFilter;
+  tiers?: ThinkTier[];
   dedup?: DedupPolicy;
   minTurns?: number;
   maxTurns?: number;
@@ -69,6 +74,7 @@ export interface ReasoningExportResult {
   skippedDialogues: number;
   includedSourceRunIds: number[];
   includedReasoningRunIds: number[];
+  profileDistribution: Record<SourceProfile, number>;
   turnNoDistribution: Record<number, number>;
   tierDistribution: Record<ThinkTier, number>;
   materialCount: number;
@@ -143,6 +149,8 @@ export function buildReasoningExportDataset(
     runIds: options.runIds,
     excludeRunIds: options.excludeRunIds,
     split: options.split,
+    profile: options.profile,
+    tiers: options.tiers,
     dedup: options.dedup,
     minTurns: options.minTurns,
     maxTurns: options.maxTurns,
@@ -175,6 +183,7 @@ export function buildReasoningExportDataset(
       records.push({
         resultId: turn.resultId,
         sourceRunId: turn.sourceRunId,
+        sourceProfile: turn.sourceProfile,
         questionId: turn.questionId,
         materialId: turn.materialId,
         videoKey: turn.videoKey,
@@ -217,6 +226,7 @@ export function buildReasoningExportDataset(
       records.push({
         resultId: last.resultId,
         sourceRunId: last.sourceRunId,
+        sourceProfile: last.sourceProfile,
         questionId: last.questionId,
         materialId: last.materialId,
         videoKey: last.videoKey,
@@ -256,6 +266,7 @@ export function buildReasoningExportDataset(
 
   const sourceRunSet = new Set<number>();
   const reasoningRunSet = new Set<number>();
+  const profileDistribution: Record<SourceProfile, number> = { standard: 0, short: 0 };
   const turnNoDistribution: Record<number, number> = {};
   const tierDistribution: Record<ThinkTier, number> = { short: 0, medium: 0, long: 0 };
   const materialSet = new Set<number>();
@@ -263,6 +274,7 @@ export function buildReasoningExportDataset(
   for (const rec of records) {
     sourceRunSet.add(rec.sourceRunId);
     reasoningRunSet.add(rec.reasoningRunId);
+    profileDistribution[rec.sourceProfile]++;
     turnNoDistribution[rec.turnNo] = (turnNoDistribution[rec.turnNo] ?? 0) + 1;
     tierDistribution[rec.lengthTier]++;
     materialSet.add(rec.materialId);
@@ -275,6 +287,7 @@ export function buildReasoningExportDataset(
     skippedDialogues,
     includedSourceRunIds: [...sourceRunSet].sort((a, b) => a - b),
     includedReasoningRunIds: [...reasoningRunSet].sort((a, b) => a - b),
+    profileDistribution,
     turnNoDistribution,
     tierDistribution,
     materialCount: materialSet.size,
@@ -347,7 +360,7 @@ export function formatReviewMarkdown(
   lines.push(`- **开始时间**：${run.started_at}${run.finished_at ? ` | **完成时间**：${run.finished_at}` : ""}`);
   lines.push(`- **通过率**：${stats.passed} / ${stats.total}（**${(stats.passRate * 100).toFixed(1)}%**），丢弃 ${stats.dropped}，错误 ${stats.errored}`);
   lines.push(`- **泄漏词命中样本数**：${stats.totalLeakHitTraces} | **平均重写次数**：${stats.avgRewrites}`);
-  lines.push(`- **已通过 \`<think>\` 统计**：均值 ${stats.avgChars} 字 / P50 ${stats.p50Chars} 字 / P90 ${stats.p90Chars} 字 | 均长比 ${(stats.avgLengthRatio * 100).toFixed(1)}% | 均 8-gram 重合 ${(stats.avgNgram8Overlap * 100).toFixed(1)}%`);
+  lines.push(`- **已通过 \`<think>\` 统计**：均值 ${stats.avgChars} 字 / P50 ${stats.p50Chars} 字 / P90 ${stats.p90Chars} 字 | 均长比 ${(stats.avgLengthRatio * 100).toFixed(1)}%`);
   lines.push(`- **起手多样性（前 8 字）**：${stats.openingDiversity.uniquePrefixCount} / ${stats.openingDiversity.evaluatedCount} 唯一（${(stats.openingDiversity.uniqueRatio * 100).toFixed(1)}%）| 前 2 字最高占比 **${(stats.openingDiversity.max2CharShare * 100).toFixed(1)}%**`);
   if (stats.openingDiversity.topRepeated2Char.length > 0) {
     const repeated2 = stats.openingDiversity.topRepeated2Char.map((r) => `\`${r.prefix}…\` ×${r.count}`).join("、");
@@ -382,12 +395,11 @@ export function formatReviewMarkdown(
     const thinkChars = metrics?.charCount ?? countContentChars(item.trace.reasoning ?? "");
     const ansChars = metrics?.answerCharCount ?? countContentChars(item.answer);
     const ratioPct = ((thinkChars / Math.max(1, ansChars)) * 100).toFixed(0);
-    const overlapPct = metrics ? `${(metrics.ngram8Overlap * 100).toFixed(1)}%` : "-";
     const maxRun = metrics ? `${metrics.maxVerbatimRun}字` : "-";
 
-    lines.push(`### #${i + 1} · result=${item.trace.result_id} · turn=${item.trace.turn_no}/${item.turnCount} · \`${item.trace.length_tier}\` · ${item.videoKey}`);
+    lines.push(`### #${i + 1} · result=${item.trace.result_id} · turn=${item.trace.turn_no}/${item.turnCount} · \`${item.sourceProfile}\` · \`${item.trace.length_tier}\` · ${item.videoKey}`);
     lines.push("");
-    lines.push(`> 指标：\`<think>\` ${thinkChars} 字 / 正文 ${ansChars} 字（${ratioPct}%）· 8-gram 重合 ${overlapPct} · 最长照抄 ${maxRun} · 重写 ${item.trace.rewrite_count} 次`);
+    lines.push(`> 指标：\`<think>\` ${thinkChars} 字 / 正文 ${ansChars} 字（${ratioPct}%）· 最长照抄 ${maxRun} · 重写 ${item.trace.rewrite_count} 次`);
     lines.push("");
 
     if (item.history.length > 0) {
@@ -476,6 +488,7 @@ export function buildExportManifest(input: {
       : {}),
     includedSourceRunIds: input.result.includedSourceRunIds,
     includedReasoningRunIds: input.result.includedReasoningRunIds,
+    profileDistribution: input.result.profileDistribution,
     turnNoDistribution: input.result.turnNoDistribution,
     tierDistribution: input.result.tierDistribution,
     skippedMissingTurns: input.result.skippedMissingTurns,

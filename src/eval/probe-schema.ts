@@ -1,13 +1,33 @@
 import { asObject, nonEmpty, parseJson } from "../schema.js";
-import { EXPECTED_BEHAVIORS, type ExpectedBehavior, type ProbeType } from "./eval-db.js";
+import {
+  ADVERSARY_TACTICS,
+  EXPECTED_BEHAVIOR_BY_TYPE,
+  isTrapProbeType,
+  PROBE_TYPES,
+  type AdversaryTactic,
+  type ExpectedBehavior,
+  type ProbeType,
+} from "./eval-db.js";
 
+/** Kept only for read-only train-overlap audit reporting in suite-freeze (never used as a build kill switch). */
 export const DUPLICATE_NGRAM_THRESHOLD = 0.6;
+
+export type GraderVerdict = "pass" | "partial" | "fail";
 
 export interface DraftProbeItem {
   slotIndex: number;
+  probeType: ProbeType;
+  persona: string;
+  targetTurns: number;
+  expectedBehavior: ExpectedBehavior;
   question: string;
   anchor: string;
   trap: string;
+}
+
+export interface DraftProbeBatch {
+  probes: DraftProbeItem[];
+  skipReason?: string;
 }
 
 export interface CriticReview {
@@ -32,14 +52,23 @@ export interface ProbeRubricV2 {
 }
 
 export interface AdversaryTurnDraft {
+  tactic: AdversaryTactic;
   userContent: string;
   trap: string;
 }
 
 export interface GraderTurnJudgement {
+  /** Holistic semantic verdict from the grader agent (primary signal in v3). */
+  verdict?: GraderVerdict;
+  /** Holistic substantive score (0..100) directly judged by the grader agent (primary signal in v3). */
+  score?: number;
   behaviorOk: boolean;
+  /** Whether the candidate fabricated unseen facts/sources/numbers. */
+  hallucinated?: boolean;
   stance: 0 | 1 | 2;
   matchedKeyPoints: number[];
+  /** True when the grader explicitly supplied `matchedKeyPoints` (even if `[]`); false when omitted. */
+  matchedKeyPointsProvided?: boolean;
   forbiddenHits: number[];
   hallucinationHits: number[];
   failureSignalHits: number[];
@@ -47,7 +76,7 @@ export interface GraderTurnJudgement {
   rationale: string;
 }
 
-/** Strips whitespace and punctuation for robust Chinese/English text matching. */
+/** Strips whitespace and punctuation for text matching / overlap auditing. */
 export function normalizeForMatch(text: string): string {
   return text
     .toLowerCase()
@@ -55,10 +84,8 @@ export function normalizeForMatch(text: string): string {
 }
 
 /**
- * Deterministic check verifying whether `anchor` genuinely comes from `material`.
- * 1. Exact normalized substring match (handles whitespace/punctuation/newline differences).
- * 2. Fallback for minor single-char ASR/punctuation edits: for normalized anchors >= 12 chars,
- *    requires >= 90% 5-gram containment inside `material`.
+ * Advisory diagnostic checking whether `anchor` appears in `material` (exact or >=85% 5-gram containment).
+ * Never blocks the agent loop — passed to `probe-critic` purely as an informational hint.
  */
 export function verifyAnchorInMaterial(anchor: string, material: string): boolean {
   const normAnchor = normalizeForMatch(anchor);
@@ -76,10 +103,10 @@ export function verifyAnchorInMaterial(anchor: string, material: string): boolea
       matched++;
     }
   }
-  return matched / totalGrams >= 0.9;
+  return matched / totalGrams >= 0.85;
 }
 
-/** Character n-gram Jaccard similarity (default bigram n=2 for Chinese short questions) used for pre-critic dedup. */
+/** Character n-gram Jaccard similarity (default bigram n=2), used for read-only train-overlap auditing. */
 export function charNgramJaccard(a: string, b: string, n = 2): number {
   const na = normalizeForMatch(a);
   const nb = normalizeForMatch(b);
@@ -105,7 +132,7 @@ export function charNgramJaccard(a: string, b: string, n = 2): number {
   return union === 0 ? 0 : intersection / union;
 }
 
-/** Finds the closest duplicate match among `existingQuestions` above `threshold`. */
+/** Finds the closest duplicate match among `existingQuestions` above `threshold` (audit utility). */
 export function findNearDuplicate(
   question: string,
   existingQuestions: readonly string[],
@@ -121,167 +148,211 @@ export function findNearDuplicate(
   return best;
 }
 
-function parseUniqueStringList(value: unknown, label: string, min: number, max: number): string[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`${label} 必须是字符串数组`);
-  }
-  if (value.length < min || value.length > max) {
-    throw new Error(`${label} 长度必须在 ${min}–${max} 之间（实际 ${value.length}）`);
-  }
+/** Tolerant string list normalizer: filters blanks, deduplicates silently, trims optional max length. */
+function normalizeStringList(value: unknown, max?: number): string[] {
+  if (!Array.isArray(value)) return [];
   const seen = new Set<string>();
   const items: string[] = [];
-  for (let i = 0; i < value.length; i++) {
-    const item = nonEmpty(value[i], `${label}[${i}]`);
-    if (seen.has(item)) {
-      throw new Error(`${label} 包含重复项：${item}`);
-    }
-    seen.add(item);
-    items.push(item);
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    items.push(trimmed);
+    if (max !== undefined && items.length >= max) break;
   }
   return items;
 }
 
-function parseSingleDraftItem(rawItem: unknown, label: string): DraftProbeItem {
-  const obj = asObject(rawItem, label);
-  const slotIndex = Number(obj.slotIndex);
-  if (!Number.isSafeInteger(slotIndex) || slotIndex < 1) {
-    throw new Error(`${label}.slotIndex 必须是正整数`);
+function normalizeProbeType(raw: unknown, allowedTypes: readonly ProbeType[], fallback?: ProbeType): ProbeType {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim() as ProbeType;
+    if (PROBE_TYPES.includes(trimmed) && allowedTypes.includes(trimmed)) {
+      return trimmed;
+    }
   }
-  return {
-    slotIndex,
-    question: nonEmpty(obj.question, `${label}.question`),
-    anchor: nonEmpty(obj.anchor, `${label}.anchor`),
-    trap: nonEmpty(obj.trap, `${label}.trap`),
-  };
+  if (fallback && allowedTypes.includes(fallback)) {
+    return fallback;
+  }
+  throw new Error(`无效或未允许的 probeType：${String(raw)}（允许：${allowedTypes.join(", ")}）`);
 }
 
-export function parseDraftProbes(text: string, expectedSlotIndices: readonly number[]): DraftProbeItem[] {
+function normalizeTargetTurns(probeType: ProbeType, raw: unknown, fallback?: number): number {
+  if (probeType === "pressure") {
+    const num = Number(raw);
+    if (Number.isSafeInteger(num)) {
+      return Math.max(2, Math.min(3, num));
+    }
+    if (fallback !== undefined && fallback >= 2 && fallback <= 3) {
+      return fallback;
+    }
+    return 2;
+  }
+  if (isTrapProbeType(probeType)) {
+    const num = Number(raw);
+    if (Number.isSafeInteger(num)) {
+      return Math.max(1, Math.min(2, num));
+    }
+    if (fallback !== undefined && fallback >= 1 && fallback <= 2) {
+      return fallback;
+    }
+    return 1;
+  }
+  return 1;
+}
+
+function normalizeOptionalText(value: unknown, fallback = ""): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+}
+
+export interface ParseDraftProbesOptions {
+  maxProbes: number;
+  allowedTypes?: readonly ProbeType[];
+}
+
+/**
+ * Tolerantly parses agent-planned draft probes (`0 .. maxProbes`).
+ * Allows `probes: []` with an optional `skipReason` when the agent judges the transcript
+ * has no cross-video transferable theoretical substance.
+ */
+export function parseDraftProbes(text: string, options: ParseDraftProbesOptions): DraftProbeBatch {
   const value = asObject(parseJson(text), "对抗出题结果");
   if (!Array.isArray(value.probes)) {
     throw new Error("对抗出题结果必须包含 probes 数组");
   }
-  const items = value.probes.map((rawItem, idx) => parseSingleDraftItem(rawItem, `probes[${idx}]`));
-  const expectedSet = new Set(expectedSlotIndices);
-  const seen = new Set<number>();
-  for (const item of items) {
-    if (!expectedSet.has(item.slotIndex)) {
-      throw new Error(`对抗出题结果包含未请求的 slotIndex=${item.slotIndex}`);
-    }
-    if (seen.has(item.slotIndex)) {
-      throw new Error(`对抗出题结果包含重复的 slotIndex=${item.slotIndex}`);
-    }
-    seen.add(item.slotIndex);
+  const allowedTypes = options.allowedTypes && options.allowedTypes.length > 0
+    ? options.allowedTypes
+    : PROBE_TYPES;
+  const skipReason = typeof value.skipReason === "string" && value.skipReason.trim().length > 0
+    ? value.skipReason.trim()
+    : undefined;
+
+  const probes: DraftProbeItem[] = [];
+  const cap = Math.max(1, options.maxProbes);
+  for (let i = 0; i < value.probes.length && probes.length < cap; i++) {
+    const obj = asObject(value.probes[i], `probes[${i}]`);
+    const question = nonEmpty(obj.question, `probes[${i}].question`);
+    const probeType = normalizeProbeType(obj.probeType, allowedTypes);
+    const persona = normalizeOptionalText(obj.persona, "网友");
+    const targetTurns = normalizeTargetTurns(probeType, obj.targetTurns);
+    const anchor = normalizeOptionalText(obj.anchor, "");
+    const trap = normalizeOptionalText(obj.trap, "");
+    probes.push({
+      slotIndex: probes.length + 1,
+      probeType,
+      persona,
+      targetTurns,
+      expectedBehavior: EXPECTED_BEHAVIOR_BY_TYPE[probeType],
+      question,
+      anchor,
+      trap,
+    });
   }
-  const missing = expectedSlotIndices.filter((idx) => !seen.has(idx));
-  if (missing.length > 0) {
-    throw new Error(`对抗出题结果缺少槽位：${missing.join(", ")}`);
-  }
-  return items.sort((a, b) => a.slotIndex - b.slotIndex);
+
+  return { probes, ...(skipReason ? { skipReason } : {}) };
 }
 
-export function parseRevisedProbe(text: string, expectedSlotIndex: number): DraftProbeItem {
+export interface ReviseProbeFallback {
+  slotIndex: number;
+  probeType: ProbeType;
+  persona: string;
+  targetTurns: number;
+  allowedTypes?: readonly ProbeType[];
+}
+
+/**
+ * Tolerantly parses a single revised probe. Allows the writer agent to pivot `probeType`,
+ * `persona`, or `targetTurns` if critic feedback recommends changing angle.
+ */
+export function parseRevisedProbe(text: string, fallback: ReviseProbeFallback): DraftProbeItem {
   const value = asObject(parseJson(text), "单题改写结果");
-  // Tolerate a single-element `{ probes: [...] }` wrapper if model echoed batch shape.
   const target = Array.isArray(value.probes) && value.probes.length === 1
     ? asObject(value.probes[0], "单题改写结果 probes[0]")
     : value;
-  const slotIndex = target.slotIndex === undefined ? expectedSlotIndex : Number(target.slotIndex);
-  if (slotIndex !== expectedSlotIndex) {
-    throw new Error(`单题改写结果 slotIndex 不一致：预期 ${expectedSlotIndex}，实际 ${String(target.slotIndex)}`);
-  }
+  const allowedTypes = fallback.allowedTypes && fallback.allowedTypes.length > 0
+    ? fallback.allowedTypes
+    : PROBE_TYPES;
+  const probeType = target.probeType !== undefined
+    ? normalizeProbeType(target.probeType, allowedTypes, fallback.probeType)
+    : fallback.probeType;
+  const persona = normalizeOptionalText(target.persona, fallback.persona);
+  const targetTurns = normalizeTargetTurns(probeType, target.targetTurns, fallback.targetTurns);
   return {
-    slotIndex,
+    slotIndex: fallback.slotIndex,
+    probeType,
+    persona,
+    targetTurns,
+    expectedBehavior: EXPECTED_BEHAVIOR_BY_TYPE[probeType],
     question: nonEmpty(target.question, "revised.question"),
-    anchor: nonEmpty(target.anchor, "revised.anchor"),
-    trap: nonEmpty(target.trap, "revised.trap"),
+    anchor: normalizeOptionalText(target.anchor, ""),
+    trap: normalizeOptionalText(target.trap, ""),
   };
 }
 
+/** Tolerant critic review parser: normalizes benign `issues` on accept and synthesizes feedback when needed. */
 export function parseCriticReview(text: string): CriticReview {
   const value = asObject(parseJson(text), "审题结果");
-  const { decision, issues, feedback } = value;
+  const decision = typeof value.decision === "string" ? value.decision.trim().toLowerCase() : "";
   if (decision !== "accept" && decision !== "revise" && decision !== "reject") {
-    throw new Error("审题 decision 必须为 accept、revise 或 reject");
+    throw new Error(`审题 decision 必须为 accept、revise 或 reject（实际：${String(value.decision)}）`);
   }
-  if (!Array.isArray(issues) || !issues.every((item) => typeof item === "string")) {
-    throw new Error("审题 issues 必须是字符串数组");
+  const issues = normalizeStringList(value.issues);
+  const rawFeedback = typeof value.feedback === "string" ? value.feedback.trim() : "";
+
+  if (decision === "accept") {
+    return { decision, issues: [], feedback: "" };
   }
-  if (typeof feedback !== "string") {
-    throw new Error("审题 feedback 必须是字符串");
-  }
-  const trimmedIssues = issues.map((s) => s.trim()).filter(Boolean);
-  const trimmedFeedback = feedback.trim();
-  if (decision === "accept" && trimmedIssues.length > 0) {
-    throw new Error("accept 的 issues 必须为空数组");
-  }
-  if (decision === "revise" && !trimmedFeedback) {
-    throw new Error("revise 必须附带非空 feedback");
-  }
-  if (decision === "reject" && trimmedIssues.length === 0 && !trimmedFeedback) {
-    throw new Error("reject 必须说明拒绝原因");
+  const feedback = rawFeedback || issues.join("；");
+  if (!feedback) {
+    throw new Error(`${decision} 必须提供说明（issues 或 feedback 至少一项非空）`);
   }
   return {
     decision,
-    issues: trimmedIssues,
-    feedback: trimmedFeedback,
+    issues: issues.length > 0 ? issues : [feedback],
+    feedback,
   };
 }
 
+/** Tolerant verifier review parser: normalizes benign `issues` on pass and synthesizes feedback when needed. */
 export function parseVerifierReview(text: string): VerifierReview {
   const value = asObject(parseJson(text), "参考答案核验结果");
-  const { decision, issues, feedback } = value;
+  const decision = typeof value.decision === "string" ? value.decision.trim().toLowerCase() : "";
   if (decision !== "pass" && decision !== "revise" && decision !== "drop") {
-    throw new Error("核验 decision 必须为 pass、revise 或 drop");
+    throw new Error(`核验 decision 必须为 pass、revise 或 drop（实际：${String(value.decision)}）`);
   }
-  if (!Array.isArray(issues) || !issues.every((item) => typeof item === "string")) {
-    throw new Error("核验 issues 必须是字符串数组");
+  const issues = normalizeStringList(value.issues);
+  const rawFeedback = typeof value.feedback === "string" ? value.feedback.trim() : "";
+
+  if (decision === "pass") {
+    return { decision, issues: [], feedback: "" };
   }
-  if (typeof feedback !== "string") {
-    throw new Error("核验 feedback 必须是字符串");
-  }
-  const trimmedIssues = issues.map((s) => s.trim()).filter(Boolean);
-  const trimmedFeedback = feedback.trim();
-  if (decision === "pass" && trimmedIssues.length > 0) {
-    throw new Error("pass 的 issues 必须为空数组");
-  }
-  if (decision === "revise" && !trimmedFeedback) {
-    throw new Error("revise 必须附带非空 feedback");
-  }
-  if (decision === "drop" && trimmedIssues.length === 0 && !trimmedFeedback) {
-    throw new Error("drop 必须说明放弃原因");
+  const feedback = rawFeedback || issues.join("；");
+  if (!feedback) {
+    throw new Error(`${decision} 必须提供说明（issues 或 feedback 至少一项非空）`);
   }
   return {
     decision,
-    issues: trimmedIssues,
-    feedback: trimmedFeedback,
+    issues: issues.length > 0 ? issues : [feedback],
+    feedback,
   };
 }
 
+/**
+ * Tolerant rubric-v2 parser:
+ * - Always aligns `expectedBehavior` with the turn's behavior instead of failing on echo mismatch.
+ * - Silently deduplicates and trims arrays without throwing brittle length errors.
+ * - Allows empty `keyPoints` (explicitly encouraged for `acknowledge_gap` / `hallucination_bait`).
+ */
 export function parseProbeRubric(
   text: string,
   expectedBehavior: ExpectedBehavior,
-  probeType?: ProbeType,
 ): ProbeRubricV2 {
   const value = asObject(parseJson(text), "评分卡 v2 结果");
-  const rawBehavior = nonEmpty(value.expectedBehavior, "rubric.expectedBehavior");
-  if (!EXPECTED_BEHAVIORS.includes(rawBehavior as ExpectedBehavior)) {
-    throw new Error(`无效的 rubric.expectedBehavior：${rawBehavior}`);
-  }
-  if (rawBehavior !== expectedBehavior) {
-    throw new Error(`rubric.expectedBehavior 与代码锁定值不一致：预期 ${expectedBehavior}，实际 ${rawBehavior}`);
-  }
   const stance = nonEmpty(value.stance, "rubric.stance");
-  const minKeyPoints = expectedBehavior === "acknowledge_gap" ? 0 : 1;
-  const keyPoints = parseUniqueStringList(value.keyPoints ?? [], "rubric.keyPoints", minKeyPoints, 6);
-  const forbidden = parseUniqueStringList(value.forbidden ?? [], "rubric.forbidden", 0, 5);
-  const minHallucinate = probeType === "hallucination_bait" || expectedBehavior === "acknowledge_gap" ? 1 : 0;
-  const mustNotHallucinate = parseUniqueStringList(
-    value.mustNotHallucinate ?? [],
-    "rubric.mustNotHallucinate",
-    minHallucinate,
-    5,
-  );
-  const failureSignals = parseUniqueStringList(value.failureSignals, "rubric.failureSignals", 1, 4);
+  const keyPoints = normalizeStringList(value.keyPoints, 6);
+  const forbidden = normalizeStringList(value.forbidden, 5);
+  const mustNotHallucinate = normalizeStringList(value.mustNotHallucinate, 5);
+  const failureSignals = normalizeStringList(value.failureSignals, 4);
 
   return {
     expectedBehavior,
@@ -293,25 +364,34 @@ export function parseProbeRubric(
   };
 }
 
-export function parseAdversaryTurn(text: string): AdversaryTurnDraft {
+/**
+ * Parses an adversary pressure turn where the agent autonomously selects `tactic`
+ * (or falls back gracefully if omitted).
+ */
+export function parseAdversaryTurn(
+  text: string,
+  fallbackTactic: AdversaryTactic = "pushback",
+): AdversaryTurnDraft {
   const value = asObject(parseJson(text), "多轮施压话术");
+  const rawTactic = typeof value.tactic === "string" ? value.tactic.trim() : "";
+  const tactic: AdversaryTactic = ADVERSARY_TACTICS.includes(rawTactic as AdversaryTactic)
+    ? (rawTactic as AdversaryTactic)
+    : fallbackTactic;
   return {
+    tactic,
     userContent: nonEmpty(value.userContent, "adversary.userContent"),
-    trap: nonEmpty(value.trap, "adversary.trap"),
+    trap: normalizeOptionalText(value.trap, "面对施压容易道歉改口或和稀泥"),
   };
 }
 
-function parseIndexList(value: unknown, label: string, maxLength: number): number[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`${label} 必须是整数索引数组`);
-  }
+/** Tolerant index list parser: filters out-of-bounds/duplicate values instead of failing the grading call. */
+function parseTolerantIndexList(value: unknown, maxLength: number): number[] {
+  if (!Array.isArray(value) || maxLength <= 0) return [];
   const seen = new Set<number>();
   const indices: number[] = [];
-  for (let i = 0; i < value.length; i++) {
-    const idx = value[i];
-    if (typeof idx !== "number" || !Number.isSafeInteger(idx) || idx < 0 || idx >= maxLength) {
-      throw new Error(`${label}[${i}] 索引越界或无效：${String(idx)}（允许范围 0..${Math.max(0, maxLength - 1)}，数组长度 ${maxLength}）`);
-    }
+  for (const item of value) {
+    const idx = typeof item === "number" ? item : Number(item);
+    if (!Number.isSafeInteger(idx) || idx < 0 || idx >= maxLength) continue;
     if (!seen.has(idx)) {
       seen.add(idx);
       indices.push(idx);
@@ -320,13 +400,33 @@ function parseIndexList(value: unknown, label: string, maxLength: number): numbe
   return indices.sort((a, b) => a - b);
 }
 
-function parseScore012(value: unknown, label: string): 0 | 1 | 2 {
-  if (value !== 0 && value !== 1 && value !== 2) {
-    throw new Error(`${label} 必须是整数 0、1 或 2（实际 ${String(value)}）`);
-  }
-  return value;
+function parseClamped012(value: unknown, fallback: 0 | 1 | 2 = 1): 0 | 1 | 2 {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  const rounded = Math.round(num);
+  if (rounded <= 0) return 0;
+  if (rounded >= 2) return 2;
+  return 1;
 }
 
+function parseOptionalVerdict(value: unknown): GraderVerdict | undefined {
+  if (typeof value !== "string") return undefined;
+  const v = value.trim().toLowerCase();
+  if (v === "pass" || v === "partial" || v === "fail") return v;
+  return undefined;
+}
+
+function parseOptionalScore(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return undefined;
+  return Number(Math.max(0, Math.min(100, num)).toFixed(2));
+}
+
+/**
+ * Parses both v3 holistic grader output (`verdict`, `score`, `behaviorOk`, `hallucinated`, `stance`, `style`, `rationale`)
+ * and legacy v2 index-based grader output (`matchedKeyPoints`, `forbiddenHits`, `hallucinationHits`, `failureSignalHits`).
+ */
 export function parseGradeResult(
   text: string,
   rubric: {
@@ -340,18 +440,28 @@ export function parseGradeResult(
   if (typeof value.behaviorOk !== "boolean") {
     throw new Error("批卷 behaviorOk 必须是布尔值");
   }
-  const stance = parseScore012(value.stance, "批卷 stance");
-  const style = parseScore012(value.style, "批卷 style");
-  const matchedKeyPoints = parseIndexList(value.matchedKeyPoints ?? [], "批卷 matchedKeyPoints", rubric.keyPoints.length);
-  const forbiddenHits = parseIndexList(value.forbiddenHits ?? [], "批卷 forbiddenHits", rubric.forbidden.length);
-  const hallucinationHits = parseIndexList(value.hallucinationHits ?? [], "批卷 hallucinationHits", rubric.mustNotHallucinate.length);
-  const failureSignalHits = parseIndexList(value.failureSignalHits ?? [], "批卷 failureSignalHits", (rubric.failureSignals ?? []).length);
+  const verdict = parseOptionalVerdict(value.verdict);
+  const score = parseOptionalScore(value.score);
+  const stance = parseClamped012(value.stance, value.behaviorOk ? 1 : 0);
+  const style = parseClamped012(value.style, 1);
+  const matchedKeyPointsProvided = Array.isArray(value.matchedKeyPoints);
+  const matchedKeyPoints = parseTolerantIndexList(value.matchedKeyPoints, rubric.keyPoints.length);
+  const forbiddenHits = parseTolerantIndexList(value.forbiddenHits, rubric.forbidden.length);
+  const hallucinationHits = parseTolerantIndexList(value.hallucinationHits, rubric.mustNotHallucinate.length);
+  const failureSignalHits = parseTolerantIndexList(value.failureSignalHits, (rubric.failureSignals ?? []).length);
+  const hallucinated = typeof value.hallucinated === "boolean"
+    ? value.hallucinated
+    : hallucinationHits.length > 0;
   const rationale = nonEmpty(value.rationale, "批卷 rationale");
 
   return {
+    ...(verdict !== undefined ? { verdict } : {}),
+    ...(score !== undefined ? { score } : {}),
     behaviorOk: value.behaviorOk,
+    hallucinated,
     stance,
     matchedKeyPoints,
+    matchedKeyPointsProvided,
     forbiddenHits,
     hallucinationHits,
     failureSignalHits,

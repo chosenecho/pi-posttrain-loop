@@ -8,9 +8,9 @@ import { DatabaseSync } from "node:sqlite";
  * Data only flows main DB -> eval DB; the eval pipeline never writes the main DB.
  */
 
-export const EVAL_SCHEMA_VERSION = "1";
+export const EVAL_SCHEMA_VERSION = "2";
 
-export const PROBE_TYPES = [
+export const ADVERSARIAL_PROBE_TYPES = [
   "wild_short",
   "premise_trap",
   "contrast",
@@ -18,17 +18,56 @@ export const PROBE_TYPES = [
   "hallucination_bait",
   "pressure",
 ] as const;
+
+export const TRAP_PROBE_TYPES = [
+  "trap_misattribution",
+  "trap_unknown_detail",
+  "trap_forced_decision",
+  "trap_unfounded_judgment",
+] as const;
+
+export const PROBE_TYPES = [
+  ...ADVERSARIAL_PROBE_TYPES,
+  ...TRAP_PROBE_TYPES,
+] as const;
 export type ProbeType = (typeof PROBE_TYPES)[number];
 
-export const EXPECTED_BEHAVIORS = ["answer", "correct_premise", "acknowledge_gap", "hold_position"] as const;
+export type EvalProfile = "adversarial" | "trap";
+
+export function isTrapProbeType(probeType: ProbeType): boolean {
+  return (TRAP_PROBE_TYPES as readonly string[]).includes(probeType);
+}
+
+export function probeTypesForProfile(profile: EvalProfile): readonly ProbeType[] {
+  return profile === "trap" ? TRAP_PROBE_TYPES : ADVERSARIAL_PROBE_TYPES;
+}
+
+export const EXPECTED_BEHAVIORS = [
+  "answer",
+  "correct_premise",
+  "acknowledge_gap",
+  "hold_position",
+  "refuse",
+] as const;
 export type ExpectedBehavior = (typeof EXPECTED_BEHAVIORS)[number];
 
-export const ADVERSARY_TACTICS = [
+export const PRESSURE_ADVERSARY_TACTICS = [
   "pushback",
   "label",
   "force_binary",
   "flatter_flip",
   "emotional",
+] as const;
+
+export const TRAP_ADVERSARY_TACTICS = [
+  "nudge_estimate",
+  "assume_premise",
+  "push_decision",
+] as const;
+
+export const ADVERSARY_TACTICS = [
+  ...PRESSURE_ADVERSARY_TACTICS,
+  ...TRAP_ADVERSARY_TACTICS,
 ] as const;
 export type AdversaryTactic = (typeof ADVERSARY_TACTICS)[number];
 
@@ -43,6 +82,10 @@ export const EXPECTED_BEHAVIOR_BY_TYPE: Record<ProbeType, ExpectedBehavior> = {
   transfer: "answer",
   hallucination_bait: "acknowledge_gap",
   pressure: "answer",
+  trap_misattribution: "refuse",
+  trap_unknown_detail: "refuse",
+  trap_forced_decision: "refuse",
+  trap_unfounded_judgment: "refuse",
 };
 
 export type ProbeStatus = "drafted" | "rejected" | "answering" | "dropped" | "error" | "accepted";
@@ -494,8 +537,104 @@ export class EvalStore {
       if (!this.hasColumn("suite_items", "difficulty")) {
         this.db.exec("ALTER TABLE suite_items ADD COLUMN difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard'));");
       }
-      this.db.prepare("INSERT OR IGNORE INTO eval_meta (key, value) VALUES ('schema_version', ?)").run(EVAL_SCHEMA_VERSION);
+      this.migrateProbeCheckConstraintsIfNeeded();
+      this.setMeta("schema_version", EVAL_SCHEMA_VERSION);
       this.db.prepare("INSERT OR IGNORE INTO eval_meta (key, value) VALUES ('created_at', ?)").run(nowIso());
+    }
+  }
+
+  /**
+   * Safely upgrades schema v1 `probe_specs` / `probes` / `probe_turns` CHECK constraints in-place
+   * to accept `trap_*` probe types and `refuse` expected behavior without touching existing data.
+   */
+  private migrateProbeCheckConstraintsIfNeeded(): void {
+    const specsRow = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probe_specs'")
+      .get() as Row | undefined;
+    const probesRow = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probes'")
+      .get() as Row | undefined;
+    const turnsRow = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probe_turns'")
+      .get() as Row | undefined;
+
+    const specsSql = String(specsRow?.sql ?? "");
+    const probesSql = String(probesRow?.sql ?? "");
+    const turnsSql = String(turnsRow?.sql ?? "");
+    if (
+      specsSql.includes("'trap_misattribution'") &&
+      probesSql.includes("'refuse'") &&
+      turnsSql.includes("'refuse'")
+    ) {
+      return;
+    }
+
+    this.db.exec("PRAGMA foreign_keys = OFF;");
+    try {
+      this.transaction(() => {
+        this.db.exec("DROP TRIGGER IF EXISTS trg_probes_accepted_frozen;");
+
+        this.db.exec(`
+          CREATE TABLE probe_specs__v2 (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES probe_runs(id),
+            source_material_id INTEGER NOT NULL REFERENCES source_materials(id),
+            slot_index INTEGER NOT NULL CHECK(slot_index >= 1),
+            probe_type TEXT NOT NULL CHECK(probe_type IN (${q(PROBE_TYPES)})),
+            persona TEXT NOT NULL,
+            target_turns INTEGER NOT NULL CHECK(target_turns BETWEEN 1 AND 3),
+            UNIQUE(run_id, source_material_id, slot_index)
+          );
+          INSERT INTO probe_specs__v2 SELECT id, run_id, source_material_id, slot_index, probe_type, persona, target_turns FROM probe_specs;
+          DROP TABLE probe_specs;
+          ALTER TABLE probe_specs__v2 RENAME TO probe_specs;
+
+          CREATE TABLE probes__v2 (
+            id INTEGER PRIMARY KEY,
+            spec_id INTEGER NOT NULL UNIQUE REFERENCES probe_specs(id),
+            question TEXT NOT NULL CHECK(length(trim(question)) > 0),
+            anchor TEXT NOT NULL,
+            trap TEXT NOT NULL,
+            expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
+            status TEXT NOT NULL CHECK(status IN ('drafted','rejected','answering','dropped','error','accepted')),
+            anchor_verified INTEGER NOT NULL DEFAULT 0 CHECK(anchor_verified IN (0,1)),
+            revisions INTEGER NOT NULL DEFAULT 0,
+            reject_reason TEXT,
+            difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO probes__v2 SELECT id, spec_id, question, anchor, trap, expected_behavior, status, anchor_verified, revisions, reject_reason, difficulty, created_at, updated_at FROM probes;
+          DROP TABLE probes;
+          ALTER TABLE probes__v2 RENAME TO probes;
+
+          CREATE TABLE probe_turns__v2 (
+            id INTEGER PRIMARY KEY,
+            probe_id INTEGER NOT NULL REFERENCES probes(id),
+            turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
+            user_content TEXT NOT NULL,
+            tactic TEXT,
+            expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
+            passed_attempt_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('running','pass','dropped','exhausted','error')),
+            UNIQUE(probe_id, turn_no)
+          );
+          INSERT INTO probe_turns__v2 SELECT id, probe_id, turn_no, user_content, tactic, expected_behavior, passed_attempt_id, status FROM probe_turns;
+          DROP TABLE probe_turns;
+          ALTER TABLE probe_turns__v2 RENAME TO probe_turns;
+
+          CREATE TRIGGER trg_probes_accepted_frozen BEFORE UPDATE OF question, anchor, trap, expected_behavior ON probes
+          WHEN OLD.status = 'accepted'
+          BEGIN SELECT RAISE(ABORT, 'accepted probe text is frozen'); END;
+        `);
+      });
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON;");
+    }
+
+    const fkErrors = this.db.prepare("PRAGMA foreign_key_check;").all() as Row[];
+    if (fkErrors.length > 0) {
+      throw new Error(`评测库迁移 schema v2 后外键校验失败：${JSON.stringify(fkErrors[0])}`);
     }
   }
 
@@ -578,8 +717,20 @@ export class EvalStore {
     return (this.db.prepare("SELECT * FROM source_materials ORDER BY id").all() as Row[]).map(mapSource);
   }
 
-  /** Source materials that have never been used by any probe_build run. */
-  listUnbuiltSourceMaterials(): SourceMaterialRecord[] {
+  /** Source materials that have never been used by any probe_build run (optionally scoped to probeTypes). */
+  listUnbuiltSourceMaterials(probeTypes?: readonly ProbeType[]): SourceMaterialRecord[] {
+    if (probeTypes && probeTypes.length > 0) {
+      const placeholders = probeTypes.map(() => "?").join(", ");
+      return (this.db.prepare(`
+        SELECT * FROM source_materials m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM probe_specs s
+          WHERE s.source_material_id = m.id
+            AND s.probe_type IN (${placeholders})
+        )
+        ORDER BY id
+      `).all(...probeTypes) as Row[]).map(mapSource);
+    }
     return (this.db.prepare(`
       SELECT * FROM source_materials m
       WHERE NOT EXISTS (SELECT 1 FROM probe_specs s WHERE s.source_material_id = m.id)
@@ -672,6 +823,40 @@ export class EvalStore {
   latestRunId(kind = "probe_build"): number | undefined {
     const row = this.db.prepare("SELECT id FROM probe_runs WHERE kind = ? ORDER BY id DESC LIMIT 1").get(kind) as Row | undefined;
     return row ? Number(row.id) : undefined;
+  }
+
+  /** Lists currently running runs (used to guard against freezing while build/calibrate is still writing). */
+  listActiveRuns(kinds?: readonly ("probe_build" | "calibrate" | "mirror")[]): Array<{
+    id: number;
+    kind: string;
+    startedAt: string;
+  }> {
+    const rows = kinds && kinds.length > 0
+      ? (this.db.prepare(
+          `SELECT id, kind, started_at FROM probe_runs WHERE status = 'running' AND kind IN (${kinds.map(() => "?").join(",")}) ORDER BY id`,
+        ).all(...kinds) as Row[])
+      : (this.db.prepare("SELECT id, kind, started_at FROM probe_runs WHERE status = 'running' ORDER BY id").all() as Row[]);
+    return rows.map((row) => ({
+      id: Number(row.id),
+      kind: String(row.kind),
+      startedAt: String(row.started_at),
+    }));
+  }
+
+  /** Returns current accepted probe counts per probe_type for soft global mix guidance. */
+  countAcceptedProbesByType(): Record<ProbeType, number> {
+    const counts = Object.fromEntries(PROBE_TYPES.map((t) => [t, 0])) as Record<ProbeType, number>;
+    const rows = this.db.prepare(`
+      SELECT s.probe_type, count(*) AS c
+      FROM probes p JOIN probe_specs s ON s.id = p.spec_id
+      WHERE p.status = 'accepted'
+      GROUP BY s.probe_type
+    `).all() as Row[];
+    for (const row of rows) {
+      const pt = String(row.probe_type) as ProbeType;
+      if (pt in counts) counts[pt] = Number(row.c);
+    }
+    return counts;
   }
 
   getRun(runId: number): {
@@ -903,7 +1088,37 @@ export class EvalStore {
     return Number(result.lastInsertRowid);
   }
 
-  reviseProbe(probeId: number, input: { question: string; anchor: string; trap: string; anchorVerified: boolean }): void {
+  updateSpec(
+    specId: number,
+    input: {
+      probeType: ProbeType;
+      persona: string;
+      targetTurns: number;
+    },
+  ): void {
+    this.db.prepare(`
+      UPDATE probe_specs SET probe_type = ?, persona = ?, target_turns = ?
+      WHERE id = ?
+    `).run(input.probeType, input.persona, input.targetTurns, specId);
+  }
+
+  reviseProbe(
+    probeId: number,
+    input: {
+      question: string;
+      anchor: string;
+      trap: string;
+      anchorVerified: boolean;
+      expectedBehavior?: ExpectedBehavior;
+    },
+  ): void {
+    if (input.expectedBehavior !== undefined) {
+      this.db.prepare(`
+        UPDATE probes SET question = ?, anchor = ?, trap = ?, expected_behavior = ?, anchor_verified = ?, revisions = revisions + 1, status = 'drafted', updated_at = ?
+        WHERE id = ?
+      `).run(input.question, input.anchor, input.trap, input.expectedBehavior, input.anchorVerified ? 1 : 0, nowIso(), probeId);
+      return;
+    }
     this.db.prepare(`
       UPDATE probes SET question = ?, anchor = ?, trap = ?, anchor_verified = ?, revisions = revisions + 1, status = 'drafted', updated_at = ?
       WHERE id = ?
@@ -940,6 +1155,7 @@ export class EvalStore {
     runId?: number;
     status?: ProbeStatus;
     probeType?: ProbeType;
+    probeTypes?: readonly ProbeType[];
     onlyUncalibrated?: boolean;
   } = {}): ProbeRecord[] {
     const where: string[] = [];
@@ -947,6 +1163,10 @@ export class EvalStore {
     if (filter.runId !== undefined) { where.push("s.run_id = ?"); params.push(filter.runId); }
     if (filter.status !== undefined) { where.push("p.status = ?"); params.push(filter.status); }
     if (filter.probeType !== undefined) { where.push("s.probe_type = ?"); params.push(filter.probeType); }
+    if (filter.probeTypes !== undefined && filter.probeTypes.length > 0) {
+      where.push(`s.probe_type IN (${filter.probeTypes.map(() => "?").join(", ")})`);
+      params.push(...filter.probeTypes);
+    }
     if (filter.onlyUncalibrated) { where.push("p.difficulty IS NULL"); }
     const sql = `${PROBE_SELECT}${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY s.run_id, s.source_material_id, s.slot_index`;
     return (this.db.prepare(sql).all(...params) as Row[]).map(mapProbe);

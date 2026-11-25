@@ -8,6 +8,7 @@ import {
   sha256Hex,
   type DifficultyLevel,
   type ProbeRecord,
+  type ProbeType,
   type SourceMaterialRecord,
 } from "./eval-db.js";
 import { charNgramJaccard, DUPLICATE_NGRAM_THRESHOLD } from "./probe-schema.js";
@@ -37,8 +38,11 @@ export interface FreezeAdversarialSuiteOptions {
   evalStore: EvalStore;
   name: string;
   runId?: number;
+  probeTypes?: readonly ProbeType[];
   maxEasyRatio?: number;
   allowUncalibrated?: boolean;
+  /** Override active-run integrity guard (only for tests or explicit recovery). */
+  allowActiveRuns?: boolean;
   /** When provided, re-verifies split='test' integrity and scans train-split question similarity (read-only). */
   mainDbPath?: string;
   trainSimThreshold?: number;
@@ -59,6 +63,8 @@ export interface FreezeAdversarialSuiteReport {
   byDifficulty: Record<string, number>;
   byBehavior: Record<string, number>;
   byPersona: Record<string, number>;
+  byVideo: Record<string, number>;
+  runIds: number[];
   easyRatio: number;
   maxEasyRatio: number;
   excludedEasyProbeIds: number[];
@@ -202,9 +208,21 @@ export async function freezeAdversarialSuite(
   }
   const trainSimThreshold = options.trainSimThreshold ?? DUPLICATE_NGRAM_THRESHOLD;
 
+  // Guardrail #3 (Data Integrity): refuse freezing while a build/calibrate run is still actively mutating probes.
+  if (!options.allowActiveRuns) {
+    const activeRuns = evalStore.listActiveRuns(["probe_build", "calibrate"]);
+    if (activeRuns.length > 0) {
+      const desc = activeRuns.map((r) => `#${r.id}(${r.kind})`).join(", ");
+      throw new Error(
+        `存在正在运行中的任务（${desc}），禁止并发冻结套卷以免写入未完成或漂移的标定快照；请等待其结束，或显式传入 --allow-active-runs`,
+      );
+    }
+  }
+
   const accepted = evalStore.listProbes({
     runId: options.runId,
     status: "accepted",
+    probeTypes: options.probeTypes,
   });
   if (accepted.length === 0) {
     throw new Error("未找到任何已通过（accepted）的对抗考题，无法冻结套卷");
@@ -260,6 +278,8 @@ export async function freezeAdversarialSuite(
   const byDifficulty: Record<string, number> = {};
   const byBehavior: Record<string, number> = {};
   const byPersona: Record<string, number> = {};
+  const byVideo: Record<string, number> = {};
+  const runIdSet = new Set<number>();
   const videoKeys = new Set<string>();
   let turnCount = 0;
 
@@ -309,6 +329,8 @@ export async function freezeAdversarialSuite(
 
     const itemKey = `probe:${probe.id}`;
     videoKeys.add(source.videoKey);
+    byVideo[source.videoKey] = (byVideo[source.videoKey] ?? 0) + 1;
+    runIdSet.add(probe.runId);
     byType[probe.probeType] = (byType[probe.probeType] ?? 0) + 1;
     const diffKey = probe.difficulty ?? "uncalibrated";
     byDifficulty[diffKey] = (byDifficulty[diffKey] ?? 0) + 1;
@@ -355,6 +377,7 @@ export async function freezeAdversarialSuite(
   const easyRatio = Number((easyCount / selected.length).toFixed(4));
 
   const sortedVideoKeys = [...videoKeys].sort();
+  const sortedRunIds = [...runIdSet].sort((a, b) => a - b);
   const sourceSha256s: Record<string, string> = {};
   for (const s of [...usedSources].sort((a, b) => a.videoId.localeCompare(b.videoId))) {
     sourceSha256s[s.videoId] = s.contentSha256;
@@ -364,10 +387,12 @@ export async function freezeAdversarialSuite(
     suiteName,
     kind: "adversarial",
     runFilter: options.runId ?? "all",
+    runIds: sortedRunIds,
     itemCount: selected.length,
     turnCount,
     videoCount: sortedVideoKeys.length,
     videoKeys: sortedVideoKeys,
+    byVideo,
     byType,
     byDifficulty,
     byBehavior,
@@ -410,6 +435,8 @@ export async function freezeAdversarialSuite(
     byDifficulty,
     byBehavior,
     byPersona,
+    byVideo,
+    runIds: sortedRunIds,
     easyRatio,
     maxEasyRatio,
     excludedEasyProbeIds,

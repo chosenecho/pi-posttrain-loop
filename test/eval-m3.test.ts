@@ -8,7 +8,11 @@ import {
 } from "../src/eval/candidate-client.js";
 import { EvalStore, type DifficultyLevel, type ExpectedBehavior, type ProbeType } from "../src/eval/eval-db.js";
 import { gradeEvalRun, normalizeSuiteTurnRubric } from "../src/eval/eval-grader.js";
-import { loadCalibrationPromptBundle } from "../src/eval/eval-prompts.js";
+import {
+  loadCalibrationPromptBundle,
+  loadDefaultCandidateSystemPrompt,
+  resolveCandidateSystemPrompt,
+} from "../src/eval/eval-prompts.js";
 import { extractSuiteDialogueTurns, runSuiteEvaluation } from "../src/eval/eval-runner.js";
 import { buildEvalReport, renderEvalReportMarkdown } from "../src/eval/report.js";
 import { freezeAdversarialSuite } from "../src/eval/suite-freeze.js";
@@ -252,10 +256,16 @@ test("M3 freeze enforces easy-ratio cap, uncalibrated guard, and idempotent sha2
         runId, sourceMaterialId: record.id, slotIndex: 1, probeType: "wild_short", difficulty: "hard",
         turns: [{ user: "q?", answer: "a", expectedBehavior: "answer" }],
       });
+      // Active running build/calibrate run blocks freezing to prevent concurrent calibration races
+      await assert.rejects(freezeAdversarialSuite({ evalStore: store2, name: "adv-race" }), /存在正在运行中的任务/);
+      store2.finishRun(runId, "completed");
+
       store2.db.prepare("UPDATE probes SET difficulty = NULL WHERE id = ?").run(pid);
       await assert.rejects(freezeAdversarialSuite({ evalStore: store2, name: "adv-x" }), /尚未完成难度标定/);
       const ok = await freezeAdversarialSuite({ evalStore: store2, name: "adv-x", allowUncalibrated: true });
       assert.equal(ok.byDifficulty.uncalibrated, 1);
+      assert.equal(ok.byVideo.BV_X, 1);
+      assert.deepEqual(ok.runIds, [runId]);
     } finally {
       store2.close();
     }
@@ -445,4 +455,115 @@ test("OpenAI-compatible candidate client strips think blocks, rejects HTML, and 
 
   mode = "html";
   await assert.rejects(runner({ messages }), /HTML/);
+});
+
+test("M3 candidate system prompt defaults to prompts/eval/candidate-system.md and preserves prompt across resume", async () => {
+  const defaultPrompt = await loadDefaultCandidateSystemPrompt();
+  assert.equal(
+    defaultPrompt,
+    "你是一个面向具体问题的顾问型助手，核心任务是帮用户理清处境、看穿假问题，并给出可用、务实、经得起现实检验的建议。你不是讨好用户的客服，也不是替用户做决定的代理人；你有自己的判断标准和界限。",
+  );
+
+  // Default fallback
+  const rDefault = await resolveCandidateSystemPrompt({ env: {} });
+  assert.equal(rDefault.source, "default_file");
+  assert.equal(rDefault.systemPrompt, defaultPrompt);
+
+  // Env overrides default, CLI overrides env
+  const rEnv = await resolveCandidateSystemPrompt({ env: { CANDIDATE_LLM_SYSTEM_PROMPT: "env prompt" } });
+  assert.equal(rEnv.source, "env");
+  assert.equal(rEnv.systemPrompt, "env prompt");
+
+  const rCli = await resolveCandidateSystemPrompt({
+    systemPrompt: "cli prompt",
+    env: { CANDIDATE_LLM_SYSTEM_PROMPT: "env prompt" },
+  });
+  assert.equal(rCli.source, "cli");
+  assert.equal(rCli.systemPrompt, "cli prompt");
+
+  // Explicit --no-system-prompt
+  const rNone = await resolveCandidateSystemPrompt({
+    noSystemPrompt: true,
+    env: { CANDIDATE_LLM_SYSTEM_PROMPT: "env prompt" },
+  });
+  assert.equal(rNone.source, "none");
+  assert.equal(rNone.systemPrompt, null);
+
+  // Resume without explicit CLI flag inherits original run prompt
+  const rResume = await resolveCandidateSystemPrompt({ isResuming: true, env: {} });
+  assert.equal(rResume.source, "resume_inherit");
+  assert.equal(rResume.systemPrompt, undefined);
+
+  // Mutually exclusive flags throw
+  await assert.rejects(
+    resolveCandidateSystemPrompt({ systemPrompt: "a", noSystemPrompt: true, env: {} }),
+    /不能同时指定/,
+  );
+
+  // Runner preserves systemPrompt on resume and rejects mismatch
+  const store = new EvalStore(":memory:");
+  try {
+    seedFixture(store);
+    await freezeAdversarialSuite({ evalStore: store, name: "adv-sys", maxEasyRatio: 0.34 });
+    let failedOnce = false;
+    const seen: Array<Array<{ role: string; content: string }>> = [];
+    const flaky: CandidateRunner = async ({ messages }) => {
+      seen.push(messages);
+      const last = messages[messages.length - 1]!;
+      if (!failedOnce && last.content === "你这就是看不起老师，承认吧？") {
+        failedOnce = true;
+        throw new Error("temporary failure");
+      }
+      return "GOOD 薪俸来源决定时间。";
+    };
+
+    const first = await runSuiteEvaluation({
+      evalStore: store,
+      suiteName: "adv-sys",
+      candidate: "sft-sys",
+      modelId: "sft-model",
+      historyMode: "gold",
+      systemPrompt: defaultPrompt,
+      runCandidate: flaky,
+      concurrency: 1,
+      callMaxAttempts: 1,
+      callRetryDelayMs: 0,
+    });
+    assert.equal(first.errorTurns, 1);
+
+    await assert.rejects(
+      runSuiteEvaluation({
+        evalStore: store,
+        suiteName: "adv-sys",
+        candidate: "sft-sys",
+        modelId: "sft-model",
+        resumeRunId: first.evalRunId,
+        systemPrompt: null,
+        runCandidate: flaky,
+        concurrency: 1,
+        callMaxAttempts: 1,
+        callRetryDelayMs: 0,
+      }),
+      /--no-system-prompt 不一致/,
+    );
+
+    const beforeResume = seen.length;
+    const resumed = await runSuiteEvaluation({
+      evalStore: store,
+      suiteName: "adv-sys",
+      candidate: "sft-sys",
+      modelId: "sft-model",
+      resumeRunId: first.evalRunId,
+      runCandidate: flaky,
+      concurrency: 1,
+      callMaxAttempts: 1,
+      callRetryDelayMs: 0,
+    });
+    assert.equal(resumed.errorTurns, 0);
+    assert.equal(seen.length - beforeResume, 1);
+    assert.equal(seen[seen.length - 1]![0]!.role, "system");
+    assert.equal(seen[seen.length - 1]![0]!.content, defaultPrompt);
+  } finally {
+    store.close();
+  }
 });

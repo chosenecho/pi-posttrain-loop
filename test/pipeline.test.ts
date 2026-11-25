@@ -67,9 +67,9 @@ test("revise then pass sends only approved role inputs and emits pure user/assis
     assert.ok(request.systemPrompt.includes(fixture.rubric.body));
   }
   assert.deepEqual(judgeCalls.map(({ input }) => input), [
-    { question: "何时交付？", answer: "周五交付。" },
-    { question: "何时交付？", answer: "周五交付，验收需两人签字。" },
-    { question: "验收有什么条件？", answer: "验收需两人签字。" },
+    { material: fixture.material.text, question: "何时交付？", answer: "周五交付。" },
+    { material: fixture.material.text, question: "何时交付？", answer: "周五交付，验收需两人签字。" },
+    { material: fixture.material.text, question: "验收有什么条件？", answer: "验收需两人签字。" },
   ]);
   assert.deepEqual(result.outcomes.map(({ status, attempts }) => ({ status, attempts })), [
     { status: "pass", attempts: 2 }, { status: "pass", attempts: 1 },

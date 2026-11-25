@@ -26,6 +26,7 @@ export interface RunCorpusQuestionsOptions {
   candidates: VideoUnit[];
   concurrency: number;
   split?: DatasetSplit;
+  profile?: string;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
   force?: boolean;
@@ -74,6 +75,7 @@ export async function runCorpusQuestionGeneration(
       model: sanitizedModel,
       concurrency,
       ...(targetSplit ? { split: targetSplit } : {}),
+      ...(options.profile ? { profile: options.profile } : {}),
       ...(callMaxAttempts > 1 ? { callMaxAttempts, callRetryDelayMs } : {}),
       videoCount: candidates.length,
       inputSchemaVersion: "v2-video-merged-tool",
@@ -145,7 +147,9 @@ export async function runCorpusQuestionGeneration(
             (savedReceipt) => {
               receipt = savedReceipt;
             },
-            { maxQuestions },
+            {
+              maxQuestions,
+            },
           );
           const output = await createPiRunner(config, [tool])({
             role: "question",

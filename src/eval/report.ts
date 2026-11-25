@@ -17,6 +17,7 @@ export interface ItemScoreSummary {
   expectedTurns: number;
   scoredTurns: number;
   itemScore: number;
+  itemSubstantiveScore?: number;
   allBehaviorOk: boolean;
   turnMeanScore: number;
   forbiddenTurns: number;
@@ -30,6 +31,7 @@ export interface TypeMetricBucket {
   items: number;
   turns: number;
   itemMeanScore: number;
+  itemSubstantiveScore?: number;
   itemBehaviorPassRate: number;
   turnMeanScore: number;
   turnBehaviorPassRate: number;
@@ -63,8 +65,10 @@ export interface CandidateSuiteMetrics {
   scoredTurns: number;
   turnCoverage: number;
   itemMeanScore: number;
+  itemSubstantiveScore: number;
   itemBehaviorPassRate: number;
   turnMeanScore: number;
+  turnSubstantiveScore: number;
   turnBehaviorPassRate: number;
   meanStance: number;
   meanKeyPointCoverage: number;
@@ -163,6 +167,21 @@ function extractTurnExpectedBehavior(score: EvalScoreRecord): string {
   return score.itemExpectedBehavior ?? "answer";
 }
 
+function extractTurnSubstantiveScore(score: EvalScoreRecord): number {
+  const scored = score.detail.scored;
+  if (scored && typeof scored === "object" && "substantiveScore" in scored) {
+    const val = (scored as { substantiveScore?: unknown }).substantiveScore;
+    if (typeof val === "number" && Number.isFinite(val)) return val;
+  }
+  const penalty =
+    scored && typeof scored === "object" && "penalty" in scored && typeof (scored as { penalty?: unknown }).penalty === "number"
+      ? Number((scored as { penalty: number }).penalty)
+      : score.forbiddenHits * 15 + score.hallucinationHits * 20 + (score.behaviorOk ? 0 : Math.min(1, score.failureSignalHits) * 12);
+  const subContent = (score.stance / 2) * 43.75 + score.keyPointCoverage * 56.25;
+  const rawSub = Math.max(0, Math.min(100, subContent - penalty));
+  return round2(score.behaviorOk ? rawSub : Math.min(rawSub, BEHAVIOR_FAIL_SCORE_CAP));
+}
+
 function extractRationale(score: EvalScoreRecord): string {
   const judgement = score.detail.judgement;
   if (judgement && typeof judgement === "object" && "rationale" in judgement) {
@@ -192,6 +211,7 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
   const byBehaviorAcc = new Map<string, { turns: number; pass: number; scoreSum: number }>();
 
   let turnScoreSum = 0;
+  let turnSubScoreSum = 0;
   let turnBehaviorPass = 0;
   let stanceSum = 0;
   let kpSum = 0;
@@ -211,6 +231,7 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
     else scoresByItemId.set(sc.suiteItemId, [sc]);
 
     turnScoreSum += sc.score;
+    turnSubScoreSum += extractTurnSubstantiveScore(sc);
     if (sc.behaviorOk) turnBehaviorPass++;
     stanceSum += sc.stance;
     kpSum += sc.keyPointCoverage;
@@ -239,6 +260,7 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
   const byDiffAcc = new Map<string, { items: number; itemScoreSum: number; itemPass: number }>();
 
   let itemScoreSum = 0;
+  let itemSubScoreSum = 0;
   let itemBehaviorPass = 0;
 
   for (const item of suiteItems) {
@@ -248,6 +270,8 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
     const allBehaviorOk = itemScores.every((s) => s.behaviorOk);
     const turnMean = itemScores.reduce((s, x) => s + x.score, 0) / itemScores.length;
     const itemScore = round2(allBehaviorOk ? turnMean : Math.min(turnMean, BEHAVIOR_FAIL_SCORE_CAP));
+    const turnSubMean = itemScores.reduce((s, x) => s + extractTurnSubstantiveScore(x), 0) / itemScores.length;
+    const itemSubstantiveScore = round2(allBehaviorOk ? turnSubMean : Math.min(turnSubMean, BEHAVIOR_FAIL_SCORE_CAP));
 
     const worstTurn = [...itemScores].sort((a, b) => a.score - b.score || a.turnNo - b.turnNo)[0]!;
     const probeType = item.probeType ?? "in_distribution";
@@ -262,6 +286,7 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
       expectedTurns: expectedTurnsByItemId.get(item.id) ?? itemScores.length,
       scoredTurns: itemScores.length,
       itemScore,
+      itemSubstantiveScore,
       allBehaviorOk,
       turnMeanScore: round2(turnMean),
       forbiddenTurns: itemScores.filter((s) => s.forbiddenHits > 0).length,
@@ -272,6 +297,7 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
     });
 
     itemScoreSum += itemScore;
+    itemSubScoreSum += itemSubstantiveScore;
     if (allBehaviorOk) itemBehaviorPass++;
 
     const t = byTypeAcc.get(probeType) ?? {
@@ -348,8 +374,10 @@ function computeRunMetrics(evalStore: EvalStore, run: EvalRunRecord): CandidateS
     scoredTurns,
     turnCoverage: expectedTurns > 0 ? round4(scoredTurns / expectedTurns) : 0,
     itemMeanScore: scoredItems > 0 ? round2(itemScoreSum / scoredItems) : 0,
+    itemSubstantiveScore: scoredItems > 0 ? round2(itemSubScoreSum / scoredItems) : 0,
     itemBehaviorPassRate: scoredItems > 0 ? round4(itemBehaviorPass / scoredItems) : 0,
     turnMeanScore: scoredTurns > 0 ? round2(turnScoreSum / scoredTurns) : 0,
+    turnSubstantiveScore: scoredTurns > 0 ? round2(turnSubScoreSum / scoredTurns) : 0,
     turnBehaviorPassRate: scoredTurns > 0 ? round4(turnBehaviorPass / scoredTurns) : 0,
     meanStance: scoredTurns > 0 ? round2(stanceSum / scoredTurns) : 0,
     meanKeyPointCoverage: scoredTurns > 0 ? round4(kpSum / scoredTurns) : 0,
@@ -549,14 +577,14 @@ export function renderEvalReportMarkdown(report: EvalComparisonReport, topFailur
   // 1. Overall Suite x Candidate summary
   lines.push("## 1. 总览（套卷 × 候选模型）");
   lines.push("");
-  lines.push("| 套卷 | 候选 | Run | 覆盖率 | 题均分 | 题级行为通过 | 轮均分 | Stance | 要点覆盖 | Style | 禁区命中 | 幻觉命中 | 失败信号 |");
-  lines.push("| :--- | :--- | :---: | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+  lines.push("| 套卷 | 候选 | Run | 覆盖率 | 题均分 | 实质分(去Style) | 题级行为通过 | 轮均分 | Stance | 要点覆盖 | Style | 禁区命中 | 幻觉命中 | 失败信号 |");
+  lines.push("| :--- | :--- | :---: | :---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
   for (const suiteName of report.suites) {
     for (const cand of report.candidates) {
       const e = report.entries.find((x) => x.suiteName === suiteName && x.candidate === cand);
       if (!e) continue;
       lines.push(
-        `| \`${e.suiteName}\` | **${e.candidate}** (\`${e.model}\`) | #${e.evalRunId} | ${e.scoredTurns}/${e.expectedTurns} (${pct(e.turnCoverage)}) | **${e.itemMeanScore.toFixed(2)}** | **${pct(e.itemBehaviorPassRate)}** | ${e.turnMeanScore.toFixed(2)} | ${e.meanStance.toFixed(2)}/2 | ${pct(e.meanKeyPointCoverage)} | ${e.meanStyle.toFixed(2)}/2 | ${pct(e.forbiddenHitRate)} | ${pct(e.hallucinationHitRate)} | ${pct(e.failureSignalHitRate)} |`,
+        `| \`${e.suiteName}\` | **${e.candidate}** (\`${e.model}\`) | #${e.evalRunId} | ${e.scoredTurns}/${e.expectedTurns} (${pct(e.turnCoverage)}) | **${e.itemMeanScore.toFixed(2)}** | **${e.itemSubstantiveScore.toFixed(2)}** | **${pct(e.itemBehaviorPassRate)}** | ${e.turnMeanScore.toFixed(2)} | ${e.meanStance.toFixed(2)}/2 | ${pct(e.meanKeyPointCoverage)} | ${e.meanStyle.toFixed(2)}/2 | ${pct(e.forbiddenHitRate)} | ${pct(e.hallucinationHitRate)} | ${pct(e.failureSignalHitRate)} |`,
       );
     }
   }

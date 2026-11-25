@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DataMakerStore } from "../src/db.js";
-import { planQuestionSchedule, runDialogueBatch } from "../src/dialogue-loop.js";
+import { runDialogueBatch } from "../src/dialogue-loop.js";
 import { createUnifiedSaveQuestionsTool } from "../src/question-store.js";
 import { parseFollowup } from "../src/schema.js";
 import type { RoleRequest } from "../src/types.js";
@@ -460,6 +460,25 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
   assert.deepEqual(manifest.includedRunIds, [2]);
   assert.equal(manifest.materialCount, 1);
 
+  const tsOutBase = join(dir, "train-ts.jsonl");
+  const tsManifestBase = join(dir, "train-ts-manifest.json");
+  const tsRes = await runCli("src/export-cli.ts", [
+    "--db", dbPath, "--all-formal", "--out", tsOutBase, "--manifest", tsManifestBase, "--timestamp",
+  ]);
+  assert.equal(tsRes.code, 0, tsRes.stderr);
+  const tsReport = JSON.parse(tsRes.stdout) as {
+    timestamp: string; out: string; manifest: string; trainSamples: number;
+  };
+  assert.match(tsReport.timestamp, /^\d{8}-\d{6}$/);
+  assert.equal(tsReport.out, join(dir, `train-ts-${tsReport.timestamp}.jsonl`));
+  assert.equal(tsReport.manifest, join(dir, `train-ts-manifest-${tsReport.timestamp}.json`));
+  assert.equal(tsReport.trainSamples, 1);
+  const tsWritten = (await readFile(tsReport.out, "utf8")).trimEnd();
+  assert.equal(tsWritten.length > 0, true);
+  const tsManifest = JSON.parse(await readFile(tsReport.manifest, "utf8")) as { timestamp: string; out: string };
+  assert.equal(tsManifest.timestamp, tsReport.timestamp);
+  assert.equal(tsManifest.out, tsReport.out);
+
   // 4. Verify DB integrity, loaded ready Skills, training_enabled=true, and zero leaked API key
   const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
@@ -522,76 +541,66 @@ test("createUnifiedSaveQuestionsTool enforces maxQuestions hard cap and counts e
   assert.deepEqual(saved.map((r) => r.question), ["问题1？", "问题2？", "问题3？"]);
 });
 
-test("planQuestionSchedule and runDialogueBatch distribute turns (30:50:20) and length tiers (25:50:25) per video", async (t) => {
+test("runDialogueBatch lets followup Agent decide turn counts naturally and passes material to judge without targetLength", async (t) => {
   const store = new DataMakerStore(":memory:");
   t.after(() => store.close());
 
-  const mat = store.upsertMaterial({ videoId: "BV-mix", content: "测试轮数与篇幅比例分配的文稿正文" });
-  const qIds: number[] = [];
-  for (let i = 1; i <= 10; i++) {
-    const q = store.insertQuestion({ id: i, materialId: mat.id, question: `比例测试问题 ${i}` }).record;
-    qIds.push(q.id);
-  }
+  const mat = store.upsertMaterial({ videoId: "BV-agent-loop", content: "测试 Agent Loop 自主收束与有稿核验的文稿正文" });
+  store.insertQuestion({ id: 1, materialId: mat.id, question: "问题1（一轮即止）" });
+  store.insertQuestion({ id: 2, materialId: mat.id, question: "问题2（两轮收束）" });
+  store.insertQuestion({ id: 3, materialId: mat.id, question: "问题3（三轮展开）" });
 
-  const plans = planQuestionSchedule(
-    qIds.map((id) => ({ id, materialId: mat.id })),
-    { maxTurns: 3, distributeTurns: true },
-  );
-  const turnCounts = { 1: 0, 2: 0, 3: 0 };
-  const tier1Counts = { short: 0, medium: 0, long: 0 };
-  for (const plan of plans.values()) {
-    turnCounts[plan.targetTurns as 1 | 2 | 3]++;
-    tier1Counts[plan.turnLengthTiers[0]]++;
-    // Consecutive turns in the same question never repeat long or short
-    for (let i = 1; i < plan.turnLengthTiers.length; i++) {
-      assert.notEqual(plan.turnLengthTiers[i], plan.turnLengthTiers[i - 1]);
-    }
-  }
-  // Exact 30% (3) 1-turn, 50% (5) 2-turn, 20% (2) 3-turn across 10 questions
-  assert.deepEqual(turnCounts, { 1: 3, 2: 5, 3: 2 });
-  // Across 10 questions: short=3, medium=5, long=2
-  assert.deepEqual(tier1Counts, { short: 3, medium: 5, long: 2 });
-
-  const seenTargetLengths: string[] = [];
   const summary = await runDialogueBatch({
     store,
     runRole: async (req) => {
+      assert.equal("targetLength" in req.input, false, `${req.role} should not receive static targetLength`);
       if (req.role === "answer") {
-        assert.equal(typeof req.input.targetLength, "string");
-        seenTargetLengths.push(String(req.input.targetLength));
+        assert.equal(req.input.material, mat.content);
         return `回答：${String(req.input.question)}`;
       }
       if (req.role === "judge") {
-        assert.equal(typeof req.input.targetLength, "string");
+        assert.equal(req.input.material, mat.content);
+        assert.equal(Object.keys(req.input)[0], "material", "judge should keep material first for KV prefix cache");
         return JSON.stringify({ decision: "pass", issues: [], feedback: "" });
       }
       if (req.role === "followup") {
-        return JSON.stringify({ action: "followup", user: "追问下一轮？" });
+        const history = req.input.history as Array<{ role: string; content: string }>;
+        const firstQ = history[0]?.content ?? "";
+        const completedTurns = history.length / 2;
+        if (firstQ.includes("问题1")) return JSON.stringify({ action: "stop" });
+        if (firstQ.includes("问题2") && completedTurns >= 2) return JSON.stringify({ action: "stop" });
+        return JSON.stringify({ action: "followup", user: `第 ${completedTurns + 1} 轮自然追问` });
       }
       throw new Error(`unexpected role: ${req.role}`);
     },
     prompts: { answer: "回答", judge: "质检", followup: "追问" },
     maxAttempts: 1,
     maxTurns: 3,
-    distributeTurns: true,
-    distributeLength: true,
-    config: { mode: "mix-test" },
+    config: { mode: "agent-loop-test" },
   });
 
   assert.equal(summary.integrityOk, true);
-  assert.equal(summary.results, 10);
-  assert.deepEqual(summary.plannedTurnDistribution, { 1: 3, 2: 5, 3: 2 });
-  // Total turns across 10 questions = 3*1 + 5*2 + 2*3 = 19 turns
-  assert.equal(seenTargetLengths.length, 19);
+  assert.equal(summary.results, 3);
 
   const dbDist = store.db.prepare(
     "SELECT turn_count, COUNT(*) AS c FROM results WHERE run_item_id IN (SELECT id FROM run_items WHERE run_id = ?) GROUP BY turn_count ORDER BY turn_count",
   ).all(summary.runId) as Array<{ turn_count: number; c: number }>;
   assert.deepEqual(dbDist.map((r) => [r.turn_count, Number(r.c)]), [
-    [1, 3],
-    [2, 5],
-    [3, 2],
+    [1, 1],
+    [2, 1],
+    [3, 1],
   ]);
+
+  // Judge model_calls record material reference in input_refs_json without duplicating raw text
+  const judgeCalls = store.db.prepare(
+    "SELECT input_refs_json FROM model_calls WHERE run_id = ? AND role = 'judge'",
+  ).all(summary.runId) as Array<{ input_refs_json: string }>;
+  assert.equal(judgeCalls.length, 6);
+  for (const row of judgeCalls) {
+    assert.equal(row.input_refs_json.includes(mat.content), false);
+    const refs = JSON.parse(row.input_refs_json) as { material?: { material_id: number; field: string } };
+    assert.deepEqual(refs.material, { material_id: mat.id, field: "content" });
+  }
 });
 
 test("runDialogueBatch retries transient empty/malformed model errors up to callMaxAttempts and drops only persistent failures", async (t) => {

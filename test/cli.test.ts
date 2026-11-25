@@ -202,9 +202,9 @@ test("live CLI preserves minimal wire inputs, isolated Skills, SQLite snapshots,
     assert.deepEqual(inputs, [
       { material: { id: "device", text: "供电电压12V。" }, direction: "设备使用" },
       { material: "供电电压12V。", question },
-      { question, answer: "请按要求供电。" },
+      { material: "供电电压12V。", question, answer: "请按要求供电。" },
       { material: "供电电压12V。", question, previousAnswer: "请按要求供电。", feedback },
-      { question, answer: "供电电压为12V。" },
+      { material: "供电电压12V。", question, answer: "供电电压为12V。" },
     ]);
 
     const exportedLines = (await readFile(exportPath, "utf8")).trimEnd().split("\n");

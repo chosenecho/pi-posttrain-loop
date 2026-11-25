@@ -9,7 +9,8 @@ import {
   computeBatchStats,
   DEFAULT_REASONING_CHECK_CONFIG,
   inferThinkTier,
-  parseTierRangeFlag,
+  parseProfileFilter,
+  parseTierFilter,
   runRuleChecks,
 } from "../src/reasoning-checks.js";
 import {
@@ -224,54 +225,55 @@ test("default reasoning prompts and skills load as ready with zero TODOs and val
   assert.deepEqual(examples.map((line) => parseReview(line).decision), ["pass", "revise", "drop"]);
 });
 
-test("deterministic rule checks enforce length, leakage, hindsight copy, format, and allow normal domain vocabulary", () => {
+test("deterministic safety checks only block engineering faults and leave tone/length/nuance to the LLM judge", () => {
   const answer =
     "把制度和自律拆成非此即彼，其实漏掉了两者互相咬合的机制。现实社会里原材料分配、道德要求和法律禁止从来不是孤立运转的，规则先划出博弈底线，人的判断再在条文之外补齐灰区。没有外部兜底，单靠个人觉悟很快就会在劣币竞争里被耗干；反过来如果只剩冰冷条文而没有人的自觉，任何细则都能被拆解成空壳。所以关键不是站哪一边，而是看规则能不能让守底线的人不吃亏。";
 
-  // Clean natural thought with philosophical words ("原材料", "道德要求", "法律禁止") should NOT false-positive
+  // Clean natural thought with domain words ("原材料", "道德要求", "法律禁止", "按规则办事") passes cleanly
   const cleanThought =
-    "把这两件事当成单选题来问，其实前提就已经劈歪了。像现实里原材料分配、道德要求和法律禁止往往绑在一起起作用，得先拆掉这个非此即彼的架子，点明光靠觉悟撑不住劣币竞争，再反过来说死条文也会被钻空子，最后落到让守底线不吃亏这个支点上。";
+    "把这两件事当成单选题来问，其实前提就已经劈歪了。像生产里的原材料怎么分配、日常的道德要求、按规则办事和成文的法律禁止，往往是绑在一起起作用的，得先拆掉这个非此即彼的架子，点明光靠觉悟撑不住劣币竞争，再反过来说死条文也会被钻空子，最后落到让守底线不吃亏这个支点上。";
   const passRes = runRuleChecks(cleanThought, answer, "short");
   assert.equal(passRes.passed, true, `Expected pass, got: ${passRes.issues.join("; ")}`);
   assert.deepEqual(passRes.metrics.leakHits, []);
   assert.deepEqual(passRes.metrics.formatHits, []);
 
-  // Formulaic bystander openings and explicit outline previews must be caught by rule layer
-  const bystanderOpening = runRuleChecks(
-    "他这里把制度和自律拆成了二选一，得先把前提拆开，再点出两者互相咬合的机制与边界，让守底线的人不吃亏。",
-    answer,
-    "short",
-  );
-  assert.equal(bystanderOpening.passed, false);
-  assert.ok(bystanderOpening.metrics.formatHits.some((h) => h.includes("旁观套话起手")));
+  // Tone/opening/style nuances and slight tier-range overflow are NOT short-circuited by regex;
+  // they pass through to the LLM judge for semantic evaluation.
+  const nuancedThought =
+    "他这里把制度和自律拆成了二选一，其实漏掉了两者互相咬合的机制。推进顺序是先拆前提，剩下的交给开口再展开。";
+  const nuanceRes = runRuleChecks(nuancedThought, answer, "short");
+  assert.equal(nuanceRes.passed, true, `Tone/short-overlap should defer to LLM judge, got: ${nuanceRes.issues.join("; ")}`);
+  assert.deepEqual(nuanceRes.metrics.formatHits, []);
 
-  const outlinePreview = runRuleChecks(
-    "把这两件事并列成二选一本身就不成立，关键看规则能不能托住人的判断。所以推进顺序是先拆掉这个伪对立，再划出制度和自律的边界，最后落到守规矩不吃亏。",
-    answer,
-    "short",
-  );
-  assert.equal(outlinePreview.passed, false);
-  assert.ok(outlinePreview.metrics.formatHits.some((h) => h.includes("显性结构预告")));
-  assert.ok(outlinePreview.feedback.includes("显性结构预告"));
+  // Slightly outside soft target range (e.g. 280 chars for medium, still well below safety fuse) passes rule layer
+  const mediumOverflow = "把制度与自律对立起来本身就是伪命题。".repeat(16); // ~288 chars
+  const longAnswer = answer.repeat(3);
+  const overflowRes = runRuleChecks(mediumOverflow, longAnswer, "medium");
+  assert.equal(overflowRes.passed, true, `Soft tier overflow should defer to LLM judge, got: ${overflowRes.issues.join("; ")}`);
 
-  const metaClosing = runRuleChecks(
-    "把制度和自律拆成单选题本身就不成立，关键看规则能不能让守底线的人不吃亏，剩下的交给开口再展开。",
-    answer,
-    "short",
-  );
-  assert.equal(metaClosing.passed, false);
-  assert.ok(metaClosing.metrics.formatHits.some((h) => h.includes("元自指收尾")));
+  // Thinking longer than a brief answer is allowed as long as it stays within maxChars safety fuse
+  const briefAnswer = "不是。它研究的不是逻辑学，而是逻辑本身，先把现成学科框架卸掉再直面逻辑本身。";
+  const deeperThoughtForBrief =
+    "一看到书名带“逻辑”两个字，最容易顺手把它归进逻辑学教科书那类现成学科里。可这里真正要追问的恰恰不是某套既成学科的规则汇编，而是逻辑自身何以成立、它的内在规定性怎么向我们显现。所以得先把现成的学科外壳卸下来，直接回到逻辑本身去谈。";
+  const longerThanAnswerRes = runRuleChecks(deeperThoughtForBrief, briefAnswer, "short");
+  assert.equal(longerThanAnswerRes.passed, true, `Thinking longer than short answer should be allowed, got: ${longerThanAnswerRes.issues.join("; ")}`);
+
+  // Runaway length fuse (> maxChars) MUST block
+  const runaway = "一二三四五六七八九十".repeat(90); // 900 chars > 800
+  const runawayRes = runRuleChecks(runaway, longAnswer, "long");
+  assert.equal(runawayRes.passed, false);
+  assert.ok(runawayRes.issues.some((issue) => issue.includes("安全上限")));
 
   // Leakage detection
   const leaked = runRuleChecks(
-    "原稿和材料中提到这个观点，按要求不超过120字且不能用加粗，所以我先简单回应这个核心分歧点，再收尾给出结论。",
+    "原稿和材料中提到这个观点，按字数要求不超过120字且不能用加粗，所以我先简单回应这个核心分歧点，再收尾给出结论。",
     answer,
     "short",
   );
   assert.equal(leaked.passed, false);
   assert.ok(leaked.metrics.leakHits.length >= 3);
 
-  // Hindsight verbatim copy detection (feedback must surface the matched snippet so the writer can fix it)
+  // Blatant verbatim copy-paste detection (feedback must surface the matched snippet)
   const copied = runRuleChecks(
     "我想说的是没有外部兜底单靠个人觉悟很快就会在劣币竞争里被耗干，反过来如果只剩冰冷条文而没有人的自觉，任何细则都能被拆解成空壳。",
     answer,
@@ -281,23 +283,19 @@ test("deterministic rule checks enforce length, leakage, hindsight copy, format,
   assert.ok(copied.issues.some((issue) => /重合率|连续.*照抄/.test(issue)));
   assert.ok(copied.feedback.includes(copied.metrics.maxVerbatimSnippet.slice(0, 12)));
 
-  // Format violations: numbered list + Markdown + <think> tags + third-person report phrasing
+  // Mechanical format violations ONLY: numbered list + Markdown + <think> tags
   const formatted = runRuleChecks(
-    "<think>用户的核心问题是制度和自律谁更根本。\n1. 先拆前提\n2. 再讲**互动关系**</think>",
+    "<think>先想清制度和自律的关系。\n1. 先拆前提\n2. 再讲**互动关系**</think>",
     answer,
     "short",
   );
   assert.equal(formatted.passed, false);
   assert.ok(formatted.metrics.formatHits.length >= 3);
 
-  // Tier range parser and tier inference
+  // Tier inference (for offline stats/stratification only)
   assert.equal(inferThinkTier(260), "short");
   assert.equal(inferThinkTier(600), "medium");
   assert.equal(inferThinkTier(1000), "long");
-  const parsedRange = parseTierRangeFlag("80-180", "--short-range");
-  assert.equal(parsedRange.targetMin, 80);
-  assert.equal(parsedRange.targetMax, 180);
-  assert.ok(parsedRange.hardMin < 80 && parsedRange.hardMax > 180);
 
   // Batch stats and opening-prefix diversity
   const stats = computeBatchStats([
@@ -333,6 +331,7 @@ test("selectStratifiedTurns balances tiers, turn numbers, and distinct videos re
         candidates.push({
           resultId: id,
           sourceRunId: 1,
+          sourceProfile: "standard",
           questionId: id,
           materialId: v,
           videoId: `BV_V${v}/P001`,
@@ -421,9 +420,12 @@ test("end-to-end backfill enforces material isolation, rule/LLM rewrites, drops,
     checkConfig: DEFAULT_REASONING_CHECK_CONFIG,
     runWriter: async (req) => {
       writerCalls.push(req);
-      // Verify strict blind isolation: raw material text must NEVER appear in writer input or prompt
+      // Verify strict blind isolation: raw material text must NEVER appear in writer input or prompt,
+      // and length tiers / targetChars are NOT forced onto the writer.
       const serialized = JSON.stringify(req.input) + req.systemPrompt;
       assert.equal(serialized.includes(secretMaterialText), false, "raw material leaked to writer");
+      assert.equal("targetThinkTier" in req.input, false);
+      assert.equal("targetChars" in req.input, false);
 
       const q = String(req.input.question);
       const count = (writerCallCounts.get(q) ?? 0) + 1;
@@ -453,6 +455,9 @@ test("end-to-end backfill enforces material isolation, rule/LLM rewrites, drops,
     runJudge: async (req) => {
       judgeCalls.push(req);
       assert.equal(JSON.stringify(req.input).includes(secretMaterialText), false, "raw material leaked to judge");
+      assert.equal("targetThinkTier" in req.input, false);
+      const metrics = req.input.referenceMetrics as Record<string, unknown> | undefined;
+      assert.ok(metrics && typeof metrics.charCount === "number" && !("targetChars" in metrics));
       const q = String(req.input.question);
       const reasoning = String(req.input.reasoning);
       if (q.includes("自我安慰") && reasoning.includes("别把前轮讲过的重复一遍")) {
@@ -679,4 +684,121 @@ test("reasoning-cli --help, --status, and --export-only work offline without API
 
   const reviewContent = await readFile(reviewPath, "utf8");
   assert.match(reviewContent, /已通过样本（3 条）/);
+});
+
+test("ReasoningStore supports standard + short profiles together and filter parsers validate input", async (t) => {
+  assert.equal(DEFAULT_REASONING_CHECK_CONFIG.maxChars, 800);
+  assert.equal(parseProfileFilter(undefined), "all");
+  assert.equal(parseProfileFilter("standard"), "standard");
+  assert.equal(parseProfileFilter("short"), "short");
+  assert.throws(() => parseProfileFilter("unknown"));
+
+  assert.equal(parseTierFilter(undefined), undefined);
+  assert.deepEqual(parseTierFilter("long"), ["long"]);
+  assert.deepEqual(parseTierFilter("short,long,short"), ["short", "long"]);
+  assert.throws(() => parseTierFilter("huge"));
+
+  const dir = await tempDir(t);
+  const dbPath = join(dir, "profiles.sqlite");
+  seedUnifiedDb(dbPath);
+
+  // Add a second answer_judge run with profile="short" and an ultra-short 105-char answer
+  const dmStore = new DataMakerStore(dbPath);
+  try {
+    const matC = dmStore.upsertMaterial({
+      videoId: "BV1SHORTC/P001",
+      content: "短答语料内容",
+      sourcePath: "data/BV1SHORTC.md",
+    });
+    const qRun = dmStore.createRun({
+      kind: "question_generation",
+      maxAttempts: 1,
+      maxTurns: 1,
+      config: { mode: "live", profile: "short" },
+      prompts: { question: "q" },
+      skills: [],
+      exportPolicy: { training_enabled: false, split: "train" },
+    });
+    dmStore.finishRun(qRun, "completed");
+    const qShort = dmStore.insertQuestion({
+      materialId: matC.id,
+      question: "《逻辑研究》研究的就是逻辑学吗？",
+      generationRunId: qRun,
+    }).record.id;
+    const shortRun = dmStore.createRun({
+      kind: "answer_judge",
+      maxAttempts: 3,
+      maxTurns: 2,
+      config: { mode: "sqlite-batch", split: "train", profile: "short" },
+      prompts: { answer: "a", judge: "j" },
+      skills: [],
+      exportPolicy: { training_enabled: true, split: "train" },
+    });
+    const itemMap = dmStore.createRunItems(shortRun, [qShort]);
+    const itemId = itemMap.get(qShort)!;
+    dmStore.startRunItem(itemId);
+    const turnId = dmStore.createTurn({ runItemId: itemId, turnNo: 1 });
+    const attemptId = dmStore.startAttempt({ turnId, attemptNo: 1 });
+    const shortAnswer = "不是。它研究的不是逻辑学，而是逻辑本身，让逻辑本身内在的规定性向我们显现。说白了，是先把现成的逻辑学框架卸掉，再去直面逻辑本身。";
+    const ansCall = dmStore.startModelCall({ runId: shortRun, role: "answer", turnId, attemptId, inputRefs: { material: matC.id, question: qShort } });
+    dmStore.finishModelCall(ansCall, shortAnswer);
+    dmStore.recordAttemptAnswer(attemptId, shortAnswer);
+    const judgeCall = dmStore.startModelCall({ runId: shortRun, role: "judge", turnId, attemptId, inputRefs: { question: qShort, answer: attemptId } });
+    dmStore.commitJudgeOutcome({
+      runItemId: itemId,
+      turnId,
+      turnNo: 1,
+      attemptId,
+      judgeCallId: judgeCall,
+      judgeOutputText: JSON.stringify({ decision: "pass", issues: [], feedback: "" }),
+      review: { decision: "pass", issues: [], feedback: "" },
+      isFinalTurn: true,
+      exhaustedBudget: false,
+    });
+    dmStore.finishRun(shortRun, "completed");
+  } finally {
+    dmStore.close();
+  }
+
+  const rStore = new ReasoningStore(dbPath);
+  try {
+    const allCands = rStore.queryCandidateTurns({ allFormal: true, profile: "all" });
+    const stdCands = rStore.queryCandidateTurns({ allFormal: true, profile: "standard" });
+    const shortCands = rStore.queryCandidateTurns({ allFormal: true, profile: "short" });
+    assert.equal(stdCands.length, 3);
+    assert.equal(shortCands.length, 1);
+    assert.equal(allCands.length, 4);
+    assert.equal(shortCands[0].sourceProfile, "short");
+
+    const status = rStore.getStatusSummary({ allFormal: true });
+    assert.deepEqual(status.byProfile, {
+      standard: { results: 2, turns: 3, missingTurns: 3 },
+      short: { results: 1, turns: 1, missingTurns: 1 },
+    });
+
+    // Stratified selection across standard + short includes both profiles
+    const stratified = selectStratifiedTurns(allCands, 2, 42);
+    assert.equal(stratified.length, 2);
+    assert.ok(stratified.some((c) => c.sourceProfile === "standard"));
+    assert.ok(stratified.some((c) => c.sourceProfile === "short"));
+
+    // Seed passed traces and verify profileDistribution in export
+    const runId = rStore.createReasoningRun({ writerModel: "m", judgeModel: null, config: {}, prompts: {}, skills: [] });
+    for (const c of allCands) {
+      const tid = rStore.startTrace({ reasoningRunId: runId, attemptId: c.attemptId, resultId: c.resultId, turnNo: c.turnNo, lengthTier: c.lengthTier });
+      rStore.completeTrace(tid, {
+        status: "completed",
+        decision: "pass",
+        rewriteCount: 0,
+        reasoning: "先把书名和现成学科框架分开，这里问的是逻辑本身而不是逻辑学教材。",
+        checks: { finalMetrics: null, llmReview: null, attempts: [] },
+        rawOutput: "ok",
+      });
+    }
+    rStore.finishReasoningRun(runId, "completed");
+    const exported = buildReasoningExportDataset(rStore, { allFormal: true, profile: "all" });
+    assert.deepEqual(exported.profileDistribution, { standard: 3, short: 1 });
+  } finally {
+    rStore.close();
+  }
 });

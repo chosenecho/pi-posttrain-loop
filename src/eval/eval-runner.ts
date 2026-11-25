@@ -52,7 +52,8 @@ export interface RunSuiteEvaluationOptions {
   candidate: string;
   modelId: string;
   historyMode?: EvalHistoryMode;
-  systemPrompt?: string;
+  /** `undefined` inherits on resume (or omits on new run); `null` explicitly disables system prompt. */
+  systemPrompt?: string | null;
   temperature?: number;
   maxTokens?: number;
   runCandidate: CandidateRunner;
@@ -101,6 +102,7 @@ export async function runSuiteEvaluation(
   let candidate = nonEmpty(options.candidate, "--candidate");
   let modelId = nonEmpty(options.modelId, "--model");
   let historyMode: EvalHistoryMode = options.historyMode ?? "gold";
+  let effectiveSystemPrompt: string | undefined;
 
   const suite = evalStore.getSuite(suiteName);
   if (!suite) {
@@ -121,6 +123,24 @@ export async function runSuiteEvaluation(
     if (options.historyMode !== undefined && existingRun.historyMode !== options.historyMode) {
       throw new Error(`eval_run #${existingRun.id} 历史模式为 ${existingRun.historyMode}，与 --history-mode ${options.historyMode} 不一致`);
     }
+    const storedSystemPrompt =
+      typeof existingRun.config.systemPrompt === "string" && existingRun.config.systemPrompt.trim().length > 0
+        ? existingRun.config.systemPrompt.trim()
+        : undefined;
+    if (options.systemPrompt === undefined) {
+      effectiveSystemPrompt = storedSystemPrompt;
+    } else if (options.systemPrompt === null) {
+      if (storedSystemPrompt !== undefined) {
+        throw new Error(`eval_run #${existingRun.id} 原配置包含系统提示词，与 --no-system-prompt 不一致`);
+      }
+      effectiveSystemPrompt = undefined;
+    } else {
+      const requestedPrompt = nonEmpty(options.systemPrompt, "systemPrompt");
+      if (requestedPrompt !== storedSystemPrompt) {
+        throw new Error(`eval_run #${existingRun.id} 原系统提示词与本次指定的不一致`);
+      }
+      effectiveSystemPrompt = requestedPrompt;
+    }
     evalRunId = existingRun.id;
     historyMode = existingRun.historyMode;
     modelId = existingRun.model;
@@ -132,6 +152,10 @@ export async function runSuiteEvaluation(
       callRetryDelayMs,
     });
   } else {
+    effectiveSystemPrompt =
+      options.systemPrompt !== undefined && options.systemPrompt !== null
+        ? nonEmpty(options.systemPrompt, "systemPrompt")
+        : undefined;
     evalRunId = evalStore.createEvalRun({
       suiteId: suite.id,
       candidate,
@@ -143,8 +167,8 @@ export async function runSuiteEvaluation(
         candidate,
         modelId,
         historyMode,
-        hasSystemPrompt: Boolean(options.systemPrompt),
-        ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
+        hasSystemPrompt: Boolean(effectiveSystemPrompt),
+        ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
         ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
         ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
         ...(options.limit !== undefined ? { limit: options.limit } : {}),
@@ -197,7 +221,7 @@ export async function runSuiteEvaluation(
         const existingAnswer = existingOkByKey.get(predKey);
 
         const requestMessages: ChatMessage[] = [
-          ...(options.systemPrompt ? [{ role: "system" as const, content: options.systemPrompt }] : []),
+          ...(effectiveSystemPrompt ? [{ role: "system" as const, content: effectiveSystemPrompt }] : []),
           ...priorHistory,
           { role: "user", content: turn.user },
         ];

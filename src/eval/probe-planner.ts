@@ -18,7 +18,7 @@ export const PROBE_PERSONAS = [
 ] as const;
 export type ProbePersona = (typeof PROBE_PERSONAS)[number];
 
-/** Default full 6-type adversarial mix (matches design doc section 3). */
+/** Default full 6-type adversarial mix weights (soft guidance for the planning/writing agent). */
 export const DEFAULT_PROBE_MIX: Readonly<Record<ProbeType, number>> = {
   wild_short: 20,
   premise_trap: 20,
@@ -26,6 +26,24 @@ export const DEFAULT_PROBE_MIX: Readonly<Record<ProbeType, number>> = {
   transfer: 15,
   hallucination_bait: 15,
   pressure: 15,
+  trap_misattribution: 0,
+  trap_unknown_detail: 0,
+  trap_forced_decision: 0,
+  trap_unfounded_judgment: 0,
+};
+
+/** Default 4-type trap-refusal mix weights (`--profile trap`). */
+export const DEFAULT_TRAP_PROBE_MIX: Readonly<Record<ProbeType, number>> = {
+  wild_short: 0,
+  premise_trap: 0,
+  contrast: 0,
+  transfer: 0,
+  hallucination_bait: 0,
+  pressure: 0,
+  trap_misattribution: 25,
+  trap_unknown_detail: 25,
+  trap_forced_decision: 25,
+  trap_unfounded_judgment: 25,
 };
 
 /** Legacy M1 single-turn-only mix (no multi-turn pressure). */
@@ -36,7 +54,18 @@ export const DEFAULT_M1_PROBE_MIX: Readonly<Record<ProbeType, number>> = {
   transfer: 20,
   hallucination_bait: 15,
   pressure: 0,
+  trap_misattribution: 0,
+  trap_unknown_detail: 0,
+  trap_forced_decision: 0,
+  trap_unfounded_judgment: 0,
 };
+
+export interface SoftMixGuidance {
+  allowedTypes: ProbeType[];
+  targetWeights: Partial<Record<ProbeType, number>>;
+  currentCounts: Partial<Record<ProbeType, number>>;
+  underrepresentedTypes: ProbeType[];
+}
 
 export interface PlannedProbeSlot {
   sourceMaterialId: number;
@@ -47,19 +76,21 @@ export interface PlannedProbeSlot {
   persona: ProbePersona;
   expectedBehavior: ExpectedBehavior;
   targetTurns: number;
-  /** Deterministic adversary tactics for turns 2..targetTurns (empty for single-turn probes). */
+  /** Advisory adversary tactics for turns 2..targetTurns (legacy planner compatibility). */
   tactics: AdversaryTactic[];
 }
 
+export function normalizeProbeMix(mix?: Partial<Record<ProbeType, number>>): Record<ProbeType, number> {
+  if (!mix) return { ...DEFAULT_PROBE_MIX };
+  const result = Object.fromEntries(PROBE_TYPES.map((t) => [t, 0])) as Record<ProbeType, number>;
+  for (const t of PROBE_TYPES) {
+    result[t] = mix[t] ?? 0;
+  }
+  return result;
+}
+
 export function parseProbeMix(raw: string): Record<ProbeType, number> {
-  const mix: Record<ProbeType, number> = {
-    wild_short: 0,
-    premise_trap: 0,
-    contrast: 0,
-    transfer: 0,
-    hallucination_bait: 0,
-    pressure: 0,
-  };
+  const mix = Object.fromEntries(PROBE_TYPES.map((t) => [t, 0])) as Record<ProbeType, number>;
   const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
   if (parts.length === 0) {
     throw new Error("--mix 不能为空");
@@ -87,9 +118,54 @@ export function parseProbeMix(raw: string): Record<ProbeType, number> {
 }
 
 /**
- * Deterministic low-discrepancy planner using Smooth Weighted Round-Robin (SWRR).
- * Guarantees balanced probe_type distribution both globally and within every individual video,
- * and rotates personas evenly across slots.
+ * Builds soft global balance guidance for the autonomous `probe-writer` agent.
+ * Unlike rigid slot locking, this tells the agent which probe types are allowed and which ones
+ * are currently underrepresented globally, while leaving the final per-video count and types
+ * to the agent after reading the transcript.
+ */
+export function buildSoftMixGuidance(
+  mix: Readonly<Record<ProbeType, number>>,
+  currentCounts: Partial<Record<ProbeType, number>> = {},
+): SoftMixGuidance {
+  const allowedTypes = PROBE_TYPES.filter((t) => (mix[t] ?? 0) > 0);
+  if (allowedTypes.length === 0) {
+    throw new Error("题型配比至少需要一个正权重类型");
+  }
+  const totalWeight = allowedTypes.reduce((sum, t) => sum + (mix[t] ?? 0), 0);
+  const totalCurrent = allowedTypes.reduce((sum, t) => sum + Math.max(0, currentCounts[t] ?? 0), 0);
+
+  const targetWeights: Partial<Record<ProbeType, number>> = {};
+  const filteredCounts: Partial<Record<ProbeType, number>> = {};
+  const deficits: Array<{ type: ProbeType; deficit: number }> = [];
+
+  for (const t of allowedTypes) {
+    const targetShare = (mix[t] ?? 0) / totalWeight;
+    targetWeights[t] = Number((targetShare * 100).toFixed(1));
+    const count = Math.max(0, currentCounts[t] ?? 0);
+    filteredCounts[t] = count;
+    const actualShare = totalCurrent > 0 ? count / totalCurrent : 0;
+    deficits.push({ type: t, deficit: targetShare - actualShare });
+  }
+
+  const underrepresentedTypes = totalCurrent > 0
+    ? deficits
+        .filter((d) => d.deficit > 0.02)
+        .sort((a, b) => b.deficit - a.deficit)
+        .map((d) => d.type)
+    : [...allowedTypes];
+
+  return {
+    allowedTypes,
+    targetWeights,
+    currentCounts: filteredCounts,
+    underrepresentedTypes,
+  };
+}
+
+/**
+ * Legacy deterministic Smooth Weighted Round-Robin (SWRR) slot allocator.
+ * Retained for optional reference/testing; the default `runProbeBuild` now lets the agent
+ * autonomously plan per-video probe count and types using `buildSoftMixGuidance`.
  */
 export function planProbeSlots(
   sources: readonly SourceMaterialRecord[],
@@ -103,17 +179,7 @@ export function planProbeSlots(
   if (!Number.isSafeInteger(probesPerVideo) || probesPerVideo < 1 || probesPerVideo > 20) {
     throw new Error("probesPerVideo 必须是 1–20 的整数");
   }
-  const effectiveMix: Record<ProbeType, number> = options.mix
-    ? {
-        wild_short: options.mix.wild_short ?? 0,
-        premise_trap: options.mix.premise_trap ?? 0,
-        contrast: options.mix.contrast ?? 0,
-        transfer: options.mix.transfer ?? 0,
-        hallucination_bait: options.mix.hallucination_bait ?? 0,
-        pressure: options.mix.pressure ?? 0,
-      }
-    : { ...DEFAULT_PROBE_MIX };
-
+  const effectiveMix = normalizeProbeMix(options.mix);
   const activeTypes = PROBE_TYPES.filter((t) => effectiveMix[t] > 0);
   if (activeTypes.length === 0) {
     throw new Error("题型配比至少需要一个正权重类型");
@@ -155,7 +221,6 @@ export function planProbeSlots(
       let targetTurns = 1;
       const tactics: AdversaryTactic[] = [];
       if (probeType === "pressure") {
-        // Deterministic 2-turn / 3-turn balance (~2/3 two-turn, ~1/3 three-turn)
         targetTurns = pressureCount % 3 === 2 ? 3 : 2;
         pressureCount++;
         const needed = targetTurns - 1;
