@@ -283,14 +283,14 @@ FROM run_items WHERE run_id = :run_id GROUP BY status;
 9. 新库验收后，一键批量生产（[src/batch-cli.ts](<../src/batch-cli.ts>)）、问题生成（[src/question-cli.ts](<../src/question-cli.ts>)）、回答质检（[src/judge-cli.ts](<../src/judge-cli.ts>)）、材料全流程（[src/cli.ts](<../src/cli.ts>)）与导出（[src/export-cli.ts](<../src/export-cli.ts>)）均已接入统一存储模块 [src/db.ts](<../src/db.ts>)，并补齐以下批量生产能力：
    - **整视频多 P 自适应合并/分块与防重复选稿（[src/corpus.ts](<../src/corpus.ts>)）**：中小多 P 视频（`<= 32,000` 字）合并为 1 条 `materials`，超长系列大合集按分 P 边界切分为多个分块；自动跳过已存在 `questions` 或 `completed` 出题调用（含 0 题）的视频及相同全文 `sha256` 的跨目录重复稿。
    - **持久化三分区隔离、评分卡与版本冻结（[src/splits.ts](<../src/splits.ts>)）**：按 `video_key` 哈希持久化划分 `train` / `test` / `dpo`，支持 `--extract-rubric` 抽取 `eval_rubrics` 评分要点、`--freeze-version` 固化不可变 `test_set_versions` 与 `--version` 精确复现导出（详见 [测试集与评测流水线设计](<test-and-eval-pipeline.md>)）。
-   - **有界并发、前缀缓存优化、自动重试与按角色思考等级**：出题与回答质检支持 `--concurrency 1–100`（默认 `10`），单进程同步短事务无锁冲突；单次模型调用异常默认自动重试 3 次（3 秒间隔），仍失败丢弃；多轮 `answer` 固定稳定前缀字段序并实行首题缓存预热闸门；支持按角色覆盖 `LLM_{QUESTION,ANSWER,JUDGE,FOLLOWUP,RUBRIC}_THINKING_LEVEL`。
-   - **增量质检（`--only-unjudged`）与总训练集导出（`--all-formal` / `--runs` / `--version`）**：`npm run judge --only-unjudged` 自动跳过同 `max_turns` 下已有 `pass` / `drop` / `exhausted` 终态的旧问题，仅跑新问题及上次 `error` / `interrupted` 的问题；`npm run export` 支持 `--split`、`--version`、`--freeze-version`、`--dedup latest | earliest | error`、可复现 `--shuffle --seed`、按 `video_key` 整视频切分验证集（`--val-out` / `--val-ratio`）与 `--manifest` 审计清单。
-   - **7 个正式 Skill 全量快照**：核心 5 角色（`question-design`、`followup-strategy`、`answer-style`、`quality-judge`、`eval-rubric`）与 CoT 补写 2 角色（`reasoning-writer`、`reasoning-judge`）全员 `status: ready`，严格按角色隔离注入并完整快照进 `runs.skills_json` / `reasoning_runs.skills_json`。
+   - **有界并发、前缀缓存优化、自动重试与按角色思考等级**：出题与回答质检支持 `--concurrency 1–500`（默认 `10`），单进程同步短事务无锁冲突；单次模型调用异常默认自动重试 3 次（3 秒间隔），仍失败丢弃；多轮 `answer` 固定稳定前缀字段序并实行首题缓存预热闸门；支持按角色覆盖 `LLM_{QUESTION,ANSWER,JUDGE,FOLLOWUP,RUBRIC}_THINKING_LEVEL`。
+   - **增量质检（`--only-unjudged`）、多预设与总训练集导出（`--all-formal` / `--runs` / `--version`）**：`npm run batch` 与 `npm run judge` 支持 `--profile standard | short | trap` 切换风格预设；`npm run judge --only-unjudged` 自动跳过同 `max_turns` 下已有 `pass` / `drop` / `exhausted` 终态的旧问题，仅跑新问题及上次 `error` / `interrupted` 的问题；`npm run export` 支持 `--split`、`--version`、`--freeze-version`、`--dedup latest | earliest | error`、可复现 `--shuffle --seed`、按 `video_key` 整视频切分验证集（`--val-out` / `--val-ratio`）、`--timestamp` 与 `--manifest` 审计清单。
+   - **多预设正式 Skill 全量快照**：核心 5 角色（`question-design`、`followup-strategy`、`answer-style`、`quality-judge`、`eval-rubric`）、`short` / `trap` 专职预设变体（各 4 份）与 CoT 补写 2 角色（`reasoning-writer`、`reasoning-judge`）全员 `status: ready`，严格按角色隔离注入并完整快照进 `runs.skills_json` / `reasoning_runs.skills_json`。
 
-## 8. 当前验收基线（截至 2026-11-24）
+## 8. 验收与回归基线
 
-- **代码与测试**：`npm run check`（`tsc --noEmit` + `tsx --test`）**116 / 116** 全部通过（涵盖核心存储、对话循环、多 P 语料、三分区防泄漏、Rubric 抽取、版本冻结、CoT 逆向补写与独立对抗评测）。
-- **生产库基线（`data/data-maker.sqlite`，14 表）**：
+- **代码与测试**：`npm run check`（`tsc --noEmit` + `tsx --test`）**124 / 124** 全部通过（涵盖核心存储、对话循环、多 P 语料、三分区防泄漏、多预设 Skill、Rubric 抽取、版本冻结、CoT 逆向补写与独立对抗/陷阱评测）。
+- **初始首版生产库基线快照（2026-11-24 冻结验证，`data/data-maker.sqlite`，14 表）**：
   - **三分区注册表（`video_splits`）**：全库 **1,700** 个视频已持久化锁定：`train` **1,367**（29 个历史回填 + 1,338 个哈希）/ `test` **174** / `dpo` **159**。
   - **正式训练集（`train`）**：已处理 **29** 个视频，入库 **166** 题，产出 **163** 条通过样本（1 轮 44 / 2 轮 92 / 3 轮 27），已导出至 `output/train-all.jsonl` 与 `output/train-all-manifest.json`。
   - **冻结盲测集（`test-v1`）**：已处理 **6** 个 `test` 视频，入库 **38** 题，**38 / 38** 全部通过（1 轮 11 / 2 轮 21 / 3 轮 6，共 **71** 轮），**71 / 71** 轮 `eval_rubrics` 全量落库，已固化版本 `test-v1` 并单独导出至 `output/test.jsonl`（同 `output/test-v1.jsonl`）及 `output/test-manifest.json`。

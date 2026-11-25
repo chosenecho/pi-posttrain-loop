@@ -6,5 +6,5 @@
 
 ## Consequences
 
-- `reasoning-writer` 在架构上无法读取 `materials` 表字段，配合确定性规则检查（禁止出现“文稿/材料/原文/标准答案”等上帝视角词汇、8-gram 重合率 `<= 0.25`、最长连续照抄 `<= 18` 字、思考/回答字数比 `<= 0.8`），强制思考链只包含“定性破题 → 推演链条 → 收束落点”。
-- 多轮样本导出给 `ms-swift` 时默认按轮展开（`--expand-turns`），历史轮次仅保留纯回答正文，只对当前训练目标末轮附带 `reasoning_content` 或 `<think>`，与实际推理时的上下文分布完全一致。
+- `reasoning-writer` 在架构上无法读取 `materials` 表字段；程序层仅保留极简工程安全阀（非空、无 `<think>`/Markdown/列表脏污、禁止“原稿/材料/逐字稿/提示词”等硬泄漏词、极端超长与极端整段照抄熔断），而将字数、重合度与最长共现片段作为参考指标（`referenceMetrics`）提供给 `reasoning-judge`，由 Agent Loop 主导语义质量、自然度、去摘要化与边界一致性裁决。
+- 多轮样本导出给 `ms-swift` 时默认采用 `--format inline`（将 `<think>...</think>` 内联进 `content`，适配 `ms-swift 4.6.0`；也保留 `--format reasoning_content` 供直调 HF `apply_chat_template`）并默认按轮展开（`--expand-turns`），历史轮次仅保留纯回答正文，只对当前训练目标末轮附带思考块，与实际推理时的上下文分布完全一致。

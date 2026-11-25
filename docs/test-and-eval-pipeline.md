@@ -172,14 +172,11 @@ LIMIT 5;
 
 ---
 
-## 7. 后续演进规划（P2 / P3）
+## 7. 后续演进状态（P2 已落地 / P3 规划）
 
-- **P2 · 脱稿盲测与自动批卷闭环（待实现）**：
-  - 新增 `eval-runner`：加载冻结版本（如 `test-v1`），在**不提供原始 `material`** 的前提下，向被测候选模型（Base / SFT v1 / DPO v1）发送首轮问题（多轮时喂入前轮标准 `chosen` 对话历史 + 本轮追问），收集候选回答。
-  - 新增 `eval-grader`：对照 `eval_rubrics`（`stance` / `keyPoints` / `forbidden` / `mustNotHallucinate`）与 `answer-style` 风格规范，逐轮输出多维度评分、立场对齐度、幻觉命中与风格自然度，并生成跨模型版本对比报告。
+- **P2 · 脱稿盲测与自动批卷闭环（已落地，见 [eval-probe-pipeline.md](./eval-probe-pipeline.md)）**：
+  - 已在独立评测库 `data/eval.sqlite` 与 `npm run eval` 中全量实现 `eval-runner`（原生多轮 Chat API，支持 `gold` / `self` 历史模式与默认 `prompts/eval/candidate-system.md`）、`eval-grader`（v3 整体语义批卷，兼容 `indist-*`、`adv-*` 与 `trap-*` 评分卡）、`report` 与 `compare` 跨模型对比报告；主库冻结版本 `test-v1` 通过 `npm run eval -- mirror` 只读镜像为 `indist-v1` 参与横向对比。
 - **P3 · On-policy DPO 错题挖掘与偏好对导出（待实现）**：
   - 仅在独立的 `dpo` 分区运行候选模型脱稿作答与批卷；
   - 将翻车回答（`rejected`）与库内对应标准通过回答（`chosen`）自动配对，执行长度比过滤（防长度偏差），与过程表沉淀的高质量 `revise → pass` 样本按需合并导出为 DPO JSONL；
-  - 训练完 DPO 模型后，回到从未用于训练的冻结 `test-v1`（及后续 `test-v2`）上做盲测复检。
-
-- **P2+ · 测试集专用对抗出题 Loop 与独立评测库**：设计见 [eval-probe-pipeline.md](./eval-probe-pipeline.md)。
+  - 训练完 DPO 模型后，回到从未用于训练的冻结 `indist-*` / `adv-*` / `trap-*` 盲测集上做盲测复检。
