@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { DataMakerStore } from "../src/db.js";
-import { runDialogueBatch } from "../src/dialogue-loop.js";
-import { runMaterialsToStore } from "../src/pipeline.js";
-import { runReasoningBackfill } from "../src/reasoning-engine.js";
-import { ReasoningStore } from "../src/reasoning-store.js";
+import { runCorpusQuestionGeneration } from "../src/synth/corpus-questions.js";
+import { scanCorpusVideos } from "../src/synth/corpus.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
+import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
+import { runReasoningBackfill } from "../src/reasoning/engine.js";
+import { ReasoningStore } from "../src/reasoning/store.js";
 import { runProbeCalibration } from "../src/eval/calibrate.js";
-import { EvalStore } from "../src/eval/eval-db.js";
+import { EvalStore } from "../src/eval/store/index.js";
 import { gradeEvalRun } from "../src/eval/eval-grader.js";
 import { runSuiteEvaluation } from "../src/eval/eval-runner.js";
-import type { RoleRunner, Skill } from "../src/types.js";
+import type { RoleRunner, Skill } from "../src/shared/types.js";
 
 const SECRET = "synthetic-privacy-flow-marker";
 const PRIVATE_MESSAGE = `${SECRET} Bearer fixture-token https://provider.example/v1?token=${SECRET}\nprivate material fragment`;
@@ -58,31 +59,43 @@ function seedSuite(store: EvalStore): void {
 test("question generation publishes only controlled errors and retains malformed output as trace", async (t) => {
   for (const malformed of [false, true]) {
     await t.test(malformed ? "model parse failure" : "injected provider exception", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "data-maker-privacy-q-"));
       const store = new DataMakerStore(":memory:");
       try {
+        await mkdir(join(dir, "by_bv", "BV_PRIV"), { recursive: true });
+        await writeFile(join(dir, "by_bv", "BV_PRIV", "P001.md"), "fixture material");
+        const candidates = await scanCorpusVideos(dir);
         const progress: string[] = [];
-        await assert.rejects(runMaterialsToStore({
-          store, materials: [{ id: "fixture-material", text: "fixture material" }], direction: "fixture",
-          rubric: SKILL, questionSkill: SKILL, answerStyle: SKILL,
-          prompts: { question: "question", answer: "answer", judge: "judge" },
-          throwOnQuestionError: true,
-          runRole: async () => {
+        const summary = await runCorpusQuestionGeneration({
+          store,
+          config: {
+            baseUrl: "http://127.0.0.1:1/v1",
+            modelId: "fixture",
+            apiKey: "fixture-key",
+            maxTokens: 256,
+            contextWindow: 32768,
+            timeoutMs: 5000,
+          },
+          systemPrompt: "question",
+          skills: [],
+          candidates,
+          concurrency: 1,
+          callMaxAttempts: 1,
+          createRunner: () => async () => {
             if (malformed) return PRIVATE_MESSAGE;
             throw sensitiveException();
           },
           onProgress: (message) => progress.push(message),
-        }), (error: unknown) => {
-          assert.ok(error instanceof Error);
-          assertPublic([error.message], malformed ? "model_output_invalid" : "unexpected_error");
-          return true;
         });
-        const code = malformed ? "model_output_invalid" : "unexpected_error";
+        assert.equal(summary.errors, 1);
+        const code = malformed ? "model_save_tool_missing" : "unexpected_error";
         assertPublic(progress, code);
-        assertErrorColumns(store.db, ["model_calls", "runs"], code);
+        assertErrorColumns(store.db, ["model_calls"], code);
         const call = store.db.prepare("SELECT output_text FROM model_calls").get();
         assert.equal(call?.output_text, malformed ? PRIVATE_MESSAGE : null);
       } finally {
         store.close();
+        await rm(dir, { recursive: true, force: true });
       }
     });
   }

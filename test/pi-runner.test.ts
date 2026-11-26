@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { test, type TestContext } from "node:test";
-import { createPiRunner, readPiConfig, type PiConfig } from "../src/pi-runner.js";
+import { createPiRunner, readPiConfig, type PiConfig } from "../src/shared/pi-runner.js";
 
 async function localApi(t: TestContext, handler: (request: IncomingMessage, response: ServerResponse) => void): Promise<string> {
   const server = createServer(handler);
@@ -135,7 +135,7 @@ test("Pi adapter uses an explicit EMPTY key without inheriting another credentia
     auth = request.headers.authorization;
     sendText(response, "完成");
   });
-  const { readEvalPiConfig } = await import("../src/pi-runner.js");
+  const { readEvalPiConfig } = await import("../src/shared/pi-runner.js");
   const evaluationConfig = readEvalPiConfig({
     LLM_BASE_URL: "https://primary.example.invalid/v1", LLM_API_KEY: config(baseUrl).apiKey,
     LLM_MODEL: "local-fixture", EVAL_LLM_BASE_URL: baseUrl, EVAL_LLM_API_KEY: "EMPTY",

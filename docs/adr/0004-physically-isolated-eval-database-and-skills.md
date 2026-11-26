@@ -1,6 +1,6 @@
 # 0004. 独立评测库（`data/eval.sqlite`）与训练侧实行数据库及 Skill 双向物理隔离
 
-对抗与陷阱评测流水线（`npm run eval`）使用独立的 `data/eval.sqlite` 数据库（Schema v2，16 张表）与专属的 `skills/eval/*`（含 `skills/eval/trap/*`）技能目录，仅允许以只读方式从主库导入 `test` 分区文稿快照或只读镜像 `test-v1`，并在代码加载层通过双向白名单守卫（`src/eval-guard.ts` 与 `src/eval/eval-prompts.ts`）阻止训练与评测互读对方的 Skill 或跨库写入。
+对抗与陷阱评测流水线（`npm run dm -- eval`）使用独立的 `data/eval.sqlite` 数据库（Schema v2，16 张表）与专属的 `skills/eval/*`（含 `skills/eval/trap/*`）技能目录，仅允许以只读方式从主库导入 `test` 分区文稿快照或只读镜像 `test-v1`，并在代码加载层通过双向白名单守卫（`src/synth/eval-guard.ts` 与 `src/eval/eval-prompts.ts`）阻止训练与评测互读对方的 Skill 或跨库写入。
 
 若评测题与训练题共用同一套出题与质检提示词（所谓“同源评测”），测试集只会考察训练出题器偏好的句式和角度，变成虚高的“开卷模拟考”；一旦同时允许评测流程读写主库，还存在将对抗测试题或过程数据误导流进 SFT 训练集的风险。
 

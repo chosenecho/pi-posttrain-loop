@@ -134,8 +134,8 @@ stateDiagram-v2
 
 工程约定：
 - **All-or-Nothing**：多轮 probe 任一轮 `drop` / 耗尽 / 报错，整道 probe 不进入 `accepted`。
-- **双层重试分离**：技术重试复用 [src/retry.ts](../src/retry.ts)（`--call-attempts` / `--retry-delay-ms`），业务返工单独计数。
-- **每次调用新建无状态 Agent**：复用 [src/pi-runner.ts](../src/pi-runner.ts)，零隐式上下文；所有调用输入引用与原始输出记入 `agent_calls`。
+- **双层重试分离**：技术重试复用 [src/shared/retry.ts](../src/shared/retry.ts)（`--call-attempts` / `--retry-delay-ms`），业务返工单独计数。
+- **每次调用新建无状态 Agent**：复用 [src/shared/pi-runner.ts](../src/shared/pi-runner.ts)，零隐式上下文；所有调用输入引用与原始输出记入 `agent_calls`。
 - **前缀缓存预热**：复用 [src/shared/concurrency.ts](../src/shared/concurrency.ts) 的 `createWarmupGate` 与有界并发池 `runConcurrentPool`。
 
 ### 4.3 评分卡 v2（`probe_rubrics.rubric_json`）
@@ -159,16 +159,16 @@ stateDiagram-v2
 
 | 层面 | 措施 |
 | --- | --- |
-| **Skill 双向白名单** | 评测 Skill 位于 `skills/eval/` 与 `skills/eval/trap/`；`eval-prompts.ts` 拒绝加载训练专属 Skill（`question-design` / `followup-strategy` / `quality-judge` / `eval-rubric` / `reasoning-*`），`io.ts` 拒绝训练流程加载任何 `skills/eval/*`。所有 Skill SHA-256 写入 `probe_runs.skills_json`。 |
+| **Skill 双向白名单** | 评测 Skill 位于 `skills/eval/` 与 `skills/eval/trap/`；`eval-prompts.ts` 拒绝加载训练专属 Skill（`question-design` / `followup-strategy` / `quality-judge` / `eval-rubric` / `reasoning-*`），`src/synth/skills.ts` 拒绝训练流程加载任何 `skills/eval/*`。所有 Skill SHA-256 写入 `probe_runs.skills_json`。 |
 | **模型与接口隔离** | 评测与批卷支持独立环境变量 `EVAL_LLM_*`；候选模型脱稿作答支持 `CANDIDATE_LLM_*` 与默认系统提示词 [prompts/eval/candidate-system.md](../prompts/eval/candidate-system.md)。 |
-| **跨库分区复核** | `eval import` 仅接受主库 `video_splits.split = 'test'`；`eval build` 与 `eval freeze` 前按 `video_key` 与 `content_sha256` 只读复核主库；训练侧 `npm run export` / `batch --export` 反查 `data/eval.sqlite` 阻止任何交集导出。 |
+| **跨库分区复核** | `eval import` 仅接受主库 `video_splits.split = 'test'`；`eval build` 与 `eval freeze` 前按 `video_key` 与 `content_sha256` 只读复核主库；训练侧 `synth export` / `synth run --export` 反查 `data/eval.sqlite` 阻止任何交集导出。 |
 | **冻结并发守卫与 2-gram 审计** | `eval freeze` 默认拒绝在存在 `status = 'running'` 的 `probe_runs` 时冻结（除非显式 `--allow-active-runs`）；同时与主库 `train` 分区全部问题做字符 **2-gram Jaccard** 相似度扫描（可设 `--fail-on-train-sim` 硬拦截）。 |
 
 ---
 
 ## 6. 独立评测库 `data/eval.sqlite`（Schema v2 · 16 表）
 
-`EvalStore`（[src/eval/eval-db.ts](../src/eval/eval-db.ts)）维护 **16 张表**，并在打开旧版 Schema v1 库时自动执行原地无损迁移（升级 `probe_specs` / `probes` / `probe_turns` 的 CHECK 约束以支持 `trap_*` 题型与 `refuse` 行为）：
+`EvalStore`（[src/eval/store/index.ts](../src/eval/store/index.ts)）维护 **16 张表**（拆分为 `source-repo.ts`、`probe-repo.ts`、`suite-eval-repo.ts` 三个仓储），并在打开旧版 Schema v1 库时自动执行原地无损迁移（升级 `probe_specs` / `probes` / `probe_turns` 的 CHECK 约束以支持 `trap_*` 题型与 `refuse` 行为）：
 
 1. 元数据与材料快照：`eval_meta`、`source_materials`（不可变触发器）
 2. 考题生产过程：`probe_runs`、`probe_specs`、`probes`（`accepted` 后题面冻结触发器）、`probe_reviews`、`probe_turns`、`probe_attempts`、`probe_rubrics`、`probe_calibrations`
@@ -199,20 +199,23 @@ erDiagram
 
 ```text
 src/eval/
-  eval-db.ts           EvalStore + Schema v2（16 表）+ v1→v2 无损迁移 + 不可变触发器
+  store/               EvalStore 门面 + Schema v2（16 表）+ source/probe/suite 仓储模块
   eval-prompts.ts      评测提示词/Skill 白名单加载器（adversarial / trap）+ 候选 system prompt 解析
   source-import.ts     从主库只读导入 test 材料快照；镜像 test-v1 → indist-v1
   probe-planner.ts     软配比引导（buildSoftMixGuidance）+ 历史 SWRR 兼容分配器
   probe-schema.ts      宽容结构化解析器（draft/revise/critic/verifier/adversary/rubric-v2/grader-v3）
-  probe-loop.ts        Agent Loop v3（自主规划 → 审题去重 → 内置裸答回流 → 核验 → 动态施压 → 评分卡）
+  probe-loop.ts        Agent Loop v3 编排入口（搭配 probe-stage-critic.ts 与 probe-stage-dialogue.ts）
   calibrate.ts         通用模型无原稿裸答 + 整体语义打分 → easy / medium / hard + 离线汇总报告
   suite-freeze.ts      套卷冻结（并发活动 run 守卫、easy 占比控制、split 复核、2-gram 相似度审计）
   candidate-client.ts  Node 原生 http/https 多轮 Chat API 客户端 + 完整/残余/截断 <think> 清洗
   eval-runner.ts       候选模型脱稿作答（gold / self 历史模式、默认 system prompt、断点续跑）
   grader-core.ts       v3 整体语义打分核心（Substantive 与 Style 解耦 + 40 分行为/幻觉熔断）
   eval-grader.ts       候选模型预测批量脱稿批卷（兼容 indist / adv / trap）
+  inspect.ts           考题分层抽检与 Markdown 报告渲染
   report.ts            套卷 × 候选模型 × 题型 × 预期行为 × 难度汇总报告与双模型 Δ 对比
-src/eval-cli.ts        12 个子命令统一入口（init/status/mirror/import/build/calibrate/freeze/run/grade/report/compare/inspect）
+  presets.ts           内置评测预设（test-fresh / adv-full / adv-fast / trap / blind-gold / blind-self）
+  workflows.ts         评测业务门面（含一键 evaluate = run + grade + report）
+src/cli/eval.ts        13 个子命令薄 CLI 适配器（init/status/mirror/import/build/calibrate/freeze/run/grade/evaluate/report/compare/inspect）
 skills/eval/           adversarial 7 份 Skill + skills/eval/trap/ 6 份陷阱拒答 Skill
 prompts/eval/          对应系统提示词 + bare-answer.md + candidate-system.md
 ```
@@ -221,28 +224,27 @@ prompts/eval/          对应系统提示词 + bare-answer.md + candidate-system
 
 ```powershell
 # 0. 初始化评测库，镜像主库 test-v1 为同分布基准卷 indist-v1
-npm run eval -- init
-npm run eval -- mirror --from-version test-v1 --as indist-v1
+npm run dm -- eval init
+npm run dm -- eval mirror --from-version test-v1 --as indist-v1
 
 # 1. 从主库 test 分区导入未用视频快照
-npm run eval -- import --limit 10 --shuffle --seed 42 --exclude-used
+npm run dm -- eval import --preset test-fresh
 
-# 2. 按预设运行 Agent Loop v3（默认内置裸答回流，可用 --bare-model 指定裸答模型或 --no-bare-check 关闭）
-npm run eval -- build --profile adversarial --videos imported --probes-per-video 6 --concurrency 8 --call-attempts 3
-npm run eval -- build --profile trap --videos imported --probes-per-video 3 --concurrency 8 --call-attempts 3
+# 2. 按预设运行 Agent Loop v3（adv-full 开启裸答回流，adv-fast 关闭，trap 专项）
+npm run dm -- eval build --preset adv-full
+npm run dm -- eval build --preset trap
 
 # 3. 难度标定（支持增量 --only-uncalibrated、按 --profile 过滤或 --report-only 离线出报告）
-npm run eval -- calibrate --run all --only-uncalibrated --concurrency 8 --out output/eval/calibration-report.md
+npm run dm -- eval calibrate --run all --only-uncalibrated --concurrency 8 --out output/eval/calibration-report.md
 
 # 4. 冻结不可变套卷（adv / trap 分别冻结并导出 JSONL 与审计 manifest）
-npm run eval -- freeze --name adv-main-v1 --profile adversarial --max-easy-ratio 0.2 --export output/eval/adv-main-v1.jsonl --manifest-out output/eval/adv-main-v1.manifest.json
-npm run eval -- freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
+npm run dm -- eval freeze --name adv-main-v1 --profile adversarial --max-easy-ratio 0.2 --export output/eval/adv-main-v1.jsonl --manifest-out output/eval/adv-main-v1.manifest.json
+npm run dm -- eval freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
 
-# 5. 候选模型脱稿盲测（默认注入 prompts/eval/candidate-system.md）、整体语义批卷与跨模型对比
-npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --history-mode gold
-npm run eval -- grade --run latest --concurrency 8
-npm run eval -- report --suites indist-v1,adv-main-v1,trap-main-v1 --candidates base,sft-v1 --out output/eval/report.md
-npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
+# 5. 一键串联候选模型脱稿盲测 + 批卷 + 出报告（eval evaluate），或分步 run + grade
+npm run dm -- eval evaluate --preset blind-gold --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --out output/eval/sft-v1.md
+npm run dm -- eval report --suites indist-v1,adv-main-v1,trap-main-v1 --candidates base,sft-v1 --out output/eval/report.md
+npm run dm -- eval compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
 ```
 
 ---

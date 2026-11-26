@@ -1,6 +1,6 @@
 import http from "node:http";
 import https from "node:https";
-import { nonEmpty } from "../schema.js";
+import { nonEmpty } from "../shared/schema.js";
 import { PublicError, toPublicError } from "../shared/public-error.js";
 import { resolveApiEndpoint } from "../shared/api-config.js";
 

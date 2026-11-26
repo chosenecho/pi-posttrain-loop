@@ -1,21 +1,21 @@
+import { runConcurrentPool } from "../shared/concurrency.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
   DEFAULT_CALL_MAX_ATTEMPTS,
   DEFAULT_CALL_RETRY_DELAY_MS,
   runWithRetry,
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
-} from "../retry.js";
-import { nonEmpty, validateConcurrency } from "../schema.js";
-import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
-import { runConcurrentPool } from "../shared/concurrency.js";
-import type { RoleRunner } from "../types.js";
+} from "../shared/retry.js";
+import { nonEmpty, validateConcurrency } from "../shared/schema.js";
+import type { RoleRunner } from "../shared/types.js";
 import {
   EvalStore,
   type CalibrationTurnRecord,
   type DifficultyLevel,
   type ExpectedBehavior,
   type ProbeRecord,
-} from "./eval-db.js";
+} from "./store/index.js";
 import type { CalibrationPromptBundle } from "./eval-prompts.js";
 import { classifyProbeDifficulty, scoreGradedTurn, type ScoredTurn } from "./grader-core.js";
 import { parseGradeResult, type ProbeRubricV2 } from "./probe-schema.js";
@@ -315,14 +315,13 @@ export async function runProbeCalibration(options: RunProbeCalibrationOptions): 
     throw toPublicError(error);
   }
 
-  const totalCallsRow = evalStore.db.prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ?").get(runRef) as { c: number };
   return aggregateCalibrationSummary({
     runId,
     bareModelId,
     graderModelId,
     totalProbes: probes.length,
     errors,
-    totalAgentCalls: Number(totalCallsRow.c),
+    totalAgentCalls: evalStore.countAgentCalls(runRef),
     items: calibratedItems,
   });
 }
@@ -519,8 +518,7 @@ export function summarizeCalibrationFromStore(options: {
   const calibrationRunIds = [...calRunIdSet].sort((a, b) => a - b);
   let totalAgentCalls = 0;
   for (const rId of calibrationRunIds) {
-    const row = evalStore.db.prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ?").get(`probe_run:${rId}`) as { c: number };
-    totalAgentCalls += Number(row.c);
+    totalAgentCalls += evalStore.countAgentCalls(`probe_run:${rId}`);
   }
 
   const bareModelId = bareModels.size > 0 ? [...bareModels].sort().join(", ") : "unknown";

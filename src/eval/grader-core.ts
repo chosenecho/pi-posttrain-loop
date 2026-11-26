@@ -1,4 +1,4 @@
-import type { DifficultyLevel } from "./eval-db.js";
+import type { DifficultyLevel } from "./store/index.js";
 import type { GraderTurnJudgement, GraderVerdict } from "./probe-schema.js";
 
 /**

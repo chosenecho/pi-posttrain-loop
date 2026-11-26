@@ -1,26 +1,9 @@
-import { DataMakerStore, extractVideoKey, formatSamplesJsonl, sha256Hex as mainSha256Hex } from "../db.js";
-import { loadVideoChunks, queryProcessedVideoIndex, scanCorpusVideos, type VideoUnit } from "../corpus.js";
-import { nonEmpty } from "../schema.js";
-import type { DatasetSplit, EvalRubric } from "../types.js";
-import { EvalStore, nowIso, sha256Hex, type SourceMaterialRecord } from "./eval-db.js";
-
-function createSeededRng(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function shuffleInPlace<T>(items: T[], rng: () => number): T[] {
-  for (let i = items.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [items[i], items[j]] = [items[j], items[i]];
-  }
-  return items;
-}
+import { nonEmpty } from "../shared/schema.js";
+import type { DatasetSplit, EvalRubric } from "../shared/types.js";
+import { createSeededRng, extractVideoKey, nowIso, sha256Hex, shuffleInPlace } from "../shared/utils.js";
+import { loadVideoChunks, queryProcessedVideoIndex, scanCorpusVideos, type VideoUnit } from "../synth/corpus.js";
+import { DataMakerStore, formatSamplesJsonl } from "../synth/store/index.js";
+import { EvalStore, type SourceMaterialRecord } from "./store/index.js";
 
 function collectMainUsedVideoKeys(mainStore: DataMakerStore): Set<string> {
   const used = new Set<string>(queryProcessedVideoIndex(mainStore).processedVideoKeys);
@@ -42,11 +25,7 @@ function collectMainUsedVideoKeys(mainStore: DataMakerStore): Set<string> {
 }
 
 function loadMainMaterialIndex(mainStore: DataMakerStore): Map<string, { id: number; sha256: string }> {
-  const rows = mainStore.db.prepare("SELECT id, video_id, sha256 FROM materials").all() as Array<{
-    id: number;
-    video_id: string;
-    sha256: string;
-  }>;
+  const rows = mainStore.listMaterialIndex();
   const map = new Map<string, { id: number; sha256: string }>();
   for (const row of rows) {
     map.set(`${row.video_id}\0${row.sha256}`, { id: Number(row.id), sha256: row.sha256 });
@@ -193,9 +172,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
     }
 
     // Source mode 2: Fallback to main DB's `materials` table (only `split = 'test'`)
-    const rows = mainStore.db.prepare(
-      "SELECT id, video_id, content, sha256, source_path FROM materials ORDER BY id",
-    ).all() as Array<{ id: number; video_id: string; content: string; sha256: string; source_path: string | null }>;
+    const rows = mainStore.listAllMaterials();
 
     const requestedSet = requestedKeys ? new Set(requestedKeys) : undefined;
     const byVideoKey = new Map<string, typeof rows>();
@@ -284,10 +261,8 @@ export function verifySourceSplits(mainDbPath: string, sources: SourceMaterialRe
         );
       }
       if (source.mainMaterialId !== null) {
-        const row = mainStore.db.prepare("SELECT sha256 FROM materials WHERE id = ?").get(source.mainMaterialId) as
-          | { sha256: string }
-          | undefined;
-        if (row && row.sha256 !== source.contentSha256) {
+        const mainSha = mainStore.getMaterialSha256(source.mainMaterialId);
+        if (mainSha !== undefined && mainSha !== source.contentSha256) {
           throw new Error(
             `跨库快照一致性校验失败：${source.videoId}（main_material_id=${source.mainMaterialId}）sha256 与主库不一致`,
           );
@@ -342,7 +317,7 @@ export function mirrorMainVersion(options: MirrorMainVersionOptions): MirrorMain
     });
 
     const jsonl = formatSamplesJsonl(merged.train.map((r) => r.sample));
-    const computedSha256 = mainSha256Hex(jsonl);
+    const computedSha256 = sha256Hex(jsonl);
     if (computedSha256 !== version.sha256) {
       throw new Error(
         `版本 ${fromVersion} sha256 校验失败：主库记录 ${version.sha256}，重新导出计算为 ${computedSha256}`,

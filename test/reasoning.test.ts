@@ -4,7 +4,7 @@ import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { DataMakerStore } from "../src/db.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 import {
   computeBatchStats,
   DEFAULT_REASONING_CHECK_CONFIG,
@@ -12,7 +12,7 @@ import {
   parseProfileFilter,
   parseTierFilter,
   runRuleChecks,
-} from "../src/reasoning-checks.js";
+} from "../src/reasoning/checks.js";
 import {
   composeReasoningJudgePrompt,
   composeReasoningWriterPrompt,
@@ -24,15 +24,15 @@ import {
   readReasoningWriterSkill,
   runReasoningBackfill,
   selectStratifiedTurns,
-} from "../src/reasoning-engine.js";
+} from "../src/reasoning/engine.js";
 import {
   buildReasoningExportDataset,
   formatReasoningJsonl,
   formatReviewMarkdown,
-} from "../src/reasoning-export.js";
-import { ReasoningStore, type CandidateTurn } from "../src/reasoning-store.js";
-import { parseReview } from "../src/schema.js";
-import type { RoleRequest } from "../src/types.js";
+} from "../src/reasoning/export.js";
+import { ReasoningStore, type CandidateTurn } from "../src/reasoning/store.js";
+import { parseReview } from "../src/shared/schema.js";
+import type { RoleRequest } from "../src/shared/types.js";
 
 async function tempDir(t: TestContext): Promise<string> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "data-maker-reasoning-test-")));
@@ -585,12 +585,12 @@ test("reasoning-cli --help, --status, and --export-only work offline without API
   delete cleanEnv.REASONING_BASE_URL;
   delete cleanEnv.REASONING_MODEL;
 
-  const helpRes = await runCli("src/reasoning-cli.ts", ["--help"], cleanEnv);
+  const helpRes = await runCli("src/cli/index.ts", ["cot", "--help"], cleanEnv);
   assert.equal(helpRes.code, 0, helpRes.stderr);
-  assert.match(helpRes.stdout, /脱稿逆向补写 CoT/);
+  assert.match(helpRes.stdout, /脱稿思考链（CoT）逆向补写/);
 
-  // --status works read-only even before reasoning_runs table exists in the DB
-  const statusRes = await runCli("src/reasoning-cli.ts", ["--db", dbPath, "--status"], cleanEnv);
+  // status works read-only even before reasoning_runs table exists in the DB
+  const statusRes = await runCli("src/cli/index.ts", ["cot", "status", "--db", dbPath], cleanEnv);
   assert.equal(statusRes.code, 0, statusRes.stderr);
   const statusJson = JSON.parse(statusRes.stdout) as {
     candidateResults: number;
@@ -642,13 +642,12 @@ test("reasoning-cli --help, --status, and --export-only work offline without API
   const reviewPath = join(dir, "review.md");
 
   const expRes = await runCli(
-    "src/reasoning-cli.ts",
+    "src/cli/index.ts",
     [
+      "cot", "export",
       "--db", dbPath,
-      "--export-only",
       "--reasoning-run", "1",
-      "--expand-turns",
-      "--export", outJsonl,
+      "--out", outJsonl,
       "--val-out", valJsonl,
       "--val-ratio", "0.5",
       "--shuffle",

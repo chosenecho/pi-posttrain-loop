@@ -1,4 +1,4 @@
-import { nonEmpty } from "../schema.js";
+import { nonEmpty } from "./schema.js";
 
 export interface ApiCredentialSource {
   baseUrl?: string;

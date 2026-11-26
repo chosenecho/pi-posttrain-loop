@@ -6,7 +6,7 @@ import {
   stripLeadingThinkBlock,
   type CandidateRunner,
 } from "../src/eval/candidate-client.js";
-import { EvalStore, type DifficultyLevel, type ExpectedBehavior, type ProbeType } from "../src/eval/eval-db.js";
+import { EvalStore, type DifficultyLevel, type ExpectedBehavior, type ProbeType } from "../src/eval/store/index.js";
 import { gradeEvalRun, normalizeSuiteTurnRubric } from "../src/eval/eval-grader.js";
 import {
   loadCalibrationPromptBundle,
@@ -16,7 +16,7 @@ import {
 import { extractSuiteDialogueTurns, runSuiteEvaluation } from "../src/eval/eval-runner.js";
 import { buildEvalReport, renderEvalReportMarkdown } from "../src/eval/report.js";
 import { freezeAdversarialSuite } from "../src/eval/suite-freeze.js";
-import type { RoleRunner } from "../src/types.js";
+import type { RoleRunner } from "../src/shared/types.js";
 
 const MATERIAL = "教师的薪俸来源决定了他们的时间和立身根本，所以职业行动者必须由组织供养。";
 const ANCHOR_MARK = "ANCHOR_SECRET";

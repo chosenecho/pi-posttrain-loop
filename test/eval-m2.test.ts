@@ -5,12 +5,12 @@ import {
   runProbeCalibration,
   summarizeCalibrationFromStore,
 } from "../src/eval/calibrate.js";
-import { EvalStore } from "../src/eval/eval-db.js";
+import { EvalStore } from "../src/eval/store/index.js";
 import { loadCalibrationPromptBundle, loadEvalPromptBundle } from "../src/eval/eval-prompts.js";
 import { classifyProbeDifficulty, scoreGradedTurn } from "../src/eval/grader-core.js";
 import { runProbeBuild } from "../src/eval/probe-loop.js";
 import { parseAdversaryTurn, parseGradeResult } from "../src/eval/probe-schema.js";
-import type { RoleRunner } from "../src/types.js";
+import type { RoleRunner } from "../src/shared/types.js";
 
 test("calibration prompt bundle loads cleanly as ready", async () => {
   const bundle = await loadCalibrationPromptBundle();

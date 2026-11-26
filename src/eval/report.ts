@@ -4,7 +4,7 @@ import {
   type EvalHistoryMode,
   type EvalRunRecord,
   type EvalScoreRecord,
-} from "./eval-db.js";
+} from "./store/index.js";
 import { extractSuiteDialogueTurns } from "./eval-runner.js";
 import { BEHAVIOR_FAIL_SCORE_CAP } from "./grader-core.js";
 

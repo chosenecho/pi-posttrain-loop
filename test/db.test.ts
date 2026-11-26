@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DataMakerStore, normalizeText, sha256Hex } from "../src/db.js";
+import { DataMakerStore, normalizeText, sha256Hex } from "../src/synth/store/index.js";
 
 function setupStore(): DataMakerStore {
   return new DataMakerStore(":memory:");

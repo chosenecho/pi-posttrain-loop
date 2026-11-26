@@ -17,7 +17,7 @@ import {
   TRAP_FOLLOWUP_SKILL,
   TRAP_QUALITY_JUDGE,
   TRAP_QUESTION_SKILL,
-} from "../src/io.js";
+} from "../src/synth/skills.js";
 
 async function workspace(t: TestContext): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "data-maker-io-"));

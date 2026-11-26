@@ -5,10 +5,11 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { DataMakerStore } from "../src/db.js";
-import { readAnswerStyle, readFollowupSkill, readQuestionSkill, readRubric } from "../src/io.js";
-import { runMaterialsToStore } from "../src/pipeline.js";
-import type { Role, RoleRequest, Skill, SystemPrompts } from "../src/types.js";
+import type { DialogueRole, RoleRequest, Skill } from "../src/shared/types.js";
+import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
+import { answerPrompt, judgePrompt } from "../src/synth/prompts.js";
+import { readAnswerStyle, readFollowupSkill, readQuestionSkill, readRubric } from "../src/synth/skills.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 
 async function temporaryDirectory(t: TestContext): Promise<string> {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "data-maker-role-contract-")));
@@ -24,9 +25,11 @@ test("two revisions send only the latest answer and feedback while keeping role 
   const store = new DataMakerStore(":memory:");
   t.after(() => store.close());
 
-  const material = { id: "contract-source", text: "仅供回答者的原始材料：周五交付，两人签字验收。" };
-  const direction = "仅供出题者的方向：梳理交付条件";
+  const materialText = "仅供回答者的原始材料：周五交付，两人签字验收。";
   const question = "如何完成交付？";
+  const mat = store.upsertMaterial({ videoId: "contract-source", content: materialText });
+  store.insertQuestion({ materialId: mat.id, question });
+
   const questionSkill: Skill = {
     status: "ready", body: "出题规则全文：聚焦单一核心问题。", sha256: "question-skill-hash",
   };
@@ -36,12 +39,10 @@ test("two revisions send only the latest answer and feedback while keeping role 
   const rubric: Skill = {
     status: "ready", body: "判断规则全文第一行：检查答案完整性。\n判断规则全文第二行：给出具体修订意见。", sha256: "judge-hash",
   };
-  const prompts: SystemPrompts = { question: "QUESTION BASE", answer: "ANSWER BASE", judge: "JUDGE BASE" };
-  const expectedQuestionPrompt = `QUESTION BASE\n\n<question-design>\n${questionSkill.body}\n</question-design>`;
-  const expectedAnswerPrompt = `ANSWER BASE\n\n<answer-style>\n${answerStyle.body}\n</answer-style>`;
-  const expectedJudgePrompt = `JUDGE BASE\n\n<judging-skill>\n${rubric.body}\n</judging-skill>`;
-  const replies: Array<[Role, string]> = [
-    ["question", JSON.stringify({ questions: [question] })],
+  const expectedAnswerPrompt = answerPrompt("ANSWER BASE", answerStyle.body);
+  const expectedJudgePrompt = judgePrompt("JUDGE BASE", rubric.body);
+
+  const replies: Array<[DialogueRole, string]> = [
     ["answer", "第一版答案"],
     ["judge", JSON.stringify({ decision: "revise", issues: ["仅质检内部问题一"], feedback: "第一轮反馈：补充日期。" })],
     ["answer", "第二版答案"],
@@ -50,14 +51,17 @@ test("two revisions send only the latest answer and feedback while keeping role 
     ["judge", JSON.stringify({ decision: "pass", issues: [], feedback: "" })],
   ];
   const calls: RoleRequest[] = [];
-  const run = await runMaterialsToStore({
+  const summary = await runDialogueBatch({
     store,
-    materials: [material],
-    direction,
-    questionSkill,
-    answerStyle,
-    rubric,
-    prompts,
+    prompts: { answer: expectedAnswerPrompt, judge: expectedJudgePrompt },
+    maxAttempts: 3,
+    maxTurns: 1,
+    concurrency: 1,
+    config: { mode: "contract-test" },
+    skills: [
+      { name: "answer-style", status: answerStyle.status, sha256: answerStyle.sha256 },
+      { name: "quality-judge", status: rubric.status, sha256: rubric.sha256 },
+    ],
     runRole: async (request) => {
       calls.push(request);
       const reply = replies.shift();
@@ -68,31 +72,21 @@ test("two revisions send only the latest answer and feedback while keeping role 
   });
 
   assert.equal(replies.length, 0);
-  assert.equal(run.integrityOk, true);
-  assert.deepEqual(run.dialogue?.outcomes, { pass: 1 });
-  assert.equal(run.dialogue?.results, 1);
-  assert.deepEqual(store.exportRunSamples(run.judgeRunId!), [{
+  assert.equal(summary.integrityOk, true);
+  assert.deepEqual(summary.outcomes, { pass: 1 });
+  assert.equal(summary.results, 1);
+  assert.deepEqual(store.exportRunSamples(summary.runId), [{
     messages: [
       { role: "user", content: question },
       { role: "assistant", content: "第三版完整答案" },
     ],
   }]);
 
-  assert.deepEqual(calls[0].input, { material, direction });
-  assert.equal(calls[0].systemPrompt, expectedQuestionPrompt);
-  assert.ok(!calls[0].systemPrompt.includes(answerStyle.body));
-  assert.ok(!calls[0].systemPrompt.includes(rubric.body));
-
   const answers = calls.filter(({ role }) => role === "answer");
-  assert.deepEqual(answers.map(({ input }) => Object.keys(input).sort()), [
-    ["material", "question"],
-    ["feedback", "material", "previousAnswer", "question"],
-    ["feedback", "material", "previousAnswer", "question"],
-  ]);
   assert.deepEqual(answers.map(({ input }) => input), [
-    { material: material.text, question },
-    { material: material.text, question, previousAnswer: "第一版答案", feedback: "第一轮反馈：补充日期。" },
-    { material: material.text, question, previousAnswer: "第二版答案", feedback: "第二轮反馈：补充签字条件。" },
+    { material: materialText, question },
+    { material: materialText, question, previousAnswer: "第一版答案", feedback: "第一轮反馈：补充日期。" },
+    { material: materialText, question, previousAnswer: "第二版答案", feedback: "第二轮反馈：补充签字条件。" },
   ]);
   for (const request of answers) {
     assert.equal(request.systemPrompt, expectedAnswerPrompt);
@@ -107,25 +101,24 @@ test("two revisions send only the latest answer and feedback while keeping role 
     ["answer", "material", "question"],
   ]);
   assert.deepEqual(judges.map(({ input }) => input), [
-    { material: material.text, question, answer: "第一版答案" },
-    { material: material.text, question, answer: "第二版答案" },
-    { material: material.text, question, answer: "第三版完整答案" },
+    { material: materialText, question, answer: "第一版答案" },
+    { material: materialText, question, answer: "第二版答案" },
+    { material: materialText, question, answer: "第三版完整答案" },
   ]);
   for (const request of judges) {
     assert.equal(request.systemPrompt, expectedJudgePrompt);
     assert.ok(!request.systemPrompt.includes(answerStyle.body));
     assert.ok(!request.systemPrompt.includes(questionSkill.body));
-    assert.ok(!request.systemPrompt.includes(material.text));
-    assert.ok(!request.systemPrompt.includes(direction));
+    assert.ok(!request.systemPrompt.includes(materialText));
   }
 
   // Verify SQLite model_calls store reference-based input_refs_json without duplicating raw material text
   const dbCalls = store.db.prepare("SELECT role, input_refs_json FROM model_calls ORDER BY id").all() as Array<{
     role: string; input_refs_json: string;
   }>;
-  assert.deepEqual(dbCalls.map((c) => c.role), ["question", "answer", "judge", "answer", "judge", "answer", "judge"]);
+  assert.deepEqual(dbCalls.map((c) => c.role), ["answer", "judge", "answer", "judge", "answer", "judge"]);
   for (const c of dbCalls) {
-    assert.equal(c.input_refs_json.includes(material.text), false);
+    assert.equal(c.input_refs_json.includes(materialText), false);
   }
 });
 

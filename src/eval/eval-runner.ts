@@ -1,19 +1,19 @@
+import { runConcurrentPool } from "../shared/concurrency.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
   DEFAULT_CALL_MAX_ATTEMPTS,
   DEFAULT_CALL_RETRY_DELAY_MS,
   runWithRetry,
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
-} from "../retry.js";
-import { nonEmpty, validateConcurrency } from "../schema.js";
-import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
-import { runConcurrentPool } from "../shared/concurrency.js";
+} from "../shared/retry.js";
+import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { CandidateRunner, ChatMessage } from "./candidate-client.js";
 import {
   EvalStore,
   type EvalHistoryMode,
   type SuiteItemRecord,
-} from "./eval-db.js";
+} from "./store/index.js";
 
 export interface SuiteDialogueTurn {
   turnNo: number;

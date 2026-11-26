@@ -16,8 +16,8 @@ import {
   scanCorpusVideos,
   selectVideos,
   summarizeCorpusStatus,
-} from "../src/corpus.js";
-import { DataMakerStore } from "../src/db.js";
+} from "../src/synth/corpus.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -28,7 +28,7 @@ async function tempDir(t: TestContext): Promise<string> {
 }
 
 async function runQuestionCli(args: string[], env: Record<string, string> = {}) {
-  const child = spawn(process.execPath, ["--import", "tsx", "src/question-cli.ts", ...args], {
+  const child = spawn(process.execPath, ["--import", "tsx", "src/cli/index.ts", "synth", "questions", ...args], {
     cwd: ROOT,
     env: { ...process.env, LLM_API_KEY: "fixture-key", LLM_MODEL: "fixture", ...env },
     stdio: ["ignore", "pipe", "pipe"],
@@ -264,7 +264,7 @@ test("batch-cli runs end-to-end video selection, question generation, 2-turn jud
   };
 
   const runBatch = async (args: string[]) => {
-    const child = spawn(process.execPath, ["--import", "tsx", "src/batch-cli.ts", ...args], {
+    const child = spawn(process.execPath, ["--import", "tsx", "src/cli/index.ts", "synth", "run", ...args], {
       cwd: ROOT,
       env: { ...process.env, LLM_API_KEY: "fixture-key", LLM_MODEL: "fixture", ...env },
       stdio: ["ignore", "pipe", "pipe"],
@@ -337,8 +337,8 @@ test("question CLI keeps unsaved model output in trace without printing it or st
   });
   assert.equal(result.code, 1);
   assert.equal(calls, 2);
-  assert.match(result.stdout, /model_save_tool_missing/);
-  assert.match(result.stdout, /question:call:\d+/);
+  assert.match(result.stderr, /model_save_tool_missing/);
+  assert.match(result.stderr, /question:call:\d+/);
   for (const value of [marker, "privacy-user@example.invalid", "fixture-private-token"]) {
     assert.equal(`${result.stdout}\n${result.stderr}`.includes(value), false);
   }

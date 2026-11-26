@@ -22,7 +22,7 @@
 
 ## 2. P0 · 持久化三分区注册表（`video_splits`）
 
-实现模块：[src/splits.ts](../src/splits.ts)、[src/db.ts](../src/db.ts)。
+实现模块：[src/synth/splits.ts](../src/synth/splits.ts)、[src/synth/store/index.ts](../src/synth/store/index.ts)。
 
 ### 2.1 分区确定性算法与历史回填
 
@@ -41,10 +41,10 @@
 ### 2.2 数据库与全链路防泄漏守卫
 
 - **表级不可变触发器**：`video_splits` 挂载 `trg_video_splits_immutable_update` 与 `trg_video_splits_immutable_delete`，禁止修改或删除已登记分区。
-- **生产默认隔离**：`npm run batch` 与 `npm run questions` 默认 `--split train`，日常生产绝不触碰 `test` / `dpo` 视频。
+- **生产默认隔离**：`npm run dm -- synth run` 与 `synth questions` 默认 `--split train`，日常生产绝不触碰 `test` / `dpo` 视频。
 - **导出策略双重拦截**：
   - `test` / `dpo` 分区运行自动写入 `runs.export_policy_json = {"format":"messages_jsonl","training_enabled":false,"eval_enabled":true}`；
-  - `npm run export -- --all-formal` 默认 `--split train`，同时校验 `training_enabled = true` 与 `video_splits.split = 'train'`；
+  - `npm run dm -- synth export` 默认 `--split train`，同时校验 `training_enabled = true` 与 `video_splits.split = 'train'`；
   - `--val-ratio` 切分验证集按 `video_key` 分组，同一超长多 P 视频所有分块强制落在训练或验证同侧。
 
 ---
@@ -58,7 +58,7 @@
 - **系统提示词**：[prompts/rubric.md](../prompts/rubric.md)（无 Skill 版：[prompts/no-skill/rubric.md](../prompts/no-skill/rubric.md)）
 - **独立 Skill**：[skills/eval-rubric/SKILL.md](../skills/eval-rubric/SKILL.md)（`status: ready`，注入标签 `<eval-rubric>`）
 - **独立思考等级配置**：支持环境变量 `LLM_RUBRIC_THINKING_LEVEL`（未设置时继承 `LLM_THINKING_LEVEL`）
-- **结构校验合同（`parseEvalRubric`，见 [src/schema.ts](../src/schema.ts)）**：
+- **结构校验合同（`parseEvalRubric`，见 [src/shared/schema.ts](../src/shared/schema.ts)）**：
   - `stance`（string，非空）：作者在本轮问题上的核心立场与定性判断。
   - `keyPoints`（string[]，1–6 条，去重）：被测模型脱稿作答必须覆盖的核心论点、机制或概念辨析（多轮只提炼本轮新增/深化要点）。
   - `forbidden`（string[]，0–5 条，去重）：反立场禁区与常见教科书式误解。
@@ -72,7 +72,7 @@
 - 仅允许对 `test` 或 `dpo` 分区使用 `--freeze-version <NAME>`（传入 `train` 分区直接报错拒绝）。
 - 冻结时将当前选中样本的 `result_ids_json`、`sample_count`、`video_count`、`manifest_json` 与导出正文 64 位 `sha256` 写入 `test_set_versions`。
 - 挂载 `trg_test_set_versions_immutable_update` 与 `trg_test_set_versions_immutable_delete`，版本一旦冻结即不可覆盖、修改或删除。
-- 后续任何时候执行 `npm run export -- --version <NAME> --out <PATH>`，都会严格按冻结时的 `result_ids` 精确复现导出，不受后续新增批次影响。
+- 后续任何时候执行 `npm run dm -- synth export --version <NAME> --out <PATH>`，都会严格按冻结时的 `result_ids` 精确复现导出，不受后续新增批次影响。
 
 ---
 
@@ -80,22 +80,22 @@
 
 ```powershell
 # 1. 查看 train / test / dpo 三分区进度（不调用模型）
-npm run batch -- --status
+npm run dm -- synth status
 
 # 2. 从 test 分区生产盲测样本 + 抽取每轮评分要点 + 冻结版本
-npm run batch -- --split test --limit 6 --shuffle --concurrency 40 --extract-rubric --freeze-version test-v1 --export output/test-v1.jsonl
+npm run dm -- synth run --preset test-freeze --limit 6 --concurrency 40 --freeze-version test-v1 --export output/test-v1.jsonl
 
 # 3. 按已冻结版本号单独导出为 test.jsonl 与审计清单
-npm run export -- --version test-v1 --out output/test.jsonl --manifest output/test-manifest.json
+npm run dm -- synth export --version test-v1 --out output/test.jsonl --manifest output/test-manifest.json
 
 # 4. 后续扩充盲测集并冻结新版本（test-v1 保持不变，test-v2 包含累积的全部 test 通过样本）
-npm run batch -- --split test --limit 14 --shuffle --concurrency 40 --extract-rubric --freeze-version test-v2 --export output/test-v2.jsonl
+npm run dm -- synth run --preset test-freeze --limit 14 --concurrency 40 --freeze-version test-v2 --export output/test-v2.jsonl
 
 # 5. 从 dpo 分区独立生产 On-policy DPO 采题池（绝不污染 test 分区）
-npm run batch -- --split dpo --limit 15 --shuffle --concurrency 40 --extract-rubric --export output/dpo-pool.jsonl
+npm run dm -- synth run --preset dpo-pool --limit 15 --concurrency 40 --export output/dpo-pool.jsonl
 
 # 6. 若曾中断或未开启 --extract-rubric，可单独对某分区补跑质检与 rubric
-npm run judge -- --split test --max-turns 3 --concurrency 40 --only-unjudged --extract-rubric
+npm run dm -- synth judge --split test --max-turns 3 --concurrency 40 --only-unjudged --extract-rubric
 ```
 
 ---
@@ -175,7 +175,7 @@ LIMIT 5;
 ## 7. 后续演进状态（P2 已落地 / P3 规划）
 
 - **P2 · 脱稿盲测与自动批卷闭环（已落地，见 [eval-probe-pipeline.md](./eval-probe-pipeline.md)）**：
-  - 已在独立评测库 `data/eval.sqlite` 与 `npm run eval` 中全量实现 `eval-runner`（原生多轮 Chat API，支持 `gold` / `self` 历史模式与默认 `prompts/eval/candidate-system.md`）、`eval-grader`（v3 整体语义批卷，兼容 `indist-*`、`adv-*` 与 `trap-*` 评分卡）、`report` 与 `compare` 跨模型对比报告；主库冻结版本 `test-v1` 通过 `npm run eval -- mirror` 只读镜像为 `indist-v1` 参与横向对比。
+  - 已在独立评测库 `data/eval.sqlite` 与 `npm run dm -- eval` 中全量实现 `eval-runner`（原生多轮 Chat API，支持 `gold` / `self` 历史模式与默认 `prompts/eval/candidate-system.md`）、`eval-grader`（v3 整体语义批卷，兼容 `indist-*`、`adv-*` 与 `trap-*` 评分卡）、`evaluate`（一键 `run + grade + report`）、`report` 与 `compare` 跨模型对比报告；主库冻结版本 `test-v1` 通过 `npm run dm -- eval mirror` 只读镜像为 `indist-v1` 参与横向对比。
 - **P3 · On-policy DPO 错题挖掘与偏好对导出（待实现）**：
   - 仅在独立的 `dpo` 分区运行候选模型脱稿作答与批卷；
   - 将翻车回答（`rejected`）与库内对应标准通过回答（`chosen`）自动配对，执行长度比过滤（防长度偏差），与过程表沉淀的高质量 `revise → pass` 样本按需合并导出为 DPO JSONL；

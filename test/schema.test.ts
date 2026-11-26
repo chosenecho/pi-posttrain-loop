@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseEvalRubric, parseQuestions, parseReview, validateMaxAttempts } from "../src/schema.js";
+import { parseEvalRubric, parseQuestions, parseReview, validateMaxAttempts } from "../src/shared/schema.js";
 
 test("questions accepts exactly zero to three nonempty questions and trims their text", () => {
   for (const questions of [[], ["一？"], ["一？", "二？"], ["一？", "二？", "三？"]]) {

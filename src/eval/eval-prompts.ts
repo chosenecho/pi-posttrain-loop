@@ -1,13 +1,18 @@
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { DEFAULT_ANSWER_STYLE, isEvalSkillPath, readSkillFile } from "../io.js";
-import { nonEmpty } from "../schema.js";
-import type { Skill } from "../types.js";
-import type { EvalProfile } from "./eval-db.js";
+import {
+  DEFAULT_EVAL_PROMPTS_DIR,
+  DEFAULT_EVAL_SKILLS_DIR,
+  DEFAULT_SKILLS_DIR,
+} from "../shared/paths.js";
+import { nonEmpty } from "../shared/schema.js";
+import { isEvalSkillPath, readSkillFile } from "../shared/skill-loader.js";
+import type { Skill } from "../shared/types.js";
+import type { EvalProfile } from "./store/index.js";
 
-export const DEFAULT_EVAL_PROMPTS_DIR = fileURLToPath(new URL("../../prompts/eval", import.meta.url));
-export const DEFAULT_EVAL_SKILLS_DIR = fileURLToPath(new URL("../../skills/eval", import.meta.url));
+const DEFAULT_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "answer-style/SKILL.md");
+
+export { DEFAULT_EVAL_PROMPTS_DIR, DEFAULT_EVAL_SKILLS_DIR };
 export const DEFAULT_CANDIDATE_SYSTEM_PROMPT_PATH = join(DEFAULT_EVAL_PROMPTS_DIR, "candidate-system.md");
 
 export async function loadDefaultCandidateSystemPrompt(

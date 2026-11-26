@@ -3,13 +3,15 @@
 [![Node.js >= 22.19.0](https://img.shields.io/badge/node-%3E%3D22.19.0-339933?logo=node.js&logoColor=white)](package.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![ModelScope Dataset](https://img.shields.io/badge/ModelScope_Dataset-vmz--sft--cot--eval-624aff)](https://www.modelscope.cn/datasets/chosenecho/vmz-sft-cot-eval)
-[![ModelScope Model](https://img.shields.io/badge/ModelScope_Model-qwen3.8--27b--ep1.5--fp8-624aff)](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8)
+[![ModelScope Model ep1.5](https://img.shields.io/badge/ModelScope_Model-qwen3.8--27b--ep1.5--fp8-624aff)](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8)
+[![ModelScope Model ep2.0](https://img.shields.io/badge/ModelScope_Model-qwen3.8--27b--ep2.0--fp8-624aff)](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep20-fp8)
 
 `pi-posttrain-loop` 是一个基于内置 `node:sqlite` 与无状态 Pi Agent 循环的模型后训练（SFT / CoT / DPO）数据合成与脱稿对抗评测 CLI。它围绕作者原始文稿完成**多预设（`standard` / `short` / `trap`）多轮问答合成与盲审返工**、**无原稿第一人称思考链（CoT）逆向补写**，以及**物理隔离的对抗/陷阱考题（Probe）盲测、难度标定与整体语义批卷**。领域核心概念见 [术语表（GLOSSARY.md）](GLOSSARY.md)，开源协议为 [MIT](LICENSE)。
 
 > **公开产出（ModelScope）**：
 > - **数据集（SFT / CoT 训练集与评测集）**：[chosenecho/vmz-sft-cot-eval](https://www.modelscope.cn/datasets/chosenecho/vmz-sft-cot-eval)
 > - **模型权重（ep1.5 Checkpoint，FP8）**：[chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8)
+> - **模型权重（ep2.0 Checkpoint，FP8）**：[chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep20-fp8](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep20-fp8)
 
 ---
 
@@ -19,16 +21,10 @@
 
 ```powershell
 npm install
-npm run demo
+npm run dm -- demo
 ```
 
-`demo` 使用内置固定材料与确定性判断脚本，不调用外部 API、不需要配置密钥，结果写入独立的 `output/demo.sqlite`：
-
-```text
-完成：通过 2，跳过 1，耗尽 0，错误 0
-```
-
-其中 2 条全部对话轮通过质检的样本写入 `results` 表（自动标记 `training_enabled: false` 防污染正式训练集），第 3 题演示 `drop` 淘汰分支，仅保留在过程表 `run_items` / `attempts` 中。
+`demo` 使用内置固定材料与确定性判断脚本，不调用外部 API、不需要配置密钥，结果写入独立的 `output/demo.sqlite`（可通过 `npm run dm -- presets` 随时查看全部内置任务预设）。其中 2 条全部对话轮通过质检的样本写入 `results` 表（自动标记 `training_enabled: false` 防污染正式训练集），第 3 题演示 `drop` 淘汰分支，仅保留在过程表 `run_items` / `attempts` 中。
 
 ---
 
@@ -41,9 +37,9 @@ npm run demo
 2. **13 个角色全员无状态 Pi Agent + Skill 白名单隔离**（[ADR 0002](docs/adr/0002-isolated-pi-agents-per-role.md)）
    每次模型调用均启动全新的独立 Pi Agent，不共享隐式会话历史。作答角色（`answer`）看不到质检评分细则（`quality-judge`）；第 $N$ 次返工重答时仅传入最新一版草稿与精简修改意见，不携带历史废案；多轮长度、收束时机与风格分工完全交由按预设切换的专属 Skill 与自主追问 Agent 驱动，不再堆砌脆弱的静态正则与机械配比；每次运行的系统提示词与 Skill SHA-256 指纹完整快照入库。
 3. **脱稿逆向补写 CoT，杜绝“看稿找答案”与“正文浓缩摘要”式思维链**（[ADR 0003](docs/adr/0003-blind-cot-backfill-without-source-material.md)）
-   在有稿问答阶段直接生成 `<think>` 会导致思考链充满“原文第二段提到……”的摘抄痕迹，而把 `<think>` 写成答案缩写则会诱发模型在正文两段草草收尾。`npm run reasoning` 在不提供 `material` 的前提下，仅凭问题、前序对话与已通过回答逆向生成第一人称开口前思考骨架；程序层仅保留极简工程安全阀（非空、禁原稿/录播/规则等硬泄漏词、禁 `<think>`/Markdown/列表格式脏污、异常超长熔断 `<= 800` 字、连续照抄熔断 `< 36` 字），将自然度、去摘要化与边界一致性交由 `reasoning-judge` 主导裁决。
+   在有稿问答阶段直接生成 `<think>` 会导致思考链充满“原文第二段提到……”的摘抄痕迹，而把 `<think>` 写成答案缩写则会诱发模型在正文两段草草收尾。`npm run dm -- cot` 在不提供 `material` 的前提下，仅凭问题、前序对话与已通过回答逆向生成第一人称开口前思考骨架；程序层仅保留极简工程安全阀（非空、禁原稿/录播/规则等硬泄漏词、禁 `<think>`/Markdown/列表格式脏污、异常超长熔断 `<= 800` 字、连续照抄熔断 `< 36` 字），将自然度、去摘要化与边界一致性交由 `reasoning-judge` 主导裁决。
 4. **训练与评测双库、双 Skill 物理隔离**（[ADR 0004](docs/adr/0004-physically-isolated-eval-database-and-skills.md)）
-   独立评测库 `data/eval.sqlite`（Schema v2，16 张表）仅以只读方式从主库拉取 `test` 分区文稿快照，使用专属的 `skills/eval/*` 与 `skills/eval/trap/*` 运行 **Agent Loop v3**（自主规划题量与题型、语义去重、内置无原稿裸答对抗回流），生产 6 类对抗考题（`adversarial`）与 4 类陷阱拒答题（`trap`）。运行时守卫（[src/eval-guard.ts](src/eval-guard.ts)、[src/eval/eval-prompts.ts](src/eval/eval-prompts.ts)）禁止训练与评测互读对方 Skill；套卷冻结时自动执行并发运行态守卫、`split = 'test'` 复核、难度占比控制与训练集 2-gram Jaccard 相似度审计；批卷采用 v3 整体语义打分（Substantive Score 与 Style 严格解耦）。
+   独立评测库 `data/eval.sqlite`（Schema v2，16 张表）仅以只读方式从主库拉取 `test` 分区文稿快照，使用专属的 `skills/eval/*` 与 `skills/eval/trap/*` 运行 **Agent Loop v3**（自主规划题量与题型、语义去重、内置无原稿裸答对抗回流），生产 6 类对抗考题（`adversarial`）与 4 类陷阱拒答题（`trap`）。运行时守卫（[src/synth/eval-guard.ts](src/synth/eval-guard.ts)、[src/eval/eval-prompts.ts](src/eval/eval-prompts.ts)）禁止训练与评测互读对方 Skill；套卷冻结时自动执行并发运行态守卫、`split = 'test'` 复核、难度占比控制与训练集 2-gram Jaccard 相似度审计；批卷采用 v3 整体语义打分（Substantive Score 与 Style 严格解耦）。
 
 > [!IMPORTANT]
 > **明确不做的事（Non-goals）**：
@@ -69,9 +65,17 @@ flowchart LR
   Freeze --> Publish
 ```
 
-1. **主数据合成流水线**（`data/data-maker.sqlite`，14 张表）：多 P 视频自适应合并/超长按分 P 切块 → `--sort core-first` 核心理论课优先或 `--shuffle` 抽选 → 按字数动态紧凑配额（2–6 题）出题 → 支持 `--profile standard | short | trap` 三套专职 Skill 预设，由 `followup` Agent 自主决定继续追问或收束 → 可选抽取结构化评分要点（`eval_rubrics`）→ 按需导出严格单行训练 JSONL（支持 `--timestamp`、按视频整块切验证集与 `--manifest`）。
-2. **脱稿 CoT 逆向补写流水线**（`npm run reasoning`）：支持按 `--profile all|standard|short` 与 `--tier short,medium,long` 过滤、分层均衡抽样（`--limit N --stratified`）或增量补齐（`--only-missing`）→ 无原稿逆向生成第一人称思考骨架 → 极简工程安全阀 + `reasoning-judge` 双关过滤 → 默认导出 `ms-swift 4.6.0` 所需的 `--format inline`（`<think>...</think>` 内联；也支持 `--format reasoning_content` 直调 HF `apply_chat_template`），默认 `--expand-turns` 按轮展开（历史轮纯正文，仅末轮带 CoT，配 `--loss_scale last_round`）。
-3. **独立对抗与陷阱评测流水线**（`data/eval.sqlite`，Schema v2，16 张表，`npm run eval`）：支持 `--profile adversarial`（6 类实战对抗题）与 `--profile trap`（4 类陷阱拒答题，`expectedBehavior = refuse`）两套独立评测体系；`ProbeWriter` 自主规划单篇 0–N 题（允许非实质文稿跳过）→ `ProbeCritic` 语义审题与去重 → 内置无原稿通用模型裸答试考回流（`bare_check` → `revise`）→ `ReferenceGenerator ⇄ ReferenceVerifier` 原稿核验（`pressure` 2–3 轮 / `trap` 1–2 轮由 `Adversary` 动态施压）→ `RubricExtractorV2` → 通用模型裸答难度标定（`easy`/`medium`/`hard`）→ 套卷冻结（`indist-*` / `adv-*` / `trap-*`）→ 候选模型脱稿作答（默认注入 [prompts/eval/candidate-system.md](prompts/eval/candidate-system.md)）、v3 整体语义批卷与跨模型对比报告。
+1. **主数据合成流水线**（`npm run dm -- synth`，`data/data-maker.sqlite`，14 张表）：多 P 视频自适应合并/超长按分 P 切块 → `--sort core-first` 核心理论课优先或 `--shuffle` 抽选 → 按字数动态紧凑配额（2–6 题）出题 → 支持 `--profile standard | short | trap` 三套专职 Skill 预设（及一键 `--preset train-standard | train-short | train-trap | test-freeze | dpo-pool`），由 `followup` Agent 自主决定继续追问或收束 → 可选抽取结构化评分要点（`eval_rubrics`）→ 按需导出严格单行训练 JSONL（支持 `--preset train-val`、`--timestamp`、按视频整块切验证集与 `--manifest`）。
+2. **脱稿 CoT 逆向补写流水线**（`npm run dm -- cot`）：支持按 `--profile all|standard|short` 与 `--tier short,medium,long` 过滤、分层均衡抽样（`--preset pilot` / `--limit N --stratified`）或增量补齐（`--preset full` / `--only-missing`）→ 无原稿逆向生成第一人称思考骨架 → 极简工程安全阀 + `reasoning-judge` 双关过滤 → 默认导出 `ms-swift 4.6.0` 所需的 `--format inline`（`<think>...</think>` 内联；也支持 `--format reasoning_content` 直调 HF `apply_chat_template`），默认按轮展开（历史轮纯正文，仅末轮带 CoT，配 `--loss_scale last_round`）。
+3. **独立对抗与陷阱评测流水线**（`npm run dm -- eval`，`data/eval.sqlite`，Schema v2，16 张表）：支持 `--preset adv-full | adv-fast | trap` 两套独立评测体系（6 类实战对抗题 + 4 类陷阱拒答题）；`ProbeWriter` 自主规划单篇 0–N 题 → `ProbeCritic` 语义审题与去重 → 内置无原稿通用模型裸答试考回流（`bare_check` → `revise`）→ `ReferenceGenerator ⇄ ReferenceVerifier` 原稿核验（`pressure` 2–3 轮 / `trap` 1–2 轮由 `Adversary` 动态施压）→ `RubricExtractorV2` → 通用模型裸答难度标定（`easy`/`medium`/`hard`）→ 套卷冻结（`indist-*` / `adv-*` / `trap-*`）→ 候选模型脱稿作答（支持一键 `eval evaluate` 串联 `run + grade + report`）、v3 整体语义批卷与跨模型对比报告。
+
+代码目录按业务域物理分层，零循环依赖、非 Store 模块零裸 SQL，并通过自动化架构守卫（[test/architecture.test.ts](test/architecture.test.ts)）持续验证：
+
+- `src/cli/`：统一单入口 CLI（`index.ts` 路由至 `synth.ts` / `cot.ts` / `eval.ts`）
+- `src/synth/`：主问答合成域（`workflows.ts` / `presets.ts` / `skills.ts` / `corpus.ts` / `dialogue-loop.ts` / `store/*`）
+- `src/reasoning/`：脱稿 CoT 补写域（`workflows.ts` / `presets.ts` / `engine.ts` / `checks.ts` / `export.ts` / `store.ts`）
+- `src/eval/`：物理隔离评测域（`workflows.ts` / `presets.ts` / `probe-loop.ts` + `probe-stage-*.ts` / `calibrate.ts` / `eval-runner.ts` / `eval-grader.ts` / `inspect.ts` / `report.ts` / `store/*`）
+- `src/shared/`：底层叶子工具（`pi-runner.ts` / `concurrency.ts` / `retry.ts` / `schema.ts` / `skill-loader.ts` / `cli-helpers.ts` / `paths.ts` / `utils.ts`）
 
 ---
 
@@ -103,89 +107,86 @@ LLM_TIMEOUT_MS=180000
 | CoT 补写角色 | `REASONING_{BASE_URL,MODEL,API_KEY,THINKING_LEVEL,MAX_TOKENS,TIMEOUT_MS}` | 独立指定 `reasoning-writer` 模型 |
 | CoT 质检角色 | `REASONING_JUDGE_{BASE_URL,MODEL,API_KEY,THINKING_LEVEL,TIMEOUT_MS}` | 独立指定 `reasoning-judge` 模型（未设时回退 `REASONING_*` → `LLM_*`） |
 | 独立对抗评测角色 | `EVAL_LLM_{BASE_URL,MODEL,API_KEY,THINKING_LEVEL,TIMEOUT_MS}` | 独立指定评测出题、核验、裸答标定与批卷裁判模型 |
-| 被测候选模型 | `CANDIDATE_LLM_{BASE_URL,MODEL,API_KEY,MAX_TOKENS,TIMEOUT_MS}` | `npm run eval -- run` 脱稿盲测时的默认候选模型接口 |
+| 被测候选模型 | `CANDIDATE_LLM_{BASE_URL,MODEL,API_KEY,MAX_TOKENS,TIMEOUT_MS}` | `npm run dm -- eval run / evaluate` 脱稿盲测时的默认候选模型接口 |
 | 候选模型系统提示词 | `CANDIDATE_LLM_SYSTEM_PROMPT` / `CANDIDATE_LLM_SYSTEM_PROMPT_FILE` | 覆盖 `eval run` 默认加载的 `prompts/eval/candidate-system.md`（可用 `--no-system-prompt` 关闭） |
 
 ---
 
-## 5. 常用命令速查
+## 5. 常用命令速查（统一入口 `npm run dm`）
 
-完整的日常生产、实时进度排查 SQL 与故障恢复手册见 [生产操作手册（docs/production-workflow.md）](docs/production-workflow.md)。
+所有命令均收敛在统一入口 `npm run dm -- <synth|cot|eval|demo|presets>` 下，内置常用任务预设（任何显式参数均可覆盖预设字段），随时运行 `npm run dm -- presets` 查看完整预设清单。完整的生产排查 SQL 与故障恢复手册见 [生产操作手册（docs/production-workflow.md）](docs/production-workflow.md)。
 
-### 5.1 主数据合成与三分区导出（`npm run batch` / `export`）
+### 5.1 主数据合成与三分区导出（`npm run dm -- synth`）
 
 ```powershell
 # 查看语料库 train / test / dpo 三分区进度与待质检题数（离线，不调用模型）
-npm run batch -- --status
+npm run dm -- synth status
 
-# 生产 standard（中长深挖，默认 3 轮）、short（极短/短答，默认 2 轮）、trap（陷阱拒答，默认 2 轮/单视频上限 3 题）训练样本
-npm run batch -- --limit 20 --sort core-first --export output/train-batch.jsonl
-npm run batch -- --profile short --limit 20 --shuffle --export output/train-short.jsonl
-npm run batch -- --profile trap --limit 20 --shuffle --export output/train-trap.jsonl
+# 使用内置预设一键生产 standard / short / trap 训练样本（显式参数可覆盖任意默认项）
+npm run dm -- synth run --preset train-standard --limit 20 --export output/train-batch.jsonl
+npm run dm -- synth run --preset train-short --limit 20 --export output/train-short.jsonl
+npm run dm -- synth run --preset train-trap --limit 20 --export output/train-trap.jsonl
 
-# 生产 test 分区同分布盲测集 + 抽取每轮结构化评分卡 (--extract-rubric) + 冻结不可变版本 test-v1
-npm run batch -- --split test --limit 10 --shuffle --extract-rubric --freeze-version test-v1 --export output/test-v1.jsonl
+# 生产 test 分区同分布盲测集（自动抽取 eval_rubrics）+ 冻结不可变版本 test-v1
+npm run dm -- synth run --preset test-freeze --limit 10 --freeze-version test-v1 --export output/test-v1.jsonl
 
 # 生产 dpo 分区 On-policy 采题池（与 test 分区物理隔离）
-npm run batch -- --split dpo --limit 10 --shuffle --extract-rubric --export output/dpo-pool.jsonl
+npm run dm -- synth run --preset dpo-pool --limit 10 --export output/dpo-pool.jsonl
 
 # 汇总导出全库所有正式 train 样本，按整视频切出 10% 验证集 + 时间戳 + 审计清单
-npm run export -- --all-formal --dedup latest --shuffle --seed 42 --timestamp --out output/train.jsonl --val-out output/val.jsonl --val-ratio 0.1 --manifest output/manifest.json
+npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl --manifest output/manifest.json
 ```
 
-也可分步调用 [src/question-cli.ts](src/question-cli.ts)（`npm run questions`）、[src/judge-cli.ts](src/judge-cli.ts)（`npm run judge -- --only-unjudged [--profile standard|short|trap]`）或单文件组合入口 [src/cli.ts](src/cli.ts)（`npm start`）。
+也可分步调用 `npm run dm -- synth questions`（单独出题）或 `npm run dm -- synth judge --only-unjudged [--profile standard|short|trap]`（单独补跑未质检题）。
 
-### 5.2 脱稿 CoT 思考链逆向补写（`npm run reasoning`）
+### 5.2 脱稿 CoT 思考链逆向补写（`npm run dm -- cot`）
 
 ```powershell
 # 查看已通过问答轮次（按 standard/short 风格与 short/medium/long 档位统计）与历史补写运行
-npm run reasoning -- --status
+npm run dm -- cot status
 
-# 30 轮分层试点（按 profile × tier × turnNo 均衡抽样），并发补写 + 双重质检 + 导出 inline JSONL 与人工审阅稿
-npm run reasoning -- --limit 30 --stratified --seed 42 --concurrency 10 --export output/cot-pilot.jsonl --review-md output/cot-pilot-review.md --manifest output/cot-pilot-manifest.json
+# 30 轮分层试点（内置 pilot 预设），并发补写 + 双重质检 + 导出 inline JSONL 与人工审阅稿
+npm run dm -- cot backfill --preset pilot --export output/cot-pilot.jsonl --review-md output/cot-pilot-review.md --manifest output/cot-pilot-manifest.json
 
-# 全量增量补写剩余未通过轮次（支持按 --profile standard|short 或 --tier long 过滤）
-npm run reasoning -- --only-missing --concurrency 10 --export output/train-cot.jsonl --val-out output/val-cot.jsonl --val-ratio 0.05 --shuffle --seed 42 --manifest output/train-cot-manifest.json
+# 全量增量补写剩余未通过轮次（内置 full 预设；支持按 --profile standard|short 或 --tier long 过滤）
+npm run dm -- cot backfill --preset full --export output/train-cot.jsonl --val-out output/val-cot.jsonl --val-ratio 0.05 --shuffle --seed 42 --manifest output/train-cot-manifest.json
 
-# 离线从指定 reasoning_run 导出（默认 --format inline 适配 ms-swift 4.6.0；直调 HF 可选 --format reasoning_content）
-npm run reasoning -- --export-only --reasoning-run 2 --format inline --expand-turns --export output/train-cot.jsonl --review-md output/cot-review.md
+# 离线从指定 reasoning_run 导出（默认 inline + 按轮展开适配 ms-swift 4.6.0；直调 HF 可选 --format reasoning_content）
+npm run dm -- cot export --preset train-cot --reasoning-run 2 --out output/train-cot.jsonl --review-md output/cot-review.md
 ```
 
-### 5.3 独立评测库与对抗 / 陷阱盲测流水线（`npm run eval`）
+### 5.3 独立评测库与对抗 / 陷阱盲测流水线（`npm run dm -- eval`）
 
 ```powershell
 # 1. 初始化独立评测库 data/eval.sqlite，并将主库 test-v1 只读镜像为同分布基准卷 indist-v1
-npm run eval -- init
-npm run eval -- mirror --from-version test-v1 --as indist-v1
+npm run dm -- eval init
+npm run dm -- eval mirror --from-version test-v1 --as indist-v1
 
-# 2. 从主库 test 分区只读导入未用视频快照，并运行 Agent Loop v3（默认内置裸答回流，可选 --no-bare-check）
-npm run eval -- import --limit 10 --shuffle --seed 42 --exclude-used
-npm run eval -- build --profile adversarial --videos imported --probes-per-video 6 --concurrency 8 --call-attempts 3
-npm run eval -- build --profile trap --videos imported --probes-per-video 3 --concurrency 8 --call-attempts 3
+# 2. 从主库 test 分区只读导入未用视频快照，并按预设运行 Agent Loop v3
+npm run dm -- eval import --preset test-fresh
+npm run dm -- eval build --preset adv-full
+npm run dm -- eval build --preset trap
 
 # 3. 通用模型无原稿裸答难度标定（easy / medium / hard）并按 profile 冻结不可变套卷
-npm run eval -- calibrate --run all --only-uncalibrated --concurrency 8 --out output/eval/calibration-report.md
-npm run eval -- freeze --name adv-main-v1 --profile adversarial --max-easy-ratio 0.2 --export output/eval/adv-main-v1.jsonl --manifest-out output/eval/adv-main-v1.manifest.json
-npm run eval -- freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
+npm run dm -- eval calibrate --run all --only-uncalibrated --concurrency 8 --out output/eval/calibration-report.md
+npm run dm -- eval freeze --name adv-main-v1 --profile adversarial --export output/eval/adv-main-v1.jsonl --manifest-out output/eval/adv-main-v1.manifest.json
+npm run dm -- eval freeze --name trap-main-v1 --profile trap --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
 
-# 4. 对候选模型执行脱稿盲测（默认加载 prompts/eval/candidate-system.md）、整体语义批卷与跨模型对比报告
-npm run eval -- run --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --history-mode gold
-npm run eval -- grade --run latest --concurrency 8
-npm run eval -- compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
+# 4. 一键串联候选模型脱稿盲测 + 批卷 + 出报告（eval evaluate），或拆分为 eval run + eval grade
+npm run dm -- eval evaluate --preset blind-gold --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --out output/eval/sft-v1.md
+npm run dm -- eval compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
 ```
 
-### 5.4 上游清洗、旧库迁移与 ModelScope 数据集发布
+### 5.4 上游清洗与 ModelScope 数据集发布
 
 本项目基于上述流水线产出的公开资源：
 - **训练集与评测集**：[ModelScope · chosenecho/vmz-sft-cot-eval](https://www.modelscope.cn/datasets/chosenecho/vmz-sft-cot-eval)
 - **微调模型权重（ep1.5 Checkpoint，FP8）**：[ModelScope · chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep15-fp8)
+- **微调模型权重（ep2.0 Checkpoint，FP8）**：[ModelScope · chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep20-fp8](https://www.modelscope.cn/models/chosenecho/qwen3.8-27b-sft-cot-vmz-r2-ep20-fp8)
 
 ```powershell
 # 从上游只读文稿仓无损清洗并按 BV 号导出 Markdown 语料目录（Python 3.12+ 标准库）
 python scripts/weimingzi/export_weimingzi.py --source data/weimingzi-source --output data/weimingzi-semantic
-
-# 将早期原型库与试跑目录幂等迁移至 data/data-maker.sqlite
-npm run migrate
 
 # 校验、脱敏并打包 CoT 训练集与冻结评测集（生成 Dataset Card 与 SHA256SUMS.txt），按需发布到 ModelScope
 python scripts/publish_modelscope.py prepare --release-dir output/modelscope-release --repo-id <namespace>/<dataset>
@@ -224,7 +225,7 @@ python scripts/publish_modelscope.py upload --repo-id <namespace>/<dataset> --re
 **当前状态**：`v0.1.0`（活跃维护）。主库 14 张表、独立评测库 16 张表（Schema v2）与上述三条核心流水线均已全量落地并通过自动化回归测试。
 
 ```powershell
-# 运行 TypeScript 类型检查 + 124 项单元与集成测试
+# 运行 TypeScript 类型检查 + 全部单元、集成与架构守卫测试
 npm run check
 
 # 运行 Python 语料无损清洗脚本的 20 项单元测试

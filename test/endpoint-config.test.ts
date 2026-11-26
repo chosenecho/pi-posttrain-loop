@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readCandidateConfig, createOpenAiCandidateRunner } from "../src/eval/candidate-client.js";
-import { readEvalPiConfig } from "../src/pi-runner.js";
-import { readReasoningPiConfigs } from "../src/reasoning-engine.js";
+import { readEvalPiConfig } from "../src/shared/pi-runner.js";
+import { readReasoningPiConfigs } from "../src/reasoning/engine.js";
 import { normalizeApiBaseUrl } from "../src/shared/api-config.js";
 
 const mainEnv = {

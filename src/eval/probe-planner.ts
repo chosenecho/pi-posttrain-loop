@@ -6,7 +6,7 @@ import {
   type ExpectedBehavior,
   type ProbeType,
   type SourceMaterialRecord,
-} from "./eval-db.js";
+} from "./store/index.js";
 
 export const PROBE_PERSONAS = [
   "学生",

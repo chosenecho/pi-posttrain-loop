@@ -1,16 +1,15 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { DataMakerStore, extractVideoKey } from "../db.js";
-import { nonEmpty } from "../schema.js";
+import { nonEmpty } from "../shared/schema.js";
+import { extractVideoKey, nowIso, sha256Hex } from "../shared/utils.js";
+import { DataMakerStore } from "../synth/store/index.js";
 import {
   EvalStore,
-  nowIso,
-  sha256Hex,
   type DifficultyLevel,
   type ProbeRecord,
   type ProbeType,
   type SourceMaterialRecord,
-} from "./eval-db.js";
+} from "./store/index.js";
 import { charNgramJaccard, DUPLICATE_NGRAM_THRESHOLD } from "./probe-schema.js";
 import { verifySourceSplits } from "./source-import.js";
 
@@ -85,11 +84,7 @@ function scanTrainQuestionSimilarity(
       splitByKey.set(row.video_key, row.split);
     }
 
-    const rows = mainStore.db.prepare(`
-      SELECT q.question, m.video_id
-      FROM questions q
-      JOIN materials m ON m.id = q.material_id
-    `).all() as Array<{ question: string; video_id: string }>;
+    const rows = mainStore.listAllQuestionsWithVideoId();
 
     const trainQuestions: string[] = [];
     for (const row of rows) {

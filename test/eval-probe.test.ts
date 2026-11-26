@@ -11,7 +11,7 @@ import {
   EVAL_SCHEMA_VERSION,
   EvalStore,
   TRAP_PROBE_TYPES,
-} from "../src/eval/eval-db.js";
+} from "../src/eval/store/index.js";
 import { loadCalibrationPromptBundle, loadEvalPromptBundle } from "../src/eval/eval-prompts.js";
 import { runProbeBuild } from "../src/eval/probe-loop.js";
 import {
@@ -33,7 +33,7 @@ import {
   parseVerifierReview,
   verifyAnchorInMaterial,
 } from "../src/eval/probe-schema.js";
-import type { RoleRunner } from "../src/types.js";
+import type { RoleRunner } from "../src/shared/types.js";
 
 const execFileAsync = promisify(execFile);
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -429,22 +429,22 @@ test("runProbeBuild runs Agent Loop v3 (autonomous planning, skip, semantic dedu
   }
 });
 
-test("eval-cli supports --help, init, and status offline without API keys", async () => {
+test("eval CLI supports --help, init, and status offline without API keys", async () => {
   const dir = await mkdtemp(join(tmpdir(), "eval-cli-"));
   try {
     const evalDb = join(dir, "eval.sqlite");
-    const helpRes = await execFileAsync(process.execPath, [TSX_CLI, join(ROOT, "src/eval-cli.ts"), "--help"]);
-    assert.match(helpRes.stdout, /独立评测库与对抗测试集生产 CLI/);
+    const helpRes = await execFileAsync(process.execPath, [TSX_CLI, join(ROOT, "src/cli/index.ts"), "eval", "--help"]);
+    assert.match(helpRes.stdout, /独立评测库与对抗/);
 
     const initRes = await execFileAsync(process.execPath, [
-      TSX_CLI, join(ROOT, "src/eval-cli.ts"), "init", "--eval-db", evalDb,
+      TSX_CLI, join(ROOT, "src/cli/index.ts"), "eval", "init", "--eval-db", evalDb,
     ]);
     const initJson = JSON.parse(initRes.stdout) as { action: string; schemaVersion: string };
     assert.equal(initJson.action, "init");
     assert.equal(initJson.schemaVersion, EVAL_SCHEMA_VERSION);
 
     const statusRes = await execFileAsync(process.execPath, [
-      TSX_CLI, join(ROOT, "src/eval-cli.ts"), "status", "--eval-db", evalDb,
+      TSX_CLI, join(ROOT, "src/cli/index.ts"), "eval", "status", "--eval-db", evalDb,
     ]);
     const statusJson = JSON.parse(statusRes.stdout) as { sourceMaterials: number };
     assert.equal(statusJson.sourceMaterials, 0);

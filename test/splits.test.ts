@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { selectVideos, type VideoUnit } from "../src/corpus.js";
-import { DataMakerStore } from "../src/db.js";
-import { runDialogueBatch } from "../src/dialogue-loop.js";
-import { readEvalRubricSkill } from "../src/io.js";
-import { evalRubricPrompt, readRubricPrompt } from "../src/prompts.js";
-import { parseEvalRubric, validateSplit } from "../src/schema.js";
+import { selectVideos, type VideoUnit } from "../src/synth/corpus.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
+import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
+import { readEvalRubricSkill } from "../src/synth/skills.js";
+import { evalRubricPrompt, readRubricPrompt } from "../src/synth/prompts.js";
+import { parseEvalRubric, validateSplit } from "../src/shared/schema.js";
 import {
   backfillProcessedTrainSplits,
   computeHashBucket,
@@ -13,7 +13,7 @@ import {
   ensureVideoSplit,
   summarizeSplitCounts,
   syncCorpusSplits,
-} from "../src/splits.js";
+} from "../src/synth/splits.js";
 
 test("computeVideoSplit is deterministic, corpus-size invariant, and groups all multi-P chunks into the same split", () => {
   const baseKey = "BV1aU4y1b7mX";

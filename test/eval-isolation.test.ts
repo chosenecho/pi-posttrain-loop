@@ -7,9 +7,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { DataMakerStore } from "../src/db.js";
-import { assertNoEvalLeak, readEvalVideoKeys } from "../src/eval-guard.js";
-import { EvalStore } from "../src/eval/eval-db.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
+import { assertNoEvalLeak, readEvalVideoKeys } from "../src/synth/eval-guard.js";
+import { EvalStore } from "../src/eval/store/index.js";
 import { assertEvalAllowedSkillPath, readEvalSkill } from "../src/eval/eval-prompts.js";
 import { importTestSources, mirrorMainVersion, verifySourceSplits } from "../src/eval/source-import.js";
 import {
@@ -19,7 +19,7 @@ import {
   readFollowupSkill,
   readQuestionSkill,
   readRubric,
-} from "../src/io.js";
+} from "../src/synth/skills.js";
 
 const execFileAsync = promisify(execFile);
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -163,9 +163,11 @@ test("training code never imports src/eval/* (static import graph isolation)", a
   const allSrc = await listTsFiles(join(ROOT, "src"));
   const trainingFiles = allSrc.filter((filePath) => {
     const normalized = filePath.replace(/\\/g, "/");
-    return !normalized.includes("/src/eval/") && !normalized.endsWith("/src/eval-cli.ts");
+    return !normalized.includes("/src/eval/")
+      && !normalized.endsWith("/src/cli/eval.ts")
+      && !normalized.endsWith("/src/cli/index.ts");
   });
-  assert.ok(trainingFiles.length >= 15);
+  assert.ok(trainingFiles.length >= 25);
   for (const filePath of trainingFiles) {
     const code = await readFile(filePath, "utf8");
     const badImport = /(?:from\s+["'][^"']*\/eval\/[^"']*["']|import\s*\(\s*["'][^"']*\/eval\/[^"']*["']\s*\))/.test(code);
@@ -356,11 +358,12 @@ test("importTestSources, mirrorMainVersion, verifySourceSplits, and export-cli c
       assertNoEvalLeak(["BV_TRAIN_1"], evalKeys);
       assert.throws(() => assertNoEvalLeak(["BV_TRAIN_1", "BV_TEST_FRESH"], evalKeys), /测试集泄漏风险/);
 
-      // 7. End-to-end export-cli test: clean training export succeeds
+      // 7. End-to-end synth export test: clean training export succeeds
       const cleanOut = join(dir, "train-clean.jsonl");
       await execFileAsync(process.execPath, [
         TSX_CLI,
-        join(ROOT, "src/export-cli.ts"),
+        join(ROOT, "src/cli/index.ts"),
+        "synth", "export",
         "--db", mainDbPath,
         "--eval-db", evalDbPath,
         "--run", String(trainRunId),
@@ -368,7 +371,7 @@ test("importTestSources, mirrorMainVersion, verifySourceSplits, and export-cli c
       ]);
       assert.equal(existsSync(cleanOut), true);
 
-      // 8. Inject BV_TRAIN_1 into a poisoned eval DB and confirm export-cli blocks training export BEFORE writing file
+      // 8. Inject BV_TRAIN_1 into a poisoned eval DB and confirm synth export blocks training export BEFORE writing file
       const poisonedEvalDb = join(dir, "eval-poisoned.sqlite");
       const poisonedStore = new EvalStore(poisonedEvalDb);
       poisonedStore.insertSourceMaterial({
@@ -384,7 +387,8 @@ test("importTestSources, mirrorMainVersion, verifySourceSplits, and export-cli c
       await assert.rejects(
         () => execFileAsync(process.execPath, [
           TSX_CLI,
-          join(ROOT, "src/export-cli.ts"),
+          join(ROOT, "src/cli/index.ts"),
+          "synth", "export",
           "--db", mainDbPath,
           "--eval-db", poisonedEvalDb,
           "--run", String(trainRunId),

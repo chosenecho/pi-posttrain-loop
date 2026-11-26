@@ -1,4 +1,4 @@
-import { asObject, nonEmpty, parseJson } from "../schema.js";
+import { asObject, nonEmpty, parseJson } from "../shared/schema.js";
 import {
   ADVERSARY_TACTICS,
   EXPECTED_BEHAVIOR_BY_TYPE,
@@ -7,7 +7,7 @@ import {
   type AdversaryTactic,
   type ExpectedBehavior,
   type ProbeType,
-} from "./eval-db.js";
+} from "./store/index.js";
 
 /** Kept only for read-only train-overlap audit reporting in suite-freeze (never used as a build kill switch). */
 export const DUPLICATE_NGRAM_THRESHOLD = 0.6;

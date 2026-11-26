@@ -6,11 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { DataMakerStore } from "../src/db.js";
-import { runDialogueBatch } from "../src/dialogue-loop.js";
-import { createUnifiedSaveQuestionsTool } from "../src/question-store.js";
-import { parseFollowup } from "../src/schema.js";
-import type { RoleRequest } from "../src/types.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
+import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
+import { createUnifiedSaveQuestionsTool } from "../src/synth/question-store.js";
+import { parseFollowup } from "../src/shared/schema.js";
+import type { RoleRequest } from "../src/shared/types.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -401,14 +401,14 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
     LLM_TIMEOUT_MS: "5000",
   };
 
-  // 1. Run question-cli into unified SQLite
-  const qRes = await runCli("src/question-cli.ts", ["--input", transcriptPath, "--db", dbPath, "--video-id", "BV-e2e/P001"], env);
+  // 1. Run synth questions into unified SQLite
+  const qRes = await runCli("src/cli/index.ts", ["synth", "questions", "--input", transcriptPath, "--db", dbPath, "--video-id", "BV-e2e/P001"], env);
   assert.equal(qRes.code, 0, qRes.stderr);
 
-  // 2. Run judge-cli with --max-turns 2 and --export + --system
+  // 2. Run synth judge with --max-turns 2 and --export + --system
   const jRes = await runCli(
-    "src/judge-cli.ts",
-    ["--db", dbPath, "--max-turns", "2", "--max-attempts", "2", "--export", exportPath, "--system", "你是作者本人。"],
+    "src/cli/index.ts",
+    ["synth", "judge", "--db", dbPath, "--max-turns", "2", "--max-attempts", "2", "--export", exportPath, "--system", "你是作者本人。"],
     env,
   );
   assert.equal(jRes.code, 0, jRes.stderr);
@@ -427,20 +427,20 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
     ],
   });
 
-  // 3. Running judge-cli again with --only-unjudged skips already-judged 2-turn question with 0 extra model calls
+  // 3. Running synth judge again with --only-unjudged skips already-judged 2-turn question with 0 extra model calls
   const callsBeforeSkip = step;
   const skipRes = await runCli(
-    "src/judge-cli.ts",
-    ["--db", dbPath, "--max-turns", "2", "--only-unjudged"],
+    "src/cli/index.ts",
+    ["synth", "judge", "--db", dbPath, "--max-turns", "2", "--only-unjudged"],
     env,
   );
   assert.equal(skipRes.code, 0, skipRes.stderr);
   assert.equal(step, callsBeforeSkip, "--only-unjudged must not invoke model when all questions are judged");
   assert.match(skipRes.stdout, /"selectedQuestions": 0/);
 
-  // 4. Verify export-cli independently without --system and with --all-formal + --manifest
+  // 4. Verify synth export independently without --system and with --all-formal + --manifest
   const exportNoSysPath = join(dir, "train-no-sys.jsonl");
-  const eRes = await runCli("src/export-cli.ts", ["--db", dbPath, "--run", "2", "--out", exportNoSysPath]);
+  const eRes = await runCli("src/cli/index.ts", ["synth", "export", "--db", dbPath, "--run", "2", "--out", exportNoSysPath]);
   assert.equal(eRes.code, 0, eRes.stderr);
   const noSysLine = JSON.parse((await readFile(exportNoSysPath, "utf8")).trimEnd()) as { messages: Array<{ role: string; content: string }> };
   assert.equal(noSysLine.messages.length, 4);
@@ -448,8 +448,8 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
 
   const allFormalOut = join(dir, "train-all-formal.jsonl");
   const manifestOut = join(dir, "train-manifest.json");
-  const allRes = await runCli("src/export-cli.ts", [
-    "--db", dbPath, "--all-formal", "--out", allFormalOut, "--manifest", manifestOut,
+  const allRes = await runCli("src/cli/index.ts", [
+    "synth", "export", "--db", dbPath, "--all-formal", "--out", allFormalOut, "--manifest", manifestOut,
   ]);
   assert.equal(allRes.code, 0, allRes.stderr);
   const manifest = JSON.parse(await readFile(manifestOut, "utf8")) as {
@@ -462,8 +462,8 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
 
   const tsOutBase = join(dir, "train-ts.jsonl");
   const tsManifestBase = join(dir, "train-ts-manifest.json");
-  const tsRes = await runCli("src/export-cli.ts", [
-    "--db", dbPath, "--all-formal", "--out", tsOutBase, "--manifest", tsManifestBase, "--timestamp",
+  const tsRes = await runCli("src/cli/index.ts", [
+    "synth", "export", "--db", dbPath, "--all-formal", "--out", tsOutBase, "--manifest", tsManifestBase, "--timestamp",
   ]);
   assert.equal(tsRes.code, 0, tsRes.stderr);
   const tsReport = JSON.parse(tsRes.stdout) as {

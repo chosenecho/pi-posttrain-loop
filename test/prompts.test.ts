@@ -4,11 +4,19 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { DataMakerStore } from "../src/db.js";
-import { runMaterialsToStore } from "../src/pipeline.js";
-import { parseReview } from "../src/schema.js";
-import { DEFAULT_PROMPTS_DIR, followupPrompt, judgePrompt, questionPrompt, readFollowupPrompt, readSystemPrompts } from "../src/prompts.js";
-import type { Role, RoleRequest, SystemPrompts } from "../src/types.js";
+import { parseReview } from "../src/shared/schema.js";
+import type { Role, RoleRequest, SystemPrompts } from "../src/shared/types.js";
+import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
+import {
+  answerPrompt,
+  DEFAULT_PROMPTS_DIR,
+  followupPrompt,
+  judgePrompt,
+  questionPrompt,
+  readFollowupPrompt,
+  readSystemPrompts,
+} from "../src/synth/prompts.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 
 const custom: SystemPrompts = {
   question: "CUSTOM question system prompt",
@@ -97,50 +105,47 @@ test("role prompt composers embed each Skill inside its dedicated tag without le
   assert.ok(!prompt.includes(custom.answer));
 });
 
-test("pipeline injects independent system prompts and isolated Skills for all roles and snapshots them in SQLite", async (t) => {
+test("dialogue loop injects independent system prompts and isolated Skills and snapshots them in SQLite", async (t) => {
   const store = new DataMakerStore(":memory:");
   t.after(() => store.close());
 
+  const material = store.upsertMaterial({ videoId: "prompt-source", content: "项目在周五交付。" });
+  store.insertQuestion({ materialId: material.id, question: "何时交付？" });
+
   const calls: RoleRequest[] = [];
-  const questionSkill = { status: "ready", body: "QUESTION SKILL 正文", sha256: "q-skill-hash" } as const;
   const answerStyle = { status: "ready", body: "STYLE 回答风格正文", sha256: "style-hash" } as const;
   const skillBody = "检查回答是否覆盖当前问题。";
-  const run = await runMaterialsToStore({
+  const expectedAnswer = answerPrompt(custom.answer, answerStyle.body);
+  const expectedJudge = judgePrompt(custom.judge, skillBody);
+
+  const summary = await runDialogueBatch({
     store,
-    materials: [{ id: "prompt-source", text: "项目在周五交付。" }],
-    direction: "事实提取",
-    questionSkill,
-    rubric: { status: "ready", body: skillBody, sha256: "prompt-test-hash" },
-    answerStyle,
-    prompts: custom,
+    prompts: { answer: expectedAnswer, judge: expectedJudge },
+    maxAttempts: 2,
+    maxTurns: 1,
+    concurrency: 1,
+    config: { mode: "test" },
+    skills: [
+      { name: "answer-style", status: answerStyle.status, sha256: answerStyle.sha256 },
+      { name: "quality-judge", status: "ready", sha256: "prompt-test-hash" },
+    ],
     runRole: async (request) => {
       calls.push(request);
-      if (request.role === "question") return '{"questions":["何时交付？"]}';
       if (request.role === "answer") return "周五交付。";
       return '{"decision":"pass","issues":[],"feedback":""}';
     },
   });
 
-  assert.equal(run.integrityOk, true);
-  assert.equal(run.dialogue?.results, 1);
-  assert.deepEqual(run.dialogue?.outcomes, { pass: 1 });
-  assert.deepEqual(calls.map(({ role }) => role), ["question", "answer", "judge"]);
-  const expectedQuestion = `${custom.question}\n\n<question-design>\n${questionSkill.body}\n</question-design>`;
-  const expectedAnswer = `${custom.answer}\n\n<answer-style>\n${answerStyle.body}\n</answer-style>`;
-  const expectedJudge = `${custom.judge}\n\n<judging-skill>\n${skillBody}\n</judging-skill>`;
-  assert.equal(calls[0].systemPrompt, expectedQuestion);
-  assert.equal(calls[1].systemPrompt, expectedAnswer);
-  assert.ok(!calls[1].systemPrompt.includes(skillBody));
-  assert.ok(!calls[2].systemPrompt.includes(answerStyle.body));
-  assert.equal(calls[2].systemPrompt, expectedJudge);
+  assert.equal(summary.integrityOk, true);
+  assert.equal(summary.results, 1);
+  assert.deepEqual(summary.outcomes, { pass: 1 });
+  assert.deepEqual(calls.map(({ role }) => role), ["answer", "judge"]);
+  assert.equal(calls[0].systemPrompt, expectedAnswer);
+  assert.ok(!calls[0].systemPrompt.includes(skillBody));
+  assert.ok(!calls[1].systemPrompt.includes(answerStyle.body));
+  assert.equal(calls[1].systemPrompt, expectedJudge);
 
-  // Verify SQLite prompt & skill snapshots match exactly
-  const qRun = store.db.prepare("SELECT prompts_json, skills_json FROM runs WHERE id = ?").get(run.questionRunId) as {
-    prompts_json: string; skills_json: string;
-  };
-  assert.deepEqual(JSON.parse(qRun.prompts_json), { question: expectedQuestion });
-  assert.equal((JSON.parse(qRun.skills_json) as Array<{ name: string }>)[0].name, "question-design");
-  const jRun = store.db.prepare("SELECT prompts_json, skills_json FROM runs WHERE id = ?").get(run.judgeRunId!) as {
+  const jRun = store.db.prepare("SELECT prompts_json, skills_json FROM runs WHERE id = ?").get(summary.runId) as {
     prompts_json: string; skills_json: string;
   };
   assert.deepEqual(JSON.parse(jRun.prompts_json), { answer: expectedAnswer, judge: expectedJudge });

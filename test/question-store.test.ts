@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
-import { DataMakerStore } from "../src/db.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 import {
   createSaveQuestionsTool,
   createUnifiedSaveQuestionsTool,
-} from "../src/question-store.js";
+} from "../src/synth/question-store.js";
 
 function database(): DatabaseSync {
   const db = new DatabaseSync(":memory:");

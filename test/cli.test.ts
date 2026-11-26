@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { DataMakerStore } from "../src/db.js";
+import { DataMakerStore } from "../src/synth/store/index.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -22,41 +22,53 @@ async function workspace(t: TestContext): Promise<string> {
   return directory;
 }
 
-async function cli(args: string[], env: Record<string, string> = {}, entry = "src/cli.ts") {
-  const child = spawn(process.execPath, ["--import", "tsx", entry, ...args], {
+async function dm(args: string[], env: Record<string, string> = {}) {
+  const child = spawn(process.execPath, ["--import", "tsx", "src/cli/index.ts", ...args], {
     cwd: ROOT,
-    env: { ...process.env, LLM_API_KEY: "fixture-project-key", LLM_MODEL: "fixture", ...env },
+    env: { ...process.env, LLM_API_KEY: "test-project-key", LLM_MODEL: "fixture", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (text: string) => { stdout += text; });
   child.stderr.setEncoding("utf8").on("data", (text: string) => { stderr += text; });
-  const code = await new Promise<number | null>((resolve, reject) => {
+  const code = await new Promise<number | null>((resolveCode, reject) => {
     child.once("error", reject);
-    child.once("close", resolve);
+    child.once("close", resolveCode);
   });
   return { code, stdout, stderr };
 }
 
-test("CLI help works without model configuration", async () => {
-  const result = await cli(["--help"], { LLM_API_KEY: "", LLM_MODEL: "" });
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /--db/);
-  assert.match(result.stdout, /--question-skill/);
-  assert.match(result.stdout, /--followup-skill/);
-  assert.match(result.stdout, /--max-attempts/);
-  assert.match(result.stdout, /--max-turns/);
-  assert.match(result.stdout, /--concurrency/);
-  assert.match(result.stdout, /--export/);
-  assert.match(result.stdout, /--prompts/);
-  assert.match(result.stdout, /--answer-style/);
+test("unified CLI help and presets listing work offline without model configuration", async () => {
+  const cleanEnv = { LLM_API_KEY: "", LLM_MODEL: "" };
+
+  const rootHelp = await dm(["--help"], cleanEnv);
+  assert.equal(rootHelp.code, 0, rootHelp.stderr);
+  assert.match(rootHelp.stdout, /synth/);
+  assert.match(rootHelp.stdout, /cot/);
+  assert.match(rootHelp.stdout, /eval/);
+  assert.match(rootHelp.stdout, /presets/);
+
+  const presetsRes = await dm(["presets"], cleanEnv);
+  assert.equal(presetsRes.code, 0, presetsRes.stderr);
+  assert.match(presetsRes.stdout, /train-standard/);
+  assert.match(presetsRes.stdout, /train-val/);
+  assert.match(presetsRes.stdout, /pilot/);
+  assert.match(presetsRes.stdout, /adv-full/);
+  assert.match(presetsRes.stdout, /blind-gold/);
+
+  const synthRunHelp = await dm(["synth", "run", "--help"], cleanEnv);
+  assert.equal(synthRunHelp.code, 0, synthRunHelp.stderr);
+  assert.match(synthRunHelp.stdout, /--preset/);
+  assert.match(synthRunHelp.stdout, /--db/);
+  assert.match(synthRunHelp.stdout, /--max-turns/);
+  assert.match(synthRunHelp.stdout, /--concurrency/);
 });
 
-test("offline CLI demo writes unified SQLite results and outcomes with training_enabled=false", async (t) => {
+test("offline dm demo writes unified SQLite results and outcomes with training_enabled=false", async (t) => {
   const root = await workspace(t);
   const dbPath = join(root, "demo.sqlite");
-  const result = await cli(["--demo", "--db", dbPath], { LLM_API_KEY: "", LLM_MODEL: "" });
+  const result = await dm(["demo", "--db", dbPath], { LLM_API_KEY: "", LLM_MODEL: "" });
   assert.equal(result.code, 0, result.stderr);
 
   const store = new DataMakerStore(dbPath, { readOnly: true });
@@ -88,10 +100,10 @@ test("offline CLI demo writes unified SQLite results and outcomes with training_
   }
 });
 
-test("CLI honors max-attempts and records exhaustion without inserting into results", async (t) => {
+test("dm demo honors max-attempts and records exhaustion without inserting into results", async (t) => {
   const root = await workspace(t);
   const dbPath = join(root, "demo-1.sqlite");
-  const result = await cli(["--demo", "--max-attempts", "1", "--db", dbPath]);
+  const result = await dm(["synth", "demo", "--max-attempts", "1", "--db", dbPath]);
   assert.equal(result.code, 0, result.stderr);
 
   const store = new DataMakerStore(dbPath, { readOnly: true });
@@ -104,61 +116,66 @@ test("CLI honors max-attempts and records exhaustion without inserting into resu
   }
 });
 
-test("CLI rejects invalid options and input before creating SQLite database", async (t) => {
+test("unified CLI rejects invalid commands, presets, and options before creating SQLite database", async (t) => {
   const root = await workspace(t);
   const dbPath = join(root, "should-not-exist.sqlite");
-  assert.equal((await cli(["--demo", "--max-attempts", "0", "--db", dbPath])).code, 1);
-  assert.equal((await cli(["--demo", "--concurrency", "0", "--db", dbPath])).code, 1);
-  assert.equal((await cli(["--demo", "--concurrency", "501", "--db", dbPath])).code, 1);
-  assert.equal((await cli(["--demo", "--input", "custom.jsonl", "--db", dbPath])).code, 1);
-  assert.equal((await cli(["--demo", "--prompts", join(root, "missing"), "--db", dbPath])).code, 1);
+  assert.equal((await dm(["unknown-group"])).code, 1);
+  assert.equal((await dm(["demo", "--max-attempts", "0", "--db", dbPath])).code, 1);
+  assert.equal((await dm(["synth", "run", "--preset", "nonexistent", "--db", dbPath])).code, 1);
+  assert.equal((await dm(["synth", "run", "--concurrency", "0", "--db", dbPath])).code, 1);
+  assert.equal((await dm(["synth", "run", "--concurrency", "501", "--db", dbPath])).code, 1);
+  assert.equal((await dm(["synth", "judge", "--prompts", join(root, "missing"), "--db", dbPath])).code, 1);
   assert.deepEqual(await readdir(root), []);
 });
 
-test("live CLI preserves minimal wire inputs, isolated Skills, SQLite snapshots, and strict JSONL export over actual Pi", async (t) => {
+test("live dm synth judge preserves minimal wire inputs, isolated Skills, SQLite snapshots, and strict JSONL export over actual Pi", async (t) => {
   const root = await workspace(t);
   const dbPath = join(root, "live.sqlite");
-  const input = join(root, "materials.jsonl");
-  const qSkillPath = join(root, "question-skill.md");
   const readySkillPath = join(root, "ready-judge.md");
   const placeholderSkillPath = join(root, "placeholder-judge.md");
   const style = join(root, "style.md");
-  const qSkillBody = "QSKILL 出题标准。";
   const styleBody = "STYLE 只设置表达方式。TODO：待填写风格。";
   const styleFile = `---\nstatus: placeholder\n---\n${styleBody}\n`;
-  await writeFile(input, '{"id":"device","text":"供电电压12V。"}\n');
-  await writeFile(qSkillPath, `---\nstatus: ready\n---\n${qSkillBody}\n`);
   await writeFile(readySkillPath, "---\nstatus: ready\n---\n检查回答是否覆盖问题的要求。\n");
   await writeFile(placeholderSkillPath, "---\nstatus: placeholder\n---\nTODO 占位规则。\n");
   await writeFile(style, styleFile);
+
   const promptsDirectory = join(root, "prompts");
   await mkdir(promptsDirectory);
-  const systemPrompts = { question: "CUSTOM 出题 Agent", answer: "CUSTOM 回答 Agent", judge: "CUSTOM 质检 Agent" };
+  const systemPrompts = { answer: "CUSTOM 回答 Agent", judge: "CUSTOM 质检 Agent" };
   for (const [role, text] of Object.entries(systemPrompts)) {
     await writeFile(join(promptsDirectory, `${role}.md`), text);
   }
+
+  const question = "供电电压是多少？";
+  const feedback = "补充明确的供电电压数值。";
+  const seedStore = new DataMakerStore(dbPath);
+  try {
+    const material = seedStore.upsertMaterial({ videoId: "device", content: "供电电压12V。" });
+    seedStore.insertQuestion({ materialId: material.id, question });
+  } finally {
+    seedStore.close();
+  }
+
   const sentSystems: string[] = [];
   const sentInputs: Record<string, unknown>[] = [];
   const messageCounts: number[] = [];
   let calls = 0;
-  const question = "供电电压是多少？";
-  const feedback = "补充明确的供电电压数值。";
   const server = createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => { body += chunk; });
     request.on("end", () => {
-      const step = calls++ % 5;
+      const step = calls++ % 4;
       const payload = JSON.parse(body) as { messages: { content: string | { type: string; text?: string }[] }[] };
       const textOf = (content: typeof payload.messages[number]["content"]) => typeof content === "string"
         ? content : content.map((part) => part.text ?? "").join("");
       sentSystems.push(textOf(payload.messages[0].content));
       sentInputs.push(JSON.parse(textOf(payload.messages[1].content)) as Record<string, unknown>);
       messageCounts.push(payload.messages.length);
-      const text = step === 0 ? JSON.stringify({ questions: [question] })
-        : step === 1 ? "请按要求供电。"
-        : step === 2 ? JSON.stringify({ decision: "revise", issues: ["数值缺失"], feedback })
-        : step === 3 ? "供电电压为12V。"
+      const text = step === 0 ? "请按要求供电。"
+        : step === 1 ? JSON.stringify({ decision: "revise", issues: ["数值缺失"], feedback })
+        : step === 2 ? "供电电压为12V。"
         : '{"decision":"pass","issues":[],"feedback":""}';
       response.writeHead(200, { "Content-Type": "text/event-stream" });
       response.write(`data: ${JSON.stringify({ id: "test", object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] })}\n\n`);
@@ -166,10 +183,10 @@ test("live CLI preserves minimal wire inputs, isolated Skills, SQLite snapshots,
       response.end("data: [DONE]\n\n");
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   t.after(async () => {
     server.closeAllConnections();
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Expected local TCP address");
@@ -177,30 +194,27 @@ test("live CLI preserves minimal wire inputs, isolated Skills, SQLite snapshots,
 
   for (const ready of [false, true]) {
     const exportPath = join(root, ready ? "ready.jsonl" : "placeholder.jsonl");
-    const args = [
-      "--input", input, "--direction", "设备使用", "--db", dbPath,
+    const result = await dm([
+      "synth", "judge",
+      "--db", dbPath,
+      "--max-turns", "1",
       "--prompts", promptsDirectory,
-      "--question-skill", qSkillPath,
       "--answer-style", style,
-      "--skill", ready ? readySkillPath : placeholderSkillPath,
+      "--quality-judge", ready ? readySkillPath : placeholderSkillPath,
       "--export", exportPath,
-    ];
-    const result = await cli(args, env);
+    ], env);
     assert.equal(result.code, 0, result.stderr);
 
-    const offset = ready ? 5 : 0;
-    const sent = sentSystems.slice(offset, offset + 5);
-    const expectedQuestion = `${systemPrompts.question}\n\n<question-design>\n${qSkillBody}\n</question-design>`;
+    const offset = ready ? 4 : 0;
+    const sent = sentSystems.slice(offset, offset + 4);
     const expectedAnswer = `${systemPrompts.answer}\n\n<answer-style>\n${styleBody}\n</answer-style>`;
-    assert.equal(sent[0], expectedQuestion);
-    assert.equal(sent[1], expectedAnswer);
-    assert.equal(sent[3], expectedAnswer);
-    assert.ok(sent[2].startsWith(`${systemPrompts.judge}\n\n<judging-skill>\n`));
-    assert.equal(sent[2], sent[4]);
+    assert.equal(sent[0], expectedAnswer);
+    assert.equal(sent[2], expectedAnswer);
+    assert.ok(sent[1].startsWith(`${systemPrompts.judge}\n\n<judging-skill>\n`));
+    assert.equal(sent[1], sent[3]);
 
-    const inputs = sentInputs.slice(offset, offset + 5);
+    const inputs = sentInputs.slice(offset, offset + 4);
     assert.deepEqual(inputs, [
-      { material: { id: "device", text: "供电电压12V。" }, direction: "设备使用" },
       { material: "供电电压12V。", question },
       { material: "供电电压12V。", question, answer: "请按要求供电。" },
       { material: "供电电压12V。", question, previousAnswer: "请按要求供电。", feedback },
@@ -236,13 +250,13 @@ test("live CLI preserves minimal wire inputs, isolated Skills, SQLite snapshots,
     assert.equal(skills0[1].status, "placeholder");
 
     for (const run of judgeRuns) {
-      assert.equal(run.config_json.includes("fixture-project-key"), false);
+      assert.equal(run.config_json.includes("test-project-key"), false);
       assert.equal(store.exportRunSamples(run.id).length, 1);
     }
   } finally {
     store.close();
   }
 
-  assert.equal(calls, 10);
-  assert.deepEqual(messageCounts, Array(10).fill(2), "each model call starts with only system and current user input");
+  assert.equal(calls, 8);
+  assert.deepEqual(messageCounts, Array(8).fill(2), "each model call starts with only system and current user input");
 });
