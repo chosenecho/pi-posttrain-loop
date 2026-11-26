@@ -10,7 +10,7 @@ export type DedupPolicy = "latest" | "earliest" | "error";
 export type SynthProfile = "standard" | "short" | "trap";
 
 export type Role = "question" | "answer" | "judge";
-export type DialogueRole = Role | "followup" | "rubric";
+export type DialogueRole = Role | "followup";
 
 /** Roles used only by the isolated test-set probe pipeline (src/eval/*). */
 export type EvalRole =
@@ -19,7 +19,6 @@ export type EvalRole =
   | "reference"
   | "verifier"
   | "adversary"
-  | "rubric_v2"
   | "bare_answer"
   | "eval_grader"
   | "candidate";
@@ -58,13 +57,6 @@ export interface Review {
   decision: "pass" | "revise" | "drop";
   issues: string[];
   feedback: string;
-}
-
-export interface EvalRubric {
-  stance: string;
-  keyPoints: string[];
-  forbidden: string[];
-  mustNotHallucinate: string[];
 }
 
 export interface TrainingMessage {

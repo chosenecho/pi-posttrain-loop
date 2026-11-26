@@ -9,11 +9,7 @@ import {
 } from "../shared/retry.js";
 import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { CandidateRunner, ChatMessage } from "./candidate-client.js";
-import {
-  EvalStore,
-  type EvalHistoryMode,
-  type SuiteItemRecord,
-} from "./store/index.js";
+import { EvalStore, type EvalHistoryMode, type SuiteItemRecord } from "./store/index.js";
 
 export interface SuiteDialogueTurn {
   turnNo: number;
@@ -21,9 +17,6 @@ export interface SuiteDialogueTurn {
   referenceAnswer: string;
 }
 
-/**
- * Extracts ordered `(user, referenceAnswer)` turn pairs from a frozen suite item's `messages`.
- */
 export function extractSuiteDialogueTurns(item: Pick<SuiteItemRecord, "itemKey" | "messages">): SuiteDialogueTurn[] {
   const nonSystem = item.messages.filter((m) => m.role !== "system");
   if (nonSystem.length === 0 || nonSystem.length % 2 !== 0) {
@@ -53,7 +46,6 @@ export interface RunSuiteEvaluationOptions {
   candidate: string;
   modelId: string;
   historyMode?: EvalHistoryMode;
-  /** `undefined` inherits on resume (or omits on new run); `null` explicitly disables system prompt. */
   systemPrompt?: string | null;
   temperature?: number;
   maxTokens?: number;
@@ -70,7 +62,6 @@ export interface RunSuiteEvaluationSummary {
   evalRunId: number;
   resumed: boolean;
   suiteName: string;
-  suiteKind: "in_distribution" | "adversarial";
   candidate: string;
   modelId: string;
   historyMode: EvalHistoryMode;
@@ -83,9 +74,9 @@ export interface RunSuiteEvaluationSummary {
 }
 
 /**
- * Runs a candidate model completely transcript-free against a frozen suite (`indist-v1` / `adv-v1`).
+ * Runs a candidate model completely transcript-free against a frozen suite.
  * Supports `gold` (reference prior turns) and `self` (candidate's own prior turns) history modes,
- * plus safe resumption via `resumeRunId`.
+ * plus resumption via `resumeRunId`.
  */
 export async function runSuiteEvaluation(
   options: RunSuiteEvaluationOptions,
@@ -99,8 +90,8 @@ export async function runSuiteEvaluation(
 
   let evalRunId: number;
   let resumed = false;
-  let suiteName = nonEmpty(options.suiteName, "--suite");
-  let candidate = nonEmpty(options.candidate, "--candidate");
+  const suiteName = nonEmpty(options.suiteName, "--suite");
+  const candidate = nonEmpty(options.candidate, "--candidate");
   let modelId = nonEmpty(options.modelId, "--model");
   let historyMode: EvalHistoryMode = options.historyMode ?? "gold";
   let effectiveSystemPrompt: string | undefined;
@@ -124,10 +115,7 @@ export async function runSuiteEvaluation(
     if (options.historyMode !== undefined && existingRun.historyMode !== options.historyMode) {
       throw new Error(`eval_run #${existingRun.id} 历史模式为 ${existingRun.historyMode}，与 --history-mode ${options.historyMode} 不一致`);
     }
-    const storedSystemPrompt =
-      typeof existingRun.config.systemPrompt === "string" && existingRun.config.systemPrompt.trim().length > 0
-        ? existingRun.config.systemPrompt.trim()
-        : undefined;
+    const storedSystemPrompt = existingRun.systemPrompt?.trim() || undefined;
     if (options.systemPrompt === undefined) {
       effectiveSystemPrompt = storedSystemPrompt;
     } else if (options.systemPrompt === null) {
@@ -146,12 +134,7 @@ export async function runSuiteEvaluation(
     historyMode = existingRun.historyMode;
     modelId = existingRun.model;
     resumed = true;
-    evalStore.reopenEvalRun(evalRunId, {
-      resumedAt: new Date().toISOString(),
-      concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
-    });
+    evalStore.reopenEvalRun(evalRunId);
   } else {
     effectiveSystemPrompt =
       options.systemPrompt !== undefined && options.systemPrompt !== null
@@ -162,6 +145,7 @@ export async function runSuiteEvaluation(
       candidate,
       model: modelId,
       historyMode,
+      systemPrompt: effectiveSystemPrompt ?? null,
       config: {
         suiteName: suite.name,
         suiteSha256: suite.sha256,
@@ -169,7 +153,6 @@ export async function runSuiteEvaluation(
         modelId,
         historyMode,
         hasSystemPrompt: Boolean(effectiveSystemPrompt),
-        ...(effectiveSystemPrompt ? { systemPrompt: effectiveSystemPrompt } : {}),
         ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
         ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
         ...(options.limit !== undefined ? { limit: options.limit } : {}),
@@ -181,7 +164,7 @@ export async function runSuiteEvaluation(
   }
 
   const runRef = `eval_run:${evalRunId}`;
-  let items = evalStore.listSuiteItemsBySuiteId(suite.id);
+  let items = evalStore.listSuiteItems(suite.id);
   if (options.limit !== undefined) {
     if (!Number.isSafeInteger(options.limit) || options.limit < 1) {
       throw new Error("--limit 必须是正整数");
@@ -193,7 +176,6 @@ export async function runSuiteEvaluation(
     throw new Error(`套卷 ${suite.name} 没有任何条目`);
   }
 
-  // Index existing valid predictions when resuming
   const existingOkByKey = new Map<string, string>();
   if (resumed) {
     for (const pred of evalStore.listEvalPredictions(evalRunId)) {
@@ -212,7 +194,7 @@ export async function runSuiteEvaluation(
     await runConcurrentPool(items, concurrency, async (item, itemIdx) => {
       const turns = extractSuiteDialogueTurns(item);
       totalTurns += turns.length;
-      const tag = `[${itemIdx + 1}/${items.length} ${item.itemKey}${item.probeType ? `:${item.probeType}` : ""}]`;
+      const tag = `[${itemIdx + 1}/${items.length} ${item.itemKey}:${item.probeType}]`;
 
       const priorHistory: ChatMessage[] = [];
       let selfModeBroken = false;
@@ -261,10 +243,10 @@ export async function runSuiteEvaluation(
           const answer = await runWithRetry({
             maxAttempts: callMaxAttempts,
             delayMs: callRetryDelayMs,
-            onRetry: (attempt: number, max: number, error: unknown) => {
+            onRetry: (attempt, max, error) => {
               options.onProgress?.(`${tag}[t${turn.turnNo}] 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
             },
-            run: async (): Promise<string> => {
+            run: async () => {
               const callId = evalStore.startCall({
                 runRef,
                 role: "candidate",
@@ -344,15 +326,10 @@ export async function runSuiteEvaluation(
     throw toPublicError(error);
   }
 
-  const totalCallsRow = evalStore.db
-    .prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ? AND role = 'candidate'")
-    .get(runRef) as { c: number };
-
   return {
     evalRunId,
     resumed,
     suiteName: suite.name,
-    suiteKind: suite.kind,
     candidate,
     modelId,
     historyMode,
@@ -361,6 +338,6 @@ export async function runSuiteEvaluation(
     completedTurns,
     skippedExistingTurns,
     errorTurns,
-    totalAgentCalls: Number(totalCallsRow.c),
+    totalAgentCalls: evalStore.countAgentCalls(runRef, "candidate"),
   };
 }

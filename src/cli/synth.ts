@@ -28,10 +28,10 @@ const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <
 
 子命令：
   status     查看语料进度、分区统计与待质检问题数
-  run        一体化批量生产（出题 -> 多轮问答质检 -> 可选导出/冻结）
+  run        一体化批量生产（出题 -> 多轮问答质检 -> 可选导出）
   questions  仅执行批量或单文件出题入库
   judge      仅对题库执行多轮回答与质检（支持增量续跑）
-  export     合并导出 JSONL / 切分验证集 / 冻结 test|dpo 版本
+  export     合并导出 JSONL / 切分验证集
   demo       运行 30 秒离线确定性演示（无需 API Key）
 
 常用示例：
@@ -39,12 +39,13 @@ const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <
   npm run dm -- synth run --preset train-standard --limit 20
   npm run dm -- synth run --preset train-short --limit 30
   npm run dm -- synth run --preset train-trap --limit 30
-  npm run dm -- synth run --preset test-freeze --limit 15 --freeze-version test-v1
+  npm run dm -- synth run --preset dpo-pool --limit 15
   npm run dm -- synth judge --only-unjudged --max-turns 3 --concurrency 10
   npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl --manifest output/manifest.json
   npm run dm -- synth demo
 
 使用 npm run dm -- synth <子命令> --help 查看具体参数。
+注意：test 分区仅供 eval 流水线使用（npm run dm -- eval make），synth 只生产 train / dpo。
 `;
 
 const RUN_HELP = `npm run dm -- synth run [选项]
@@ -55,7 +56,7 @@ ${Object.values(SYNTH_RUN_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descri
 常用选项：
   --preset NAME             内置预设名（推荐）
   --limit N                 本次抽取未出题视频数量上限
-  --split SPLIT             数据集分区：train（默认）| test | dpo
+  --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
   --profile PROFILE         风格预设：standard（默认）| short | trap
   --sort MODE               视频排序：id | core-first（与 --shuffle 互斥）
   --shuffle                 随机打乱待出题视频顺序
@@ -63,16 +64,14 @@ ${Object.values(SYNTH_RUN_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descri
   --max-turns N             多轮对话轮数 1-3（standard 默认 3，short/trap 默认 2）
   --max-attempts N          每轮返工最大尝试次数（默认 3）
   --concurrency N           并发数（默认 10）
-  --extract-rubric          通过样本同步抽取 eval_rubrics（test-freeze/dpo-pool 默认开启）
   --include-unjudged        同时把库中该分区历史未质检问题并入本批质检
-  --freeze-version NAME     仅 test/dpo：跑完自动冻结不可变版本
   --export PATH             跑完自动导出本批 JSONL
   --system TEXT / --system-file PATH   导出时注入 system 提示词
   --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
   --eval-db PATH            独立评测库路径（用于防泄漏校验，默认同目录 eval.sqlite）
   --no-skill                关闭全部 Skill（仅消融实验）
-  --question-skill / --followup-skill / --answer-style / --quality-judge / --rubric-skill PATH
+  --question-skill / --followup-skill / --answer-style / --quality-judge PATH
   --prompts DIR             覆盖提示词目录
   --call-attempts N         单次模型调用最大尝试次数（默认 3）
   --retry-delay-ms N        重试间隔毫秒数（默认 1500）
@@ -83,7 +82,7 @@ const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
 选项：
   --input FILE              单视频文稿文件路径（与 --input-dir 互斥）
   --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
-  --split SPLIT             数据集分区：train（默认）| test | dpo
+  --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
   --limit N                 本次最多处理未出题视频数
   --sort MODE               视频排序：id（默认）| core-first
   --shuffle                 随机抽取待出题视频
@@ -101,7 +100,7 @@ const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
 const JUDGE_HELP = `npm run dm -- synth judge [选项]
 
 选项：
-  --split SPLIT             按数据集分区过滤：train | test | dpo
+  --split SPLIT             按数据集分区过滤：train | dpo（test 仅供 eval 流水线）
   --profile PROFILE         风格预设：standard（默认）| short | trap
   --video-id ID             仅处理指定 video_id 的问题
   --question-ids ID1,ID2    仅处理指定问题 ID 列表
@@ -109,12 +108,11 @@ const JUDGE_HELP = `npm run dm -- synth judge [选项]
   --max-turns N             对话轮数 1-3（standard 默认 3，short/trap 默认 2）
   --max-attempts N          每轮最大返工次数（默认 3）
   --concurrency N           并发数（默认 10）
-  --extract-rubric          同步抽取 eval_rubrics
   --export PATH             跑完自动导出本批 JSONL
   --system TEXT / --system-file PATH   导出时注入 system 提示词
   --no-skill                关闭全部 Skill
   --prompts DIR             覆盖提示词目录
-  --followup-skill / --answer-style / --quality-judge / --rubric-skill PATH
+  --followup-skill / --answer-style / --quality-judge PATH
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
   --call-attempts N         单次调用重试次数（默认 3）
   --retry-delay-ms N        重试间隔毫秒数（默认 1500）
@@ -132,10 +130,8 @@ ${Object.values(SYNTH_EXPORT_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.des
   --val-ratio FLOAT         验证集按视频切分比例，如 0.1
   --manifest PATH           导出审计清单 JSON 路径
   --run ID / --runs ID1,ID2 导出指定单/多个 run_id
-  --all-formal              汇总全库指定分区正式样本（未指定 run/version 时默认开启）
-  --version NAME            导出已冻结版本（如 test-v1）
-  --split SPLIT             分区过滤：train | test | dpo
-  --freeze-version NAME     仅 test/dpo：同步固化为不可变版本
+  --all-formal              汇总全库指定分区正式样本（未指定 run 时默认开启）
+  --split SPLIT             分区过滤：train | dpo（test 仅供 eval 流水线）
   --exclude-runs IDs        排除指定 run_id
   --min-turns N / --max-turns N   按对话轮数过滤
   --dedup POLICY            同题选版策略：latest（默认）| earliest | error
@@ -228,16 +224,13 @@ export async function runSynthCli(args: string[]): Promise<void> {
         concurrency: { type: "string" },
         "call-attempts": { type: "string" },
         "retry-delay-ms": { type: "string" },
-        "extract-rubric": { type: "boolean", default: false },
         "include-unjudged": { type: "boolean", default: false },
-        "freeze-version": { type: "string" },
         "no-skill": { type: "boolean", default: false },
         prompts: { type: "string" },
         "question-skill": { type: "string" },
         "followup-skill": { type: "string" },
         "answer-style": { type: "string" },
         "quality-judge": { type: "string" },
-        "rubric-skill": { type: "string" },
         export: { type: "string" },
         system: { type: "string" },
         "system-file": { type: "string" },
@@ -260,7 +253,6 @@ export async function runSynthCli(args: string[]): Promise<void> {
     const shuffle = values.shuffle || (values.sort === undefined && Boolean(preset?.shuffle));
     const maxTurns = parsePositiveInt(values["max-turns"], "--max-turns") ?? preset?.maxTurns;
     const maxQuestionsPerVideo = parsePositiveInt(values["max-questions"], "--max-questions") ?? preset?.maxQuestionsPerVideo;
-    const extractRubric = values["extract-rubric"] || Boolean(preset?.extractRubric);
     const exportSystemPrompt = await readSystemPromptOption({
       system: values.system,
       systemFile: values["system-file"],
@@ -281,9 +273,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
       concurrency: parsePositiveInt(values.concurrency, "--concurrency"),
       callMaxAttempts: parsePositiveInt(values["call-attempts"], "--call-attempts"),
       callRetryDelayMs: parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms"),
-      extractRubric,
       includeUnjudged: values["include-unjudged"],
-      freezeVersion: values["freeze-version"],
       noSkill: values["no-skill"],
       promptsDir: values.prompts,
       skillOverrides: {
@@ -291,7 +281,6 @@ export async function runSynthCli(args: string[]): Promise<void> {
         followupSkill: values["followup-skill"],
         answerStyle: values["answer-style"],
         qualityJudge: values["quality-judge"],
-        rubricSkill: values["rubric-skill"],
       },
       exportPath: values.export,
       exportSystemPrompt,
@@ -373,13 +362,11 @@ export async function runSynthCli(args: string[]): Promise<void> {
         concurrency: { type: "string" },
         "call-attempts": { type: "string" },
         "retry-delay-ms": { type: "string" },
-        "extract-rubric": { type: "boolean", default: false },
         "no-skill": { type: "boolean", default: false },
         prompts: { type: "string" },
         "followup-skill": { type: "string" },
         "answer-style": { type: "string" },
         "quality-judge": { type: "string" },
-        "rubric-skill": { type: "string" },
         export: { type: "string" },
         system: { type: "string" },
         "system-file": { type: "string" },
@@ -408,14 +395,12 @@ export async function runSynthCli(args: string[]): Promise<void> {
       concurrency: parsePositiveInt(values.concurrency, "--concurrency"),
       callMaxAttempts: parsePositiveInt(values["call-attempts"], "--call-attempts"),
       callRetryDelayMs: parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms"),
-      extractRubric: values["extract-rubric"],
       noSkill: values["no-skill"],
       promptsDir: values.prompts,
       skillOverrides: {
         followupSkill: values["followup-skill"],
         answerStyle: values["answer-style"],
         qualityJudge: values["quality-judge"],
-        rubricSkill: values["rubric-skill"],
       },
       exportPath: values.export,
       exportSystemPrompt,
@@ -438,9 +423,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         run: { type: "string" },
         runs: { type: "string" },
         "all-formal": { type: "boolean", default: false },
-        version: { type: "string" },
         split: { type: "string" },
-        "freeze-version": { type: "string" },
         "exclude-runs": { type: "string" },
         "min-turns": { type: "string" },
         "max-turns": { type: "string" },
@@ -482,10 +465,8 @@ export async function runSynthCli(args: string[]): Promise<void> {
       dbPath: values.db,
       evalDbPath: values["eval-db"],
       runIds,
-      allFormal: values["all-formal"] || (runIds === undefined && values.version === undefined && Boolean(preset?.allFormal)),
-      versionName: values.version,
+      allFormal: values["all-formal"] || (runIds === undefined && Boolean(preset?.allFormal)),
       split: values.split !== undefined ? validateSplit(values.split, "--split") : preset?.split,
-      freezeVersion: values["freeze-version"],
       excludeRunIds: parseIdList(values["exclude-runs"], "--exclude-runs"),
       minTurns: parsePositiveInt(values["min-turns"], "--min-turns"),
       maxTurns: parsePositiveInt(values["max-turns"], "--max-turns"),

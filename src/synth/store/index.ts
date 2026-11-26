@@ -2,12 +2,13 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { validateMaxTurns } from "../../shared/schema.js";
-import type { DatasetSplit, EvalRubric, Review, SplitAssignMethod } from "../../shared/types.js";
+import type { DatasetSplit, Review, SplitAssignMethod } from "../../shared/types.js";
 import { createSeededRng, extractVideoKey, normalizeText, nowIso, sha256Hex } from "../../shared/utils.js";
 import { CorpusRepository } from "./corpus-repo.js";
 import { ExportRepository } from "./export-repo.js";
 import { RunRepository } from "./run-repo.js";
 import {
+  LEGACY_DROP_SQL,
   SCHEMA_SQL,
   formatSamplesJsonl,
   type AttemptStatus,
@@ -15,7 +16,6 @@ import {
   type CallStatus,
   type CreateRunInput,
   type DedupPolicy,
-  type EvalRubricRecord,
   type ExportOptions,
   type IntegrityReport,
   type InterruptedCounts,
@@ -30,7 +30,6 @@ import {
   type RunRecord,
   type RunStatus,
   type TargetQuestionRow,
-  type TestSetVersionRecord,
   type TrainingMessage,
   type TrainingSampleLine,
   type TurnStatus,
@@ -49,7 +48,6 @@ export {
   type CallStatus,
   type CreateRunInput,
   type DedupPolicy,
-  type EvalRubricRecord,
   type ExportOptions,
   type IntegrityReport,
   type InterruptedCounts,
@@ -64,7 +62,6 @@ export {
   type RunRecord,
   type RunStatus,
   type TargetQuestionRow,
-  type TestSetVersionRecord,
   type TrainingMessage,
   type TrainingSampleLine,
   type TurnStatus,
@@ -95,6 +92,7 @@ export class DataMakerStore {
         this.db.exec("PRAGMA journal_mode = WAL;");
       }
       this.db.exec(SCHEMA_SQL);
+      this.db.exec(LEGACY_DROP_SQL);
     }
 
     const hasTable = (name: string) => this.hasTable(name);
@@ -225,7 +223,7 @@ export class DataMakerStore {
     return this.corpus.queryPassedResultCountsByVideo();
   }
 
-  // --- Runs / Dialogue State / Eval Rubrics ---
+  // --- Runs / Dialogue State ---
 
   markInterruptedRuns(timestamp = nowIso()): InterruptedCounts {
     return this.runs.markInterruptedRuns(timestamp);
@@ -348,39 +346,7 @@ export class DataMakerStore {
     return this.runs.queryOutcomeCounts(runId);
   }
 
-  upsertEvalRubric(input: {
-    resultId: number;
-    turnNo: number;
-    rubric: EvalRubric;
-    callId?: number | null;
-    createdAt?: string;
-  }): EvalRubricRecord {
-    return this.runs.upsertEvalRubric(input);
-  }
-
-  getEvalRubric(resultId: number, turnNo: number): EvalRubricRecord | undefined {
-    return this.runs.getEvalRubric(resultId, turnNo);
-  }
-
-  startEvalModelCall(input: {
-    resultId?: number | null;
-    turnNo?: number | null;
-    role: "rubric";
-    input: Record<string, unknown>;
-    startedAt?: string;
-  }): number {
-    return this.runs.startEvalModelCall(input);
-  }
-
-  finishEvalModelCall(callId: number, outputText: string, finishedAt = nowIso()): void {
-    this.runs.finishEvalModelCall(callId, outputText, finishedAt);
-  }
-
-  failEvalModelCall(callId: number, error: string, options: { outputText?: string | null; finishedAt?: string } = {}): void {
-    this.runs.failEvalModelCall(callId, error, options);
-  }
-
-  // --- Exports & Frozen Versions ---
+  // --- Exports ---
 
   exportRunSamples(runId: number, options: ExportOptions = {}): TrainingSampleLine[] {
     return this.exports.exportRunSamples(runId, options);
@@ -392,26 +358,5 @@ export class DataMakerStore {
 
   exportMergedDataset(options: MergedExportOptions): MergedExportResult {
     return this.exports.exportMergedDataset(options);
-  }
-
-  getTestSetVersion(nameOrId: string | number): TestSetVersionRecord | undefined {
-    return this.exports.getTestSetVersion(nameOrId);
-  }
-
-  listTestSetVersions(split?: "test" | "dpo"): TestSetVersionRecord[] {
-    return this.exports.listTestSetVersions(split);
-  }
-
-  freezeTestSetVersion(input: {
-    name: string;
-    split?: "test" | "dpo";
-    runIds?: number[];
-    dedup?: DedupPolicy;
-    minTurns?: number;
-    maxTurns?: number;
-    systemPrompt?: string;
-    createdAt?: string;
-  }): TestSetVersionRecord {
-    return this.exports.freezeTestSetVersion(input);
   }
 }

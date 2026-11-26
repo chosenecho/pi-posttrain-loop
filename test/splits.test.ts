@@ -2,10 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { selectVideos, type VideoUnit } from "../src/synth/corpus.js";
 import { DataMakerStore } from "../src/synth/store/index.js";
-import { runDialogueBatch } from "../src/synth/dialogue-loop.js";
-import { readEvalRubricSkill } from "../src/synth/skills.js";
-import { evalRubricPrompt, readRubricPrompt } from "../src/synth/prompts.js";
-import { parseEvalRubric, validateSplit } from "../src/shared/schema.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { validateSplit } from "../src/shared/schema.js";
+import {
+  assertSynthSplit,
+  runSynthBatchWorkflow,
+  runSynthExportWorkflow,
+  runSynthJudgeWorkflow,
+  runSynthQuestionsWorkflow,
+  SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE,
+} from "../src/synth/workflows.js";
 import {
   backfillProcessedTrainSplits,
   computeHashBucket,
@@ -248,112 +257,77 @@ test("exportMergedDataset excludes test/dpo from training exports and keeps mult
   }
 });
 
-test("P1 dialogue loop extracts structured eval_rubrics and freezes immutable test_set_versions", async () => {
-  const rubricBase = await readRubricPrompt();
-  const rubricSkill = await readEvalRubricSkill();
-  assert.equal(rubricSkill.status, "ready");
-  const fullRubricPrompt = evalRubricPrompt(rubricBase, rubricSkill.body);
-  assert.ok(fullRubricPrompt.includes("<eval-rubric>"));
-
-  const store = new DataMakerStore(":memory:");
+test("opening a main DB drops legacy test-v1 tables (eval_rubrics / eval_model_calls / test_set_versions)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dm-legacy-drop-"));
+  const dbPath = join(dir, "main.sqlite");
   try {
-    store.assignVideoSplit({ videoKey: "BV_TEST_V1", split: "test", method: "manual" });
-    const mat = store.upsertMaterial({
-      videoId: "BV_TEST_V1",
-      content: "传感器每10分钟采样一次，达到20毫米告警，连续3次低于15毫米解除。",
-    });
-    const q1 = store.insertQuestion({ materialId: mat.id, question: "告警如何触发和解除？" }).record;
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      CREATE TABLE test_set_versions (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+      CREATE TRIGGER trg_test_set_versions_immutable_delete BEFORE DELETE ON test_set_versions
+      BEGIN SELECT RAISE(ABORT, 'cannot delete frozen test_set_version'); END;
+      CREATE TABLE eval_model_calls (id INTEGER PRIMARY KEY, role TEXT NOT NULL);
+      CREATE TABLE eval_rubrics (id INTEGER PRIMARY KEY, call_id INTEGER REFERENCES eval_model_calls(id), rubric_json TEXT);
+      CREATE INDEX idx_eval_rubrics_call ON eval_rubrics(call_id);
+      INSERT INTO test_set_versions (name) VALUES ('test-v1');
+      INSERT INTO eval_model_calls (role) VALUES ('rubric');
+      INSERT INTO eval_rubrics (call_id, rubric_json) VALUES (1, '{}');
+    `);
+    raw.close();
 
-    const rubricPayload = {
-      stance: "告警解除需满足连续3次采样低于15毫米的滞回条件",
-      keyPoints: [
-        "每10分钟采样一次，达到或超过20毫米触发告警",
-        "连续3次采样低于15毫米才解除告警",
-      ],
-      forbidden: ["单次低于阈值即解除告警"],
-      mustNotHallucinate: ["不得编造芯片型号"],
-    };
-    assert.deepEqual(parseEvalRubric(JSON.stringify(rubricPayload)), rubricPayload);
-
-    const summary = await runDialogueBatch({
-      store,
-      maxAttempts: 2,
-      maxTurns: 1,
-      split: "test",
-      prompts: {
-        answer: "回答提示词",
-        judge: "质检提示词",
-        rubric: fullRubricPrompt,
-      },
-      config: { mode: "test-set-production", split: "test" },
-      exportPolicy: {
-        format: "messages_jsonl",
-        split: "test",
-        purpose: "test",
-        training_enabled: false,
-        eval_enabled: true,
-      },
-      runRole: async ({ role }) => {
-        if (role === "answer") return "每10分钟采样一次，20毫米触发，连续3次低于15毫米解除。";
-        if (role === "judge") return '{"decision":"pass","issues":[],"feedback":""}';
-        if (role === "rubric") return JSON.stringify(rubricPayload);
-        throw new Error(`unexpected role: ${role}`);
-      },
-    });
-
-    assert.equal(summary.results, 1);
-    assert.equal(summary.rubricsExtracted, 1);
-    assert.equal(summary.rubricErrors, 0);
-    assert.equal(summary.integrityOk, true);
-
-    const resultRow = store.db.prepare("SELECT id FROM results LIMIT 1").get() as { id: number };
-    const savedRubric = store.getEvalRubric(resultRow.id, 1);
-    assert.ok(savedRubric);
-    assert.deepEqual(savedRubric.rubric, rubricPayload);
-
-    // Freeze test-v1 version
-    assert.throws(
-      () => store.freezeTestSetVersion({ name: "bad-train", split: "train" as "test" }),
-      /禁止将 train 冻结为测试集/,
-    );
-    const v1 = store.freezeTestSetVersion({ name: "test-v1", split: "test" });
-    assert.equal(v1.name, "test-v1");
-    assert.equal(v1.split, "test");
-    assert.equal(v1.sample_count, 1);
-    assert.equal(v1.video_count, 1);
-
-    // Idempotent when called again with identical content
-    const v1Again = store.freezeTestSetVersion({ name: "test-v1", split: "test" });
-    assert.equal(v1Again.id, v1.id);
-    assert.equal(v1Again.sha256, v1.sha256);
-
-    // Add a second test question later -> test-v1 export remains frozen at 1 sample, and overwriting test-v1 is rejected
-    const q2 = store.insertQuestion({ materialId: mat.id, question: "采样周期是多久？" }).record;
-    await runDialogueBatch({
-      store,
-      maxAttempts: 1,
-      maxTurns: 1,
-      split: "test",
-      questionIds: [q2.id],
-      prompts: { answer: "回答提示词", judge: "质检提示词" },
-      config: { split: "test" },
-      exportPolicy: { format: "messages_jsonl", split: "test", training_enabled: false, eval_enabled: true },
-      runRole: async ({ role }) =>
-        role === "answer" ? "每10分钟采样一次。" : '{"decision":"pass","issues":[],"feedback":""}',
-    });
-
-    assert.throws(
-      () => store.freezeTestSetVersion({ name: "test-v1", split: "test" }),
-      /测试集版本 test-v1 已冻结/,
-    );
-
-    const frozenExport = store.exportMergedDataset({ versionName: "test-v1" });
-    assert.equal(frozenExport.train.length, 1);
-    assert.equal(frozenExport.train[0].questionId, q1.id);
-
-    const v2 = store.freezeTestSetVersion({ name: "test-v2", split: "test" });
-    assert.equal(v2.sample_count, 2);
+    const legacy = ["test_set_versions", "eval_rubrics", "eval_model_calls"];
+    for (let open = 0; open < 2; open++) {
+      // Second open verifies the drop is idempotent.
+      const store = new DataMakerStore(dbPath);
+      try {
+        for (const name of legacy) {
+          assert.equal(store.hasTable(name), false, `${name} should be dropped (open #${open + 1})`);
+        }
+        const leftovers = store.db.prepare(
+          "SELECT name FROM sqlite_master WHERE name LIKE '%test_set_version%' OR name LIKE '%eval_rubric%' OR name LIKE '%eval_model_call%'",
+        ).all();
+        assert.deepEqual(leftovers, []);
+        assert.equal(store.hasTable("video_splits"), true);
+        assert.equal(store.checkIntegrity().ok, true);
+      } finally {
+        store.close();
+      }
+    }
   } finally {
-    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("synth run / questions / judge / export reject --split test (eval pipeline only)", async () => {
+  assert.match(SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE, /test 分区仅供 eval 流水线使用/);
+  assert.match(SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE, /npm run dm -- eval make/);
+  assert.equal(assertSynthSplit("train"), "train");
+  assert.equal(assertSynthSplit("dpo"), "dpo");
+  assert.throws(() => assertSynthSplit("test"), /test 分区仅供 eval 流水线使用/);
+
+  const dir = mkdtempSync(join(tmpdir(), "dm-synth-test-split-"));
+  const dbPath = join(dir, "main.sqlite");
+  const runRole = async () => {
+    throw new Error("model must not be called");
+  };
+  try {
+    await assert.rejects(
+      runSynthBatchWorkflow({ dbPath, split: "test", runRole } as Parameters<typeof runSynthBatchWorkflow>[0]),
+      /test 分区仅供 eval 流水线使用/,
+    );
+    await assert.rejects(
+      runSynthQuestionsWorkflow({ dbPath, split: "test", runRole } as Parameters<typeof runSynthQuestionsWorkflow>[0]),
+      /test 分区仅供 eval 流水线使用/,
+    );
+    await assert.rejects(
+      runSynthJudgeWorkflow({ dbPath, split: "test", runRole } as Parameters<typeof runSynthJudgeWorkflow>[0]),
+      /test 分区仅供 eval 流水线使用/,
+    );
+    await assert.rejects(
+      runSynthExportWorkflow({ dbPath, split: "test" } as Parameters<typeof runSynthExportWorkflow>[0]),
+      /test 分区仅供 eval 流水线使用/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

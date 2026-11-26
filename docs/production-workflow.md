@@ -26,9 +26,8 @@ LLM_TIMEOUT_MS=180000
 >   LLM_ANSWER_THINKING_LEVEL=high
 >   LLM_JUDGE_THINKING_LEVEL=low
 >   LLM_FOLLOWUP_THINKING_LEVEL=medium
->   LLM_RUBRIC_THINKING_LEVEL=medium
 >   ```
-> - 候选模型脱稿盲测（`npm run dm -- eval run` / `eval evaluate`）默认加载 [prompts/eval/candidate-system.md](../prompts/eval/candidate-system.md)，也可通过 `CANDIDATE_LLM_SYSTEM_PROMPT` / `CANDIDATE_LLM_SYSTEM_PROMPT_FILE` 或 CLI `--system-prompt` / `--system-prompt-file` / `--no-system-prompt` 覆盖。
+> - 候选模型脱稿盲测（`npm run dm -- eval evaluate`）默认加载 [prompts/eval/candidate-system.md](../prompts/eval/candidate-system.md)，也可通过 `CANDIDATE_LLM_SYSTEM_PROMPT` / `CANDIDATE_LLM_SYSTEM_PROMPT_FILE` 或 CLI `--system-prompt` / `--system-prompt-file` / `--no-system-prompt` 覆盖。
 
 ---
 
@@ -106,18 +105,12 @@ npm run dm -- synth export --preset train-all --out output/train-all.jsonl --man
 npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl --manifest output/train-manifest.json
 ```
 
-### 第四步：独立生产并冻结盲测集（`test`）与 DPO 采题池（`dpo`）
+### 第四步：生产 DPO 采题池（`dpo`）
 
-语料库全部 1,700 个视频已按 `video_key` 的 SHA-256 哈希持久化划分为 `train`（1,367 个，含 29 个历史回填）、`test`（174 个）、`dpo`（159 个）三个物理隔离分区（完整设计与 `test-v1` 基准明细见 [测试集与评测流水线设计](<test-and-eval-pipeline.md>)）：
+语料库视频已按 `video_key` 的 SHA-256 哈希持久化划分为 `train`（约 80%）、`test`（约 10%，仅供独立评测流水线 `eval make` 只读使用，`synth` 命令禁止对 `test` 生产）、`dpo`（约 10%）三个物理隔离分区（分区算法见 [测试集与评测流水线设计](<test-and-eval-pipeline.md>)）：
 
 ```powershell
-# 1. 从 test 分区抽视频出题 + 多轮问答质检 + 自动抽取 eval_rubrics + 固化版本 test-v1
-npm run dm -- synth run --preset test-freeze --limit 6 --concurrency 40 --freeze-version test-v1 --export output/test-v1.jsonl
-
-# 2. 随时按冻结版本号单独导出为纯净盲测集与审计清单（不受后续批次影响）
-npm run dm -- synth export --version test-v1 --out output/test.jsonl --manifest output/test-manifest.json
-
-# 3. 从 dpo 分区独立生产 On-policy DPO 采题池（不污染 test 盲测集）
+# 从 dpo 分区独立生产 On-policy DPO 采题池（与 train / test 物理隔离）
 npm run dm -- synth run --preset dpo-pool --limit 15 --concurrency 40 --export output/dpo-pool.jsonl
 ```
 
@@ -141,29 +134,22 @@ npm run dm -- cot export --preset train-cot --reasoning-run 2 --out output/train
 
 > **安全阀参数**：程序层仅拦截明显工程故障（空正文、硬泄漏词、`<think>`/Markdown/列表格式脏污、超长安全上限 `--max-chars 800`、连续极端照抄 `--max-verbatim-run 36`），语气自然度、去摘要化与逻辑边界由 `reasoning-judge` 主导裁决。
 
-### 第六步：独立评测库与对抗 / 陷阱盲测流水线（`npm run dm -- eval`）
+### 第六步：独立评测库与盲测流水线（`npm run dm -- eval`）
 
-用于构建与训练侧双向隔离的综合对抗卷（`--preset adv-full` / `adv-fast`，6 类题型）与陷阱拒答卷（`--preset trap`，4 类题型），并在同分布卷、对抗卷与陷阱卷上对候选模型执行脱稿盲测与整体语义批卷对比（完整设计见 [对抗与陷阱评测库设计](<eval-probe-pipeline.md>)）：
+所有评测集均在独立的 `data/eval.sqlite`（Schema v3，12 表，5 类统一题型）中生产、标定、冻结与盲测（完整设计见 [独立评测库设计](<eval-probe-pipeline.md>)）：
 
 ```powershell
-# 1. 初始化独立评测库 data/eval.sqlite 并只读镜像 test-v1 -> indist-v1
-npm run dm -- eval init
-npm run dm -- eval mirror --from-version test-v1 --as indist-v1
+# 1. 一键造卷（导入 test 分区 → 出题核验+评分卡 → 裸答难度标定 → 冻结套卷；可断点续跑）
+npm run dm -- eval make --suite eval-v1 --max-probes 5 --max-easy-ratio 0.2 --export output/eval/eval-v1.jsonl --manifest-out output/eval/eval-v1.manifest.json
 
-# 2. 从主库 test 分区只读导入未用视频快照，按预设运行 Agent Loop v3（默认内置裸答回流，可用 --no-bare-check 或 adv-fast 关闭）
-npm run dm -- eval import --preset test-fresh
-npm run dm -- eval build --preset adv-full
-npm run dm -- eval build --preset trap
+# 查看库状态与已冻结套卷，或抽检考题
+npm run dm -- eval suites
+npm run dm -- eval inspect --sample 10 --out output/eval/inspect.md
 
-# 3. 通用模型无原稿裸答难度标定（支持 --only-uncalibrated / --profile / --report-only）并按预设冻结套卷
-npm run dm -- eval calibrate --run all --only-uncalibrated --concurrency 8 --out output/eval/calibration-report.md
-npm run dm -- eval freeze --name adv-main-v1 --profile adversarial --max-easy-ratio 0.2 --export output/eval/adv-main-v1.jsonl --manifest-out output/eval/adv-main-v1.manifest.json
-npm run dm -- eval freeze --name trap-main-v1 --profile trap --max-easy-ratio 0.2 --export output/eval/trap-main-v1.jsonl --manifest-out output/eval/trap-main-v1.manifest.json
-
-# 4. 一键串联候选模型脱稿盲测 + 批卷 + 出报告（eval evaluate），或拆分为 eval run + eval grade
-npm run dm -- eval evaluate --preset blind-gold --suite adv-main-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --out output/eval/sft-v1.md
-npm run dm -- eval report --suites indist-v1,adv-main-v1,trap-main-v1 --candidates base,sft-v1 --out output/eval/report.md
-npm run dm -- eval compare --baseline base --target sft-v1 --suites indist-v1,adv-main-v1,trap-main-v1 --out output/eval/compare-base-vs-sft.md
+# 2. 一键串联候选模型脱稿盲测 + 整体语义批卷 + 出报告（默认 gold 历史，可选 --history-mode self）
+npm run dm -- eval evaluate --suite eval-v1 --candidate sft-v1 --model my-sft --base-url http://127.0.0.1:8000/v1 --api-key EMPTY --out output/eval/sft-v1.md
+npm run dm -- eval report --suites eval-v1 --candidates base,sft-v1 --out output/eval/report.md
+npm run dm -- eval compare --baseline base --target sft-v1 --suites eval-v1 --out output/eval/compare-base-vs-sft.md
 ```
 
 ### 第七步（可选）：数据集校验脱敏与 ModelScope 打包发布
@@ -234,16 +220,12 @@ python scripts/publish_modelscope.py upload --repo-id <namespace>/<dataset-name>
   JOIN turns t ON t.run_item_id = i.id
   JOIN model_calls c ON c.turn_id = t.id
   WHERE i.run_id = :run_id AND c.status = 'error';
-
-  -- 查看已冻结的测试集版本及评分要点抽取量
-  SELECT name, split, sample_count, video_count, created_at FROM test_set_versions ORDER BY id;
-  SELECT COUNT(*) AS rubric_turns FROM eval_rubrics;
   ```
 - **进程意外中断（如断电 / Ctrl+C）**：
   - 已通过的题目已原子提交进 `results`，不会丢失；
   - 下次启动任何命令会自动把遗留的 `running` 标记为 `interrupted`；
-  - 使用 `npm run dm -- synth judge --max-turns 3 --only-unjudged`（可搭配 `--profile` / `--split test --extract-rubric`）或 `npm run dm -- synth run --include-unjudged` 即可只补跑中断/报错题，绝不重复消耗已通过题的额度；
-  - 在独立评测库中，若仍有 `running` 状态的 `probe_runs`，`eval freeze` 会主动拦截以防冻结半成品（恢复后自动放行，极端场景可用 `--allow-active-runs` 显式覆写）。
+  - 使用 `npm run dm -- synth judge --max-turns 3 --only-unjudged`（可搭配 `--profile`）或 `npm run dm -- synth run --include-unjudged` 即可只补跑中断/报错题，绝不重复消耗已通过题的额度；
+  - 在独立评测库中，重新执行 `npm run dm -- eval make --suite <name>` 会自动跳过已导入、已出题与已标定的条目断点续跑；若存在运行中的 `probe_runs`，冻结守卫会主动拦截以防冻结半成品。
 
 ---
 
@@ -251,10 +233,10 @@ python scripts/publish_modelscope.py upload --repo-id <namespace>/<dataset-name>
 
 修改任意 Skill 后**无需改代码**，下次运行自动生效并记录新的 SHA-256 快照到 `runs.skills_json`（或 `reasoning_runs.skills_json` / `probe_runs.skills_json`）：
 
-- **主数据合成（`standard` 默认）**：[question-design](<../skills/question-design/SKILL.md>) · [followup-strategy](<../skills/followup-strategy/SKILL.md>) · [answer-style](<../skills/answer-style/SKILL.md>) · [quality-judge](<../skills/quality-judge/SKILL.md>) · [eval-rubric](<../skills/eval-rubric/SKILL.md>)
+- **主数据合成（`standard` 默认）**：[question-design](<../skills/question-design/SKILL.md>) · [followup-strategy](<../skills/followup-strategy/SKILL.md>) · [answer-style](<../skills/answer-style/SKILL.md>) · [quality-judge](<../skills/quality-judge/SKILL.md>)
 - **短答预设（`short`）**：[short/question-design](<../skills/short/question-design/SKILL.md>) · [short/followup-strategy](<../skills/short/followup-strategy/SKILL.md>) · [short/answer-style](<../skills/short/answer-style/SKILL.md>) · [short/quality-judge](<../skills/short/quality-judge/SKILL.md>)
 - **陷阱拒答预设（`trap`）**：[trap/question-design](<../skills/trap/question-design/SKILL.md>) · [trap/followup-strategy](<../skills/trap/followup-strategy/SKILL.md>) · [trap/answer-style](<../skills/trap/answer-style/SKILL.md>) · [trap/quality-judge](<../skills/trap/quality-judge/SKILL.md>)
 - **脱稿 CoT 补写**：[reasoning-writer](<../skills/reasoning-writer/SKILL.md>) · [reasoning-judge](<../skills/reasoning-judge/SKILL.md>)
-- **独立评测（`adversarial` 与 `eval/trap`）**：`skills/eval/*/SKILL.md` 与 `skills/eval/trap/*/SKILL.md`
+- **独立评测（5 类统一题型）**：`skills/eval/*/SKILL.md`（共 6 份）
 
 修改任何 Skill 或代码后，建议跑一次 `npm run check` 确保格式校验与全部测试通过。

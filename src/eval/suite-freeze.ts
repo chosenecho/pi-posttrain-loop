@@ -3,15 +3,16 @@ import { dirname } from "node:path";
 import { nonEmpty } from "../shared/schema.js";
 import { extractVideoKey, nowIso, sha256Hex } from "../shared/utils.js";
 import { DataMakerStore } from "../synth/store/index.js";
+import { charNgramJaccard, DUPLICATE_NGRAM_THRESHOLD } from "./probe-schema.js";
+import { verifySourceSplits } from "./source-import.js";
 import {
   EvalStore,
   type DifficultyLevel,
   type ProbeRecord,
   type ProbeType,
   type SourceMaterialRecord,
+  type SuiteRubricEntry,
 } from "./store/index.js";
-import { charNgramJaccard, DUPLICATE_NGRAM_THRESHOLD } from "./probe-schema.js";
-import { verifySourceSplits } from "./source-import.js";
 
 export const DEFAULT_MAX_EASY_RATIO = 0.2;
 
@@ -33,16 +34,14 @@ export interface TrainOverlapScanReport {
   topNeighbors: TrainOverlapNeighbor[];
 }
 
-export interface FreezeAdversarialSuiteOptions {
+export interface FreezeSuiteOptions {
   evalStore: EvalStore;
   name: string;
   runId?: number;
   probeTypes?: readonly ProbeType[];
   maxEasyRatio?: number;
   allowUncalibrated?: boolean;
-  /** Override active-run integrity guard (only for tests or explicit recovery). */
   allowActiveRuns?: boolean;
-  /** When provided, re-verifies split='test' integrity and scans train-split question similarity (read-only). */
   mainDbPath?: string;
   trainSimThreshold?: number;
   failOnTrainSim?: number;
@@ -50,10 +49,9 @@ export interface FreezeAdversarialSuiteOptions {
   manifestOutPath?: string;
 }
 
-export interface FreezeAdversarialSuiteReport {
+export interface FreezeSuiteReport {
   created: boolean;
   suiteName: string;
-  kind: "adversarial";
   itemCount: number;
   turnCount: number;
   videoCount: number;
@@ -61,7 +59,6 @@ export interface FreezeAdversarialSuiteReport {
   byType: Record<string, number>;
   byDifficulty: Record<string, number>;
   byBehavior: Record<string, number>;
-  byPersona: Record<string, number>;
   byVideo: Record<string, number>;
   runIds: number[];
   easyRatio: number;
@@ -84,12 +81,9 @@ function scanTrainQuestionSimilarity(
       splitByKey.set(row.video_key, row.split);
     }
 
-    const rows = mainStore.listAllQuestionsWithVideoId();
-
     const trainQuestions: string[] = [];
-    for (const row of rows) {
-      const videoKey = extractVideoKey(row.video_id);
-      if (splitByKey.get(videoKey) === "train") {
+    for (const row of mainStore.listAllQuestionsWithVideoId()) {
+      if (splitByKey.get(extractVideoKey(row.video_id)) === "train") {
         trainQuestions.push(row.question);
       }
     }
@@ -151,24 +145,18 @@ function selectWithEasyCap(
   }
 
   if (easy.length === 0 || maxEasyRatio >= 1) {
-    return {
-      selected: [...probes].sort((a, b) => a.id - b.id),
-      excludedEasyProbeIds: [],
-    };
+    return { selected: [...probes].sort((a, b) => a.id - b.id), excludedEasyProbeIds: [] };
   }
 
-  const maxAllowedEasy = maxEasyRatio <= 0
-    ? 0
-    : Math.floor((nonEasy.length * maxEasyRatio) / (1 - maxEasyRatio) + 1e-12);
+  const maxAllowedEasy =
+    maxEasyRatio <= 0
+      ? 0
+      : Math.floor((nonEasy.length * maxEasyRatio) / (1 - maxEasyRatio) + 1e-12);
 
   if (easy.length <= maxAllowedEasy) {
-    return {
-      selected: [...probes].sort((a, b) => a.id - b.id),
-      excludedEasyProbeIds: [],
-    };
+    return { selected: [...probes].sort((a, b) => a.id - b.id), excludedEasyProbeIds: [] };
   }
 
-  // Deterministically keep the hardest (lowest bare-model calibration score) among easy probes.
   const scoreById = new Map<number, number>();
   for (const p of easy) {
     const cals = evalStore.listCompleteCalibrationsForProbe(p.id, p.targetTurns);
@@ -179,7 +167,10 @@ function selectWithEasyCap(
     (a, b) => (scoreById.get(a.id) ?? 100) - (scoreById.get(b.id) ?? 100) || a.id - b.id,
   );
   const keptEasy = sortedEasy.slice(0, maxAllowedEasy);
-  const excludedEasyProbeIds = sortedEasy.slice(maxAllowedEasy).map((p) => p.id).sort((a, b) => a - b);
+  const excludedEasyProbeIds = sortedEasy
+    .slice(maxAllowedEasy)
+    .map((p) => p.id)
+    .sort((a, b) => a - b);
 
   return {
     selected: [...nonEasy, ...keptEasy].sort((a, b) => a.id - b.id),
@@ -188,28 +179,25 @@ function selectWithEasyCap(
 }
 
 /**
- * Freezes accepted adversarial probes from `eval.sqlite` into an immutable `adversarial` suite
- * (e.g. `adv-v1`), enforcing difficulty easy-ratio caps, main-DB split verification, train-set
- * n-gram overlap auditing, deterministic JSONL snapshot hashing, and optional file export.
+ * Freezes accepted calibrated probes into an immutable suite in `eval.sqlite`,
+ * enforcing active-run guards, easy-ratio caps, main-DB split verification,
+ * train-set 2-gram similarity auditing, and deterministic JSONL hashing.
  */
-export async function freezeAdversarialSuite(
-  options: FreezeAdversarialSuiteOptions,
-): Promise<FreezeAdversarialSuiteReport> {
+export async function freezeEvalSuite(options: FreezeSuiteOptions): Promise<FreezeSuiteReport> {
   const { evalStore } = options;
-  const suiteName = nonEmpty(options.name, "--name");
+  const suiteName = nonEmpty(options.name, "--suite");
   const maxEasyRatio = options.maxEasyRatio ?? DEFAULT_MAX_EASY_RATIO;
   if (!Number.isFinite(maxEasyRatio) || maxEasyRatio < 0 || maxEasyRatio > 1) {
     throw new Error("--max-easy-ratio 必须在 [0, 1] 范围内");
   }
   const trainSimThreshold = options.trainSimThreshold ?? DUPLICATE_NGRAM_THRESHOLD;
 
-  // Guardrail #3 (Data Integrity): refuse freezing while a build/calibrate run is still actively mutating probes.
   if (!options.allowActiveRuns) {
     const activeRuns = evalStore.listActiveRuns(["probe_build", "calibrate"]);
     if (activeRuns.length > 0) {
       const desc = activeRuns.map((r) => `#${r.id}(${r.kind})`).join(", ");
       throw new Error(
-        `存在正在运行中的任务（${desc}），禁止并发冻结套卷以免写入未完成或漂移的标定快照；请等待其结束，或显式传入 --allow-active-runs`,
+        `存在正在运行中的任务（${desc}），禁止并发冻结套卷；请等待其结束，或显式传入 --allow-active-runs`,
       );
     }
   }
@@ -220,14 +208,14 @@ export async function freezeAdversarialSuite(
     probeTypes: options.probeTypes,
   });
   if (accepted.length === 0) {
-    throw new Error("未找到任何已通过（accepted）的对抗考题，无法冻结套卷");
+    throw new Error("未找到任何已通过（accepted）的考题，无法冻结套卷");
   }
 
   if (!options.allowUncalibrated) {
     const uncalibrated = accepted.filter((p) => p.difficulty === null);
     if (uncalibrated.length > 0) {
       throw new Error(
-        `存在 ${uncalibrated.length} 道尚未完成难度标定的 accepted 考题（如 probe #${uncalibrated[0]!.id}）；请先运行 eval calibrate，或显式传入 --allow-uncalibrated`,
+        `存在 ${uncalibrated.length} 道尚未完成难度标定的考题（如 probe #${uncalibrated[0]!.id}）；请先标定，或显式传入 --allow-uncalibrated`,
       );
     }
   }
@@ -237,7 +225,6 @@ export async function freezeAdversarialSuite(
     throw new Error(`按 --max-easy-ratio ${maxEasyRatio} 筛选后没有任何考题可冻结`);
   }
 
-  // Load and validate source materials and complete dialogues/rubrics
   const sourceCache = new Map<number, SourceMaterialRecord>();
   const usedSources: SourceMaterialRecord[] = [];
   const seenSourceIds = new Set<number>();
@@ -245,34 +232,26 @@ export async function freezeAdversarialSuite(
   interface ExportedSuiteLine {
     itemKey: string;
     videoKey: string;
-    probeType: string;
-    expectedBehavior: string;
+    probeType: ProbeType;
     difficulty: DifficultyLevel | null;
     persona: string;
     messages: Array<{ role: "user" | "assistant"; content: string }>;
-    rubrics: Array<{
-      turnNo: number;
-      expectedBehavior: string;
-      tactic: string | null;
-      rubric: unknown;
-    }>;
+    rubrics: SuiteRubricEntry[];
   }
 
   const exportedLines: ExportedSuiteLine[] = [];
   const suiteItems: Array<{
     itemKey: string;
     videoKey: string;
-    probeType: string | null;
-    expectedBehavior: string | null;
+    probeType: ProbeType;
     difficulty: DifficultyLevel | null;
-    messages: unknown[];
-    rubrics: unknown[];
+    messages: Array<{ role: "user" | "assistant"; content: string }>;
+    rubrics: SuiteRubricEntry[];
   }> = [];
 
   const byType: Record<string, number> = {};
   const byDifficulty: Record<string, number> = {};
   const byBehavior: Record<string, number> = {};
-  const byPersona: Record<string, number> = {};
   const byVideo: Record<string, number> = {};
   const runIdSet = new Set<number>();
   const videoKeys = new Set<string>();
@@ -292,26 +271,16 @@ export async function freezeAdversarialSuite(
       usedSources.push(source);
     }
 
-    const dialogue = evalStore.getProbeDialogue(probe.id);
-    if (dialogue.length === 0) {
-      throw new Error(`probe #${probe.id} 缺少通过的参考对话轮次`);
-    }
-    if (dialogue.length !== probe.targetTurns) {
-      throw new Error(
-        `probe #${probe.id} 对话轮数不完整：预期 ${probe.targetTurns} 轮，实际 ${dialogue.length} 轮`,
-      );
-    }
-    for (const turn of dialogue) {
-      if (!turn.rubric) {
-        throw new Error(`probe #${probe.id} Turn ${turn.turnNo} 缺少评分卡 v2（probe_rubrics）`);
-      }
+    const turns = evalStore.listProbeTurns(probe.id);
+    if (turns.length !== probe.targetTurns) {
+      throw new Error(`probe #${probe.id} 对话轮数不完整：预期 ${probe.targetTurns} 轮，实际 ${turns.length} 轮`);
     }
 
     const messages: Array<{ role: "user" | "assistant"; content: string }> = [];
-    const rubrics: ExportedSuiteLine["rubrics"] = [];
-    for (const turn of dialogue) {
-      messages.push({ role: "user", content: turn.user });
-      messages.push({ role: "assistant", content: turn.answer });
+    const rubrics: SuiteRubricEntry[] = [];
+    for (const turn of turns) {
+      messages.push({ role: "user", content: turn.userContent });
+      messages.push({ role: "assistant", content: turn.referenceAnswer });
       rubrics.push({
         turnNo: turn.turnNo,
         expectedBehavior: turn.expectedBehavior,
@@ -329,13 +298,11 @@ export async function freezeAdversarialSuite(
     byType[probe.probeType] = (byType[probe.probeType] ?? 0) + 1;
     const diffKey = probe.difficulty ?? "uncalibrated";
     byDifficulty[diffKey] = (byDifficulty[diffKey] ?? 0) + 1;
-    byPersona[probe.persona] = (byPersona[probe.persona] ?? 0) + 1;
 
     exportedLines.push({
       itemKey,
       videoKey: source.videoKey,
       probeType: probe.probeType,
-      expectedBehavior: probe.expectedBehavior,
       difficulty: probe.difficulty,
       persona: probe.persona,
       messages,
@@ -345,14 +312,12 @@ export async function freezeAdversarialSuite(
       itemKey,
       videoKey: source.videoKey,
       probeType: probe.probeType,
-      expectedBehavior: probe.expectedBehavior,
       difficulty: probe.difficulty,
       messages,
       rubrics,
     });
   }
 
-  // Cross-DB verification & train question n-gram scan (read-only)
   let trainOverlapScan: TrainOverlapScanReport | null = null;
   if (options.mainDbPath) {
     verifySourceSplits(options.mainDbPath, usedSources);
@@ -361,7 +326,7 @@ export async function freezeAdversarialSuite(
       const worst = trainOverlapScan.topNeighbors[0];
       throw new Error(
         `冻结拦截：考题与训练集问法最大相似度 ${trainOverlapScan.maxSimilarity} >= 阈值 ${options.failOnTrainSim}` +
-        (worst ? `（${worst.itemKey} vs 训练集「${worst.trainQuestion.slice(0, 40)}」）` : ""),
+          (worst ? `（${worst.itemKey} vs 训练集「${worst.trainQuestion.slice(0, 40)}」）` : ""),
       );
     }
   }
@@ -370,9 +335,9 @@ export async function freezeAdversarialSuite(
   const sha256 = sha256Hex(jsonl);
   const easyCount = byDifficulty.easy ?? 0;
   const easyRatio = Number((easyCount / selected.length).toFixed(4));
-
   const sortedVideoKeys = [...videoKeys].sort();
   const sortedRunIds = [...runIdSet].sort((a, b) => a - b);
+
   const sourceSha256s: Record<string, string> = {};
   for (const s of [...usedSources].sort((a, b) => a.videoId.localeCompare(b.videoId))) {
     sourceSha256s[s.videoId] = s.contentSha256;
@@ -380,8 +345,6 @@ export async function freezeAdversarialSuite(
 
   const manifest: Record<string, unknown> = {
     suiteName,
-    kind: "adversarial",
-    runFilter: options.runId ?? "all",
     runIds: sortedRunIds,
     itemCount: selected.length,
     turnCount,
@@ -391,7 +354,6 @@ export async function freezeAdversarialSuite(
     byType,
     byDifficulty,
     byBehavior,
-    byPersona,
     easyRatio,
     maxEasyRatio,
     excludedEasyProbeIds,
@@ -403,7 +365,6 @@ export async function freezeAdversarialSuite(
 
   const { created, suite } = evalStore.freezeSuite({
     name: suiteName,
-    kind: "adversarial",
     sha256,
     manifest,
     items: suiteItems,
@@ -421,7 +382,6 @@ export async function freezeAdversarialSuite(
   return {
     created,
     suiteName: suite.name,
-    kind: "adversarial",
     itemCount: suite.itemCount,
     turnCount,
     videoCount: sortedVideoKeys.length,
@@ -429,7 +389,6 @@ export async function freezeAdversarialSuite(
     byType,
     byDifficulty,
     byBehavior,
-    byPersona,
     byVideo,
     runIds: sortedRunIds,
     easyRatio,

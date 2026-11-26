@@ -5,7 +5,6 @@ export type SynthRunPresetName =
   | "train-standard"
   | "train-short"
   | "train-trap"
-  | "test-freeze"
   | "dpo-pool";
 
 export interface SynthRunPreset {
@@ -17,7 +16,6 @@ export interface SynthRunPreset {
   shuffle?: boolean;
   maxTurns: number;
   maxQuestionsPerVideo?: number;
-  extractRubric?: boolean;
 }
 
 export const SYNTH_RUN_PRESETS: Record<SynthRunPresetName, SynthRunPreset> = {
@@ -46,23 +44,13 @@ export const SYNTH_RUN_PRESETS: Record<SynthRunPresetName, SynthRunPreset> = {
     maxTurns: 2,
     maxQuestionsPerVideo: 3,
   },
-  "test-freeze": {
-    name: "test-freeze",
-    description: "盲测集生产预设（test 分区 + 随机抽选 + 抽取 eval_rubrics）",
-    split: "test",
-    profile: "standard",
-    shuffle: true,
-    maxTurns: 3,
-    extractRubric: true,
-  },
   "dpo-pool": {
     name: "dpo-pool",
-    description: "DPO 采题池预设（dpo 分区 + 随机抽选 + 抽取 eval_rubrics）",
+    description: "DPO 采题池预设（dpo 分区 + 随机抽选 + 3 轮）",
     split: "dpo",
     profile: "standard",
     shuffle: true,
     maxTurns: 3,
-    extractRubric: true,
   },
 };
 

@@ -1,5 +1,5 @@
 import { createWarmupGate, runConcurrentPool } from "../shared/concurrency.js";
-import { PublicError, publicErrorMessage, toPublicError } from "../shared/public-error.js";
+import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
   DEFAULT_CALL_MAX_ATTEMPTS,
   DEFAULT_CALL_RETRY_DELAY_MS,
@@ -7,442 +7,513 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../shared/retry.js";
-import { nonEmpty, validateConcurrency, validateMaxAttempts } from "../shared/schema.js";
+import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { EvalRole, RoleRunner } from "../shared/types.js";
+import type { EvalBuildPrompts, EvalSkillSnapshot } from "./eval-prompts.js";
 import {
+  parseAdversaryTurn,
+  parseCriticReview,
+  parseProbeDraftBatch,
+  parseProbeRevision,
+  parseVerifierResult,
+  verifyAnchorInMaterial,
+  type PlannedProbeDraft,
+} from "./probe-schema.js";
+import {
+  ADVERSARY_TACTICS,
   EvalStore,
+  expectedBehaviorForTurn,
   PROBE_TYPES,
-  TRAP_PROBE_TYPES,
-  type EvalProfile,
-  type ExpectedBehavior,
+  type AdversaryTactic,
+  type ProbeRubric,
   type ProbeType,
   type SourceMaterialRecord,
 } from "./store/index.js";
-import type { EvalPromptBundle } from "./eval-prompts.js";
-import {
-  buildSoftMixGuidance,
-  normalizeProbeMix,
-  PROBE_PERSONAS,
-} from "./probe-planner.js";
-import {
-  parseDraftProbes,
-  verifyAnchorInMaterial,
-} from "./probe-schema.js";
-import { runProbeCriticStage, type MutableProbeState, type TrackedInvoker } from "./probe-stage-critic.js";
-import { runProbeDialogueStage } from "./probe-stage-dialogue.js";
-import { verifySourceSplits } from "./source-import.js";
 
-/** Default upper bound on probes the agent may plan per video (the agent decides the actual 0..N count). */
-export const DEFAULT_PROBES_PER_VIDEO = 6;
+export const DEFAULT_MAX_PROBES_PER_VIDEO = 5;
 export const DEFAULT_MAX_CRITIC_REVISIONS = 2;
-export const DEFAULT_MAX_ANSWER_ATTEMPTS = 3;
-export const DEFAULT_MAX_BARE_REFINEMENTS = 1;
+export const DEFAULT_MAX_ANSWER_ATTEMPTS = 2;
 
-export interface RunProbeBuildOptions {
+const DEFAULT_PERSONAS = ["普通提问者", "打工人", "学生", "杠精网友", "学者", "同情者", "反对者"] as const;
+
+export interface SoftTypeGuidance {
+  currentTypeCounts: Record<ProbeType, number>;
+  underrepresentedTypes: ProbeType[];
+}
+
+export function buildSoftTypeGuidance(
+  existingCounts: Record<string, number>,
+  allowedTypes: readonly ProbeType[] = PROBE_TYPES,
+): SoftTypeGuidance {
+  const currentTypeCounts = {} as Record<ProbeType, number>;
+  let total = 0;
+  for (const type of PROBE_TYPES) {
+    const count = existingCounts[type] ?? 0;
+    currentTypeCounts[type] = count;
+    if (allowedTypes.includes(type)) total += count;
+  }
+  const avg = allowedTypes.length > 0 ? total / allowedTypes.length : 0;
+  const underrepresentedTypes = allowedTypes
+    .filter((t) => (currentTypeCounts[t] ?? 0) <= avg)
+    .sort((a, b) => (currentTypeCounts[a] ?? 0) - (currentTypeCounts[b] ?? 0));
+  return { currentTypeCounts, underrepresentedTypes };
+}
+
+export interface RunProbeBuildLoopOptions {
   evalStore: EvalStore;
   sources: SourceMaterialRecord[];
-  /** When provided, verifies every source's `split = 'test'` & sha256 against main DB (read-only) before building. */
-  mainDbPath?: string;
-  prompts: EvalPromptBundle["prompts"];
-  skills: EvalPromptBundle["skills"];
-  runRole: RoleRunner;
+  prompts: EvalBuildPrompts;
+  skills: EvalSkillSnapshot[];
   modelId: string;
-  /** Optional build profile label recorded in run config (`adversarial` | `trap`). */
-  profile?: EvalProfile;
-  /** Maximum probes per video; `probe-writer` autonomously chooses 0..probesPerVideo based on material depth. */
-  probesPerVideo?: number;
-  /** Soft global mix weights (types with weight 0 are disallowed). */
-  mix?: Partial<Record<ProbeType, number>>;
-  seed?: number;
-  maxCriticRevisions?: number;
+  runRole: RoleRunner;
+  allowedTypes?: readonly ProbeType[];
+  maxProbesPerVideo?: number;
+  maxRevisions?: number;
   maxAnswerAttempts?: number;
-  /**
-   * Optional inline bare-model adversarial feedback loop:
-   * after Turn 1 passes `probe-critic`, runs a transcript-free bare generic model on `question`
-   * and feeds `bareAnswer` back to `probe-critic` (`mode: "bare_check"`). If the bare model
-   * nails it effortlessly or exposes unseen private trivia, sends `bareAnswer` + feedback back
-   * to `probe-writer` (`mode: "revise"`) to sharpen or pivot before investing in reference/rubric calls.
-   */
-  runBareModel?: RoleRunner;
-  barePrompt?: string;
-  bareModelId?: string;
-  maxBareRefinements?: number;
   concurrency?: number;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
+  configSnapshot?: Record<string, unknown>;
   onProgress?: (message: string) => void;
 }
 
-export interface RunProbeBuildSummary {
+export interface RunProbeBuildLoopSummary {
   runId: number;
-  modelId: string;
-  bareModelId?: string;
-  videos: number;
-  skippedVideos: number;
-  plannedSlots: number;
-  draftedProbes: number;
-  draftErrors: number;
-  criticEvaluated: number;
-  criticAccepted: number;
-  criticAcceptRate: number;
-  bareChecked: number;
-  bareTriggeredRevisions: number;
-  verifierEvaluated: number;
-  verifierPassed: number;
-  verifierPassRate: number;
-  statusCounts: Record<string, number>;
+  sourcesProcessed: number;
+  sourcesSkipped: number;
+  probesCreated: number;
   accepted: number;
-  acceptedTurns: number;
-  acceptedByType: Record<string, number>;
-  acceptedByPersona: Record<string, number>;
-  anchorVerifiedRate: number;
-  totalAgentCalls: number;
+  rejected: number;
+  dropped: number;
   errors: number;
+  byType: Record<string, number>;
+  totalAgentCalls: number;
 }
 
-interface QueuedProbe extends MutableProbeState {
-  probeId: number;
-  specId: number;
-  slotIndex: number;
-  source: SourceMaterialRecord;
+async function invokeTrackedRole<T>(options: {
+  evalStore: EvalStore;
+  runRef: string;
+  role: EvalRole;
+  model: string;
+  systemPrompt: string;
+  input: Record<string, unknown>;
+  inputRefs: Record<string, unknown>;
+  runRole: RoleRunner;
+  parse: (raw: string) => T;
+  callMaxAttempts: number;
+  callRetryDelayMs: number;
+  warmupGate?: ReturnType<typeof createWarmupGate>;
+  warmupKey?: string;
+  onRetry?: (attempt: number, max: number, error: unknown) => void;
+}): Promise<{ callId: number; result: T }> {
+  const execute = async (): Promise<{ callId: number; result: T }> =>
+    runWithRetry({
+      maxAttempts: options.callMaxAttempts,
+      delayMs: options.callRetryDelayMs,
+      onRetry: options.onRetry,
+      run: async () => {
+        const callId = options.evalStore.startCall({
+          runRef: options.runRef,
+          role: options.role,
+          model: options.model,
+          inputRefs: options.inputRefs,
+        });
+        let rawOutput: string | undefined;
+        try {
+          rawOutput = await options.runRole({
+            role: options.role,
+            systemPrompt: options.systemPrompt,
+            input: options.input,
+          });
+          let parsed: T;
+          try {
+            parsed = options.parse(rawOutput);
+          } catch (error) {
+            throw toPublicError(error, "model_output_invalid");
+          }
+          options.evalStore.finishCall(callId, { output: rawOutput });
+          return { callId, result: parsed };
+        } catch (error) {
+          options.evalStore.finishCall(callId, { output: rawOutput, error: publicErrorMessage(error) });
+          throw toPublicError(error);
+        }
+      },
+    });
+
+  if (options.warmupGate && options.warmupKey) {
+    return options.warmupGate.run(options.warmupKey, true, execute);
+  }
+  return execute();
 }
 
-export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunProbeBuildSummary> {
-  const { evalStore, sources, runRole, modelId } = options;
-  if (sources.length === 0) {
-    throw new Error("没有可用于构建考题的 source_materials（请先运行 eval import）");
-  }
-
-  const maxProbesPerVideo = options.probesPerVideo ?? DEFAULT_PROBES_PER_VIDEO;
-  if (!Number.isSafeInteger(maxProbesPerVideo) || maxProbesPerVideo < 1 || maxProbesPerVideo > 20) {
-    throw new Error("probesPerVideo 必须是 1–20 的整数");
-  }
-  const maxCriticRevisions = options.maxCriticRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS;
-  if (!Number.isSafeInteger(maxCriticRevisions) || maxCriticRevisions < 0 || maxCriticRevisions > 5) {
-    throw new Error("maxCriticRevisions 必须是 0–5 的整数");
-  }
-  const maxBareRefinements = options.maxBareRefinements ?? DEFAULT_MAX_BARE_REFINEMENTS;
-  if (!Number.isSafeInteger(maxBareRefinements) || maxBareRefinements < 0 || maxBareRefinements > 3) {
-    throw new Error("maxBareRefinements 必须是 0–3 的整数");
-  }
-  const maxAnswerAttempts = validateMaxAttempts(options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS);
-  const concurrency = validateConcurrency(options.concurrency ?? 1);
+export async function runProbeBuildLoop(options: RunProbeBuildLoopOptions): Promise<RunProbeBuildLoopSummary> {
+  const { evalStore, sources, prompts, skills, modelId, runRole } = options;
+  const allowedTypes: readonly ProbeType[] =
+    options.allowedTypes && options.allowedTypes.length > 0 ? options.allowedTypes : PROBE_TYPES;
+  const maxProbesPerVideo = options.maxProbesPerVideo ?? DEFAULT_MAX_PROBES_PER_VIDEO;
+  const maxRevisions = options.maxRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS;
+  const maxAnswerAttempts = options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS;
+  const concurrency = validateConcurrency(options.concurrency ?? 4);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
-  const effectiveMix = normalizeProbeMix(options.mix);
-  const allowedTypes = PROBE_TYPES.filter((t) => effectiveMix[t] > 0);
-  if (allowedTypes.length === 0) {
-    throw new Error("题型配比至少需要一个正权重类型");
-  }
-
-  // Validate prompts before touching DB
-  const writerPrompt = nonEmpty(options.prompts.probeWriter, "probe-writer 提示词");
-  const criticPrompt = nonEmpty(options.prompts.probeCritic, "probe-critic 提示词");
-  const referencePrompt = nonEmpty(options.prompts.reference, "reference 提示词");
-  const verifierPrompt = nonEmpty(options.prompts.verifier, "verifier 提示词");
-  const rubricPrompt = nonEmpty(options.prompts.rubricV2, "rubric-v2 提示词");
-  const needsAdversary =
-    effectiveMix.pressure > 0 || TRAP_PROBE_TYPES.some((t) => effectiveMix[t] > 0);
-  const adversaryPrompt = needsAdversary
-    ? nonEmpty(options.prompts.adversary, "adversary 提示词")
-    : options.prompts.adversary;
-  const bareEnabled = Boolean(options.runBareModel && options.barePrompt);
-  const barePrompt = bareEnabled ? nonEmpty(options.barePrompt, "bare-answer 提示词") : undefined;
-  const bareModelId = bareEnabled ? (options.bareModelId ?? modelId) : undefined;
-
-  // Guardrail #1: Cross-DB test-split + sha256 verification before any LLM call
-  if (options.mainDbPath) {
-    verifySourceSplits(options.mainDbPath, sources);
-  }
-
   evalStore.markInterruptedRuns();
-
-  const liveTypeCounts: Record<ProbeType, number> = evalStore.countAcceptedProbesByType();
 
   const runId = evalStore.createRun({
     kind: "probe_build",
     config: {
-      architecture: "agent-loop-v3",
-      profile: options.profile ?? "adversarial",
       modelId,
-      ...(bareModelId ? { bareModelId, maxBareRefinements } : {}),
-      videos: sources.length,
-      videoIds: sources.map((s) => s.videoId),
+      allowedTypes,
       maxProbesPerVideo,
-      mix: effectiveMix,
-      ...(options.seed !== undefined ? { seed: options.seed } : {}),
-      maxCriticRevisions,
+      maxRevisions,
       maxAnswerAttempts,
       concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
+      ...(options.configSnapshot ?? {}),
     },
     prompts: {
-      probe_writer: writerPrompt,
-      probe_critic: criticPrompt,
-      reference: referencePrompt,
-      verifier: verifierPrompt,
-      ...(adversaryPrompt ? { adversary: adversaryPrompt } : {}),
-      rubric_v2: rubricPrompt,
-      ...(barePrompt ? { bare_answer: barePrompt } : {}),
+      probeWriter: prompts.probeWriter,
+      probeCritic: prompts.probeCritic,
+      reference: prompts.reference,
+      verifier: prompts.verifier,
+      adversary: prompts.adversary,
     },
-    skills: options.skills,
+    skills,
   });
-
-  const runRef = `probe_run:${runId}`;
+  const runRef = `probe_build:${runId}`;
   const warmupGate = createWarmupGate();
 
-  const invokeTracked: TrackedInvoker = async <T>(params: {
-    role: EvalRole;
-    sourceMaterialId: number;
-    runner?: RoleRunner;
-    model?: string;
-    systemPrompt: string;
-    inputRefs: Record<string, unknown>;
-    wireInput: Record<string, unknown>;
-    parse: (raw: string) => T;
-    tag: string;
-    skipWarmup?: boolean;
-  }) => {
-    const effectiveRunner = params.runner ?? runRole;
-    const effectiveModel = params.model ?? modelId;
-    const callId = evalStore.startCall({
-      runRef,
-      role: params.role,
-      model: effectiveModel,
-      inputRefs: params.inputRefs,
+  let sourcesProcessed = 0;
+  let sourcesSkipped = 0;
+  let probesCreated = 0;
+  let accepted = 0;
+  let rejected = 0;
+  let dropped = 0;
+  let errors = 0;
+  const byType: Record<string, number> = {};
+
+  async function processOneProbe(
+    source: SourceMaterialRecord,
+    slotIndex: number,
+    draft: PlannedProbeDraft,
+    tag: string,
+  ): Promise<void> {
+    const probeId = evalStore.createProbe({
+      runId,
+      sourceMaterialId: source.id,
+      slotIndex,
+      probeType: draft.probeType,
+      persona: draft.persona,
+      targetTurns: draft.targetTurns,
+      question: draft.question,
+      anchor: draft.anchor,
+      trap: draft.trap,
+      anchorVerified: verifyAnchorInMaterial(draft.anchor, source.content),
     });
-    let lastRawOutput: string | undefined;
-    try {
-      const result = await runWithRetry({
-        maxAttempts: callMaxAttempts,
-        delayMs: callRetryDelayMs,
-        run: async () => {
-          lastRawOutput = undefined;
-          const exec = () => effectiveRunner({
-            role: params.role,
-            systemPrompt: params.systemPrompt,
-            input: params.wireInput,
-          });
-          const output = params.skipWarmup
-            ? await exec()
-            : await warmupGate.run(`${params.sourceMaterialId}:${params.role}`, concurrency > 1, exec);
-          lastRawOutput = output;
-          try {
-            return { output, parsed: params.parse(output) };
-          } catch {
-            throw new PublicError("model_output_invalid");
-          }
+    probesCreated++;
+
+    // Stage 1: Static critic review + revision loop (up to maxRevisions)
+    let criticPassed = false;
+    for (let roundNo = 1; roundNo <= maxRevisions + 1; roundNo++) {
+      const current = evalStore.getProbe(probeId)!;
+      const siblings = evalStore.listExistingQuestionsForSource(source.id, probeId);
+
+      const { callId, result: review } = await invokeTrackedRole({
+        evalStore,
+        runRef,
+        role: "probe_critic",
+        model: modelId,
+        systemPrompt: prompts.probeCritic,
+        input: {
+          material: source.content,
+          probeType: current.probeType,
+          persona: current.persona,
+          expectedBehavior: current.expectedBehavior,
+          targetTurns: current.targetTurns,
+          question: current.question,
+          anchor: current.anchor,
+          anchorVerified: current.anchorVerified,
+          trap: current.trap,
+          ...(siblings.length > 0 ? { existingQuestions: siblings } : {}),
         },
-        onRetry: (attempt, max, error) => {
-          options.onProgress?.(`${params.tag} ${params.role} call:${callId} 失败（第 ${attempt}/${max} 次），重试：${publicErrorMessage(error)}`);
-        },
+        inputRefs: { probe_id: probeId, round_no: roundNo },
+        runRole,
+        parse: parseCriticReview,
+        callMaxAttempts,
+        callRetryDelayMs,
+        warmupGate,
+        warmupKey: "probe_critic",
       });
-      evalStore.finishCall(callId, { output: result.output });
-      return { callId, output: result.output, parsed: result.parsed };
-    } catch (error) {
-      const safeError = toPublicError(error, "model_request_failed");
-      const msg = publicErrorMessage(safeError);
-      evalStore.finishCall(callId, { output: lastRawOutput, error: msg });
-      throw safeError;
+
+      evalStore.appendReview(probeId, {
+        roundNo,
+        decision: review.decision,
+        issues: review.issues,
+        feedback: review.feedback,
+        callId,
+      });
+
+      if (review.decision === "accept") {
+        criticPassed = true;
+        break;
+      }
+      if (review.decision === "reject" || roundNo > maxRevisions) {
+        const reason =
+          review.decision === "reject"
+            ? review.feedback
+            : `审题改写 ${maxRevisions} 次仍未通过：${review.feedback}`;
+        evalStore.setProbeStatus(probeId, "rejected", reason);
+        rejected++;
+        options.onProgress?.(`${tag} probe#${probeId} rejected: ${reason.slice(0, 60)}`);
+        return;
+      }
+
+      // Revise via probe-writer
+      const { result: revised } = await invokeTrackedRole({
+        evalStore,
+        runRef,
+        role: "probe_writer",
+        model: modelId,
+        systemPrompt: prompts.probeWriter,
+        input: {
+          material: source.content,
+          mode: "revise",
+          videoId: source.videoId,
+          allowedTypes,
+          slot: {
+            slotIndex: current.slotIndex,
+            probeType: current.probeType,
+            persona: current.persona,
+            expectedBehavior: current.expectedBehavior,
+            targetTurns: current.targetTurns,
+          },
+          previousProbe: {
+            question: current.question,
+            anchor: current.anchor,
+            trap: current.trap,
+          },
+          issues: review.issues,
+          feedback: review.feedback,
+          ...(siblings.length > 0 ? { existingQuestions: siblings } : {}),
+        },
+        inputRefs: { probe_id: probeId, mode: "revise", round_no: roundNo },
+        runRole,
+        parse: (raw) => parseProbeRevision(raw, allowedTypes),
+        callMaxAttempts,
+        callRetryDelayMs,
+        warmupGate,
+        warmupKey: "probe_writer",
+      });
+
+      const nextType = revised.probeType ?? current.probeType;
+      const nextTurns =
+        revised.targetTurns ?? (nextType === "hold_position" ? Math.max(2, current.targetTurns) : 1);
+      evalStore.reviseProbe(probeId, {
+        probeType: nextType,
+        persona: revised.persona ?? current.persona,
+        targetTurns: nextTurns,
+        question: revised.question,
+        anchor: revised.anchor || current.anchor,
+        trap: revised.trap || current.trap,
+        anchorVerified: verifyAnchorInMaterial(revised.anchor || current.anchor, source.content),
+      });
     }
-  };
 
-  const probeQueue: QueuedProbe[] = [];
-  const existingBySourceId = new Map<number, string[]>();
-  const latestQuestionsBySourceId = new Map<number, Map<number, string>>();
+    if (!criticPassed) return;
 
-  let skippedVideos = 0;
-  let plannedSlots = 0;
-  let draftedProbes = 0;
-  let draftErrors = 0;
-  let criticEvaluated = 0;
-  let criticAccepted = 0;
-  let bareChecked = 0;
-  let bareTriggeredRevisions = 0;
-  let verifierEvaluated = 0;
-  let verifierPassed = 0;
-  let probeErrors = 0;
+    // Stage 2: Reference + Verifier (emits rubric on pass) across 1..targetTurns
+    const probe = evalStore.getProbe(probeId)!;
+    const history: Array<{ role: "user" | "assistant"; content: string }> = [];
+    const usedTactics: AdversaryTactic[] = [];
+
+    for (let turnNo = 1; turnNo <= probe.targetTurns; turnNo++) {
+      const expectedBehavior = expectedBehaviorForTurn(probe.probeType, turnNo);
+      let userContent = probe.question;
+      let turnTrap = probe.trap;
+      let tactic: AdversaryTactic | null = null;
+
+      if (turnNo >= 2) {
+        const remainingTactics = ADVERSARY_TACTICS.filter((t) => !usedTactics.includes(t));
+        const availableTactics = remainingTactics.length > 0 ? remainingTactics : [...ADVERSARY_TACTICS];
+        const { result: adv } = await invokeTrackedRole({
+          evalStore,
+          runRef,
+          role: "adversary",
+          model: modelId,
+          systemPrompt: prompts.adversary,
+          input: {
+            material: source.content,
+            history,
+            probeType: probe.probeType,
+            persona: probe.persona,
+            availableTactics,
+            ...(usedTactics.length > 0 ? { usedTactics } : {}),
+            turnNo,
+            targetTurns: probe.targetTurns,
+            anchor: probe.anchor,
+          },
+          inputRefs: { probe_id: probeId, turn_no: turnNo },
+          runRole,
+          parse: (raw) => parseAdversaryTurn(raw, availableTactics),
+          callMaxAttempts,
+          callRetryDelayMs,
+          warmupGate,
+          warmupKey: "adversary",
+        });
+        tactic = adv.tactic;
+        usedTactics.push(tactic);
+        userContent = adv.userContent;
+        turnTrap = adv.trap || probe.trap;
+      }
+
+      let previousAnswer: string | undefined;
+      let feedback: string | undefined;
+      let passedAnswer: string | undefined;
+      let passedRubric: ProbeRubric | undefined;
+      let attemptsUsed = 0;
+
+      for (let attempt = 1; attempt <= maxAnswerAttempts; attempt++) {
+        attemptsUsed = attempt;
+        const { result: answerText } = await invokeTrackedRole({
+          evalStore,
+          runRef,
+          role: "reference",
+          model: modelId,
+          systemPrompt: prompts.reference,
+          input: {
+            material: source.content,
+            question: userContent,
+            probeType: probe.probeType,
+            expectedBehavior,
+            ...(history.length > 0 ? { history } : {}),
+            ...(previousAnswer ? { previousAnswer, feedback } : {}),
+          },
+          inputRefs: { probe_id: probeId, turn_no: turnNo, attempt },
+          runRole,
+          parse: (raw) => nonEmpty(raw, "参考答案"),
+          callMaxAttempts,
+          callRetryDelayMs,
+          warmupGate,
+          warmupKey: "reference",
+        });
+
+        const { result: verified } = await invokeTrackedRole({
+          evalStore,
+          runRef,
+          role: "verifier",
+          model: modelId,
+          systemPrompt: prompts.verifier,
+          input: {
+            material: source.content,
+            probeType: probe.probeType,
+            expectedBehavior,
+            question: userContent,
+            anchor: probe.anchor,
+            trap: turnTrap,
+            ...(history.length > 0 ? { history } : {}),
+            answer: answerText,
+          },
+          inputRefs: { probe_id: probeId, turn_no: turnNo, attempt },
+          runRole,
+          parse: (raw) => parseVerifierResult(raw, expectedBehavior),
+          callMaxAttempts,
+          callRetryDelayMs,
+          warmupGate,
+          warmupKey: "verifier",
+        });
+
+        if (verified.decision === "pass" && verified.rubric) {
+          passedAnswer = answerText;
+          passedRubric = verified.rubric;
+          break;
+        }
+        if (verified.decision === "drop" || attempt >= maxAnswerAttempts) {
+          const reason =
+            verified.decision === "drop"
+              ? `Turn ${turnNo} 核验淘汰：${verified.feedback}`
+              : `Turn ${turnNo} 参考答案返工 ${maxAnswerAttempts} 次仍未通过：${verified.feedback}`;
+          evalStore.setProbeStatus(probeId, "dropped", reason);
+          dropped++;
+          options.onProgress?.(`${tag} probe#${probeId} dropped: ${reason.slice(0, 60)}`);
+          return;
+        }
+        previousAnswer = answerText;
+        feedback = verified.feedback;
+      }
+
+      if (!passedAnswer || !passedRubric) return;
+
+      evalStore.saveProbeTurn({
+        probeId,
+        turnNo,
+        expectedBehavior,
+        tactic,
+        userContent,
+        referenceAnswer: passedAnswer,
+        rubric: passedRubric,
+        attempts: attemptsUsed,
+      });
+      history.push({ role: "user", content: userContent });
+      history.push({ role: "assistant", content: passedAnswer });
+    }
+
+    evalStore.setProbeStatus(probeId, "accepted");
+    accepted++;
+    byType[probe.probeType] = (byType[probe.probeType] ?? 0) + 1;
+    options.onProgress?.(`${tag} probe#${probeId} (${probe.probeType}, ${probe.targetTurns}t) accepted`);
+  }
 
   try {
-    // Stage 1: Agent-autonomous planning & drafting per video (0..maxProbesPerVideo)
-    await runConcurrentPool(sources, Math.min(concurrency, sources.length), async (source) => {
-      const existingQuestions = evalStore.listExistingQuestionsForVideoKey(source.videoKey);
-      existingBySourceId.set(source.id, existingQuestions);
-      const latestMap = new Map<number, string>();
-      latestQuestionsBySourceId.set(source.id, latestMap);
-      const tag = `[draft:${source.videoId}]`;
-      const mixGuidance = buildSoftMixGuidance(effectiveMix, liveTypeCounts);
-
+    await runConcurrentPool(sources, concurrency, async (source, idx) => {
+      const tag = `[build ${idx + 1}/${sources.length} ${source.videoId}]`;
       try {
-        const { parsed: batch } = await invokeTracked({
+        const guidance = buildSoftTypeGuidance(evalStore.countProbesByType(["accepted", "draft"]), allowedTypes);
+        const existingQuestions = evalStore.listExistingQuestionsForSource(source.id);
+
+        const { result: batch } = await invokeTrackedRole({
+          evalStore,
+          runRef,
           role: "probe_writer",
-          sourceMaterialId: source.id,
-          systemPrompt: writerPrompt,
-          inputRefs: {
-            source_material_id: source.id,
-            video_id: source.videoId,
-            mode: "draft",
-            max_probes: maxProbesPerVideo,
-          },
-          wireInput: {
+          model: modelId,
+          systemPrompt: prompts.probeWriter,
+          input: {
             material: source.content,
             mode: "draft",
             videoId: source.videoId,
             partCount: source.partCount,
             maxProbes: maxProbesPerVideo,
-            allowedTypes: mixGuidance.allowedTypes,
-            preferredMix: mixGuidance.targetWeights,
-            currentTypeCounts: mixGuidance.currentCounts,
-            underrepresentedTypes: mixGuidance.underrepresentedTypes,
-            suggestedPersonas: [...PROBE_PERSONAS],
+            allowedTypes,
+            currentTypeCounts: guidance.currentTypeCounts,
+            underrepresentedTypes: guidance.underrepresentedTypes,
+            suggestedPersonas: DEFAULT_PERSONAS,
             ...(existingQuestions.length > 0 ? { existingQuestions } : {}),
           },
-          parse: (raw) => parseDraftProbes(raw, { maxProbes: maxProbesPerVideo, allowedTypes }),
-          tag,
+          inputRefs: { source_material_id: source.id, video_id: source.videoId, mode: "draft" },
+          runRole,
+          parse: (raw) => parseProbeDraftBatch(raw, { maxProbes: maxProbesPerVideo, allowedTypes }),
+          callMaxAttempts,
+          callRetryDelayMs,
+          warmupGate,
+          warmupKey: "probe_writer",
         });
 
+        sourcesProcessed++;
         if (batch.probes.length === 0) {
-          skippedVideos++;
-          options.onProgress?.(`${tag} 出题员主动跳过本视频（0 题）`);
+          sourcesSkipped++;
+          options.onProgress?.(`${tag} 跳过（${batch.skipReason ?? "无合适考题"}）`);
           return;
         }
 
-        evalStore.transaction(() => {
-          for (const item of batch.probes) {
-            const specId = evalStore.createSpec({
-              runId,
-              sourceMaterialId: source.id,
-              slotIndex: item.slotIndex,
-              probeType: item.probeType,
-              persona: item.persona,
-              targetTurns: item.targetTurns,
-            });
-            const anchorVerified = item.anchor.length > 0 && verifyAnchorInMaterial(item.anchor, source.content);
-            const probeId = evalStore.createProbe({
-              specId,
-              question: item.question,
-              anchor: item.anchor,
-              trap: item.trap,
-              expectedBehavior: item.expectedBehavior,
-              anchorVerified,
-            });
-            plannedSlots++;
-            draftedProbes++;
-            liveTypeCounts[item.probeType] = (liveTypeCounts[item.probeType] ?? 0) + 1;
-            latestMap.set(probeId, item.question);
-            probeQueue.push({
-              probeId,
-              specId,
-              slotIndex: item.slotIndex,
-              source,
-              probeType: item.probeType,
-              persona: item.persona,
-              expectedBehavior: item.expectedBehavior,
-              targetTurns: item.targetTurns,
-              question: item.question,
-              anchor: item.anchor,
-              trap: item.trap,
-              anchorVerified,
-            });
-          }
-        });
-        options.onProgress?.(`${tag} 自主规划并出题 ${batch.probes.length} 题（上限 ${maxProbesPerVideo}）`);
-      } catch (error) {
-        draftErrors++;
-        options.onProgress?.(`${tag} probe-writer 失败：${publicErrorMessage(error)}`);
-      }
-    });
-
-    // Stage 2: Per-probe concurrent Agent Loop:
-    //   2A: [probe-critic <-> probe-writer] -> [optional blind bare_answer -> probe-critic(bare_check) -> probe-writer]
-    //   2B+2C: [per-turn adversary -> probe-critic -> reference <-> verifier] -> [rubric-v2 -> atomic accept]
-    await runConcurrentPool(probeQueue, concurrency, async (item) => {
-      const { probeId, specId, slotIndex, source } = item;
-      const current: MutableProbeState = {
-        probeType: item.probeType,
-        persona: item.persona,
-        expectedBehavior: item.expectedBehavior,
-        targetTurns: item.targetTurns,
-        question: item.question,
-        anchor: item.anchor,
-        trap: item.trap,
-        anchorVerified: item.anchorVerified,
-      };
-      const makeTag = () => `[p${probeId}:${source.videoId}:s${slotIndex}:${current.probeType}]`;
-
-      const collectSiblingQuestions = (): string[] => {
-        const list = [...(existingBySourceId.get(source.id) ?? [])];
-        const latestMap = latestQuestionsBySourceId.get(source.id);
-        if (latestMap) {
-          for (const [otherId, qText] of latestMap.entries()) {
-            if (otherId !== probeId) list.push(qText);
+        for (let i = 0; i < batch.probes.length; i++) {
+          try {
+            await processOneProbe(source, i + 1, batch.probes[i]!, tag);
+          } catch (error) {
+            errors++;
+            options.onProgress?.(`${tag} slot#${i + 1} 失败：${publicErrorMessage(error)}`);
           }
         }
-        return list;
-      };
-
-      try {
-        criticEvaluated++;
-        const criticResult = await runProbeCriticStage({
-          evalStore,
-          invokeTracked,
-          probeId,
-          specId,
-          slotIndex,
-          source,
-          current,
-          allowedTypes,
-          writerPrompt,
-          criticPrompt,
-          maxCriticRevisions,
-          bareCheck: bareEnabled && options.runBareModel && barePrompt && bareModelId
-            ? {
-                runBareModel: options.runBareModel,
-                barePrompt,
-                bareModelId,
-                maxBareRefinements,
-              }
-            : undefined,
-          collectSiblingQuestions,
-          onQuestionUpdated: (q) => latestQuestionsBySourceId.get(source.id)?.set(probeId, q),
-          onQuestionRemoved: () => latestQuestionsBySourceId.get(source.id)?.delete(probeId),
-          makeTag,
-          onProgress: options.onProgress,
-        });
-        bareChecked += criticResult.bareChecked;
-        bareTriggeredRevisions += criticResult.bareTriggeredRevisions;
-        if (!criticResult.accepted) return;
-
-        criticAccepted++;
-        evalStore.setProbeStatus(probeId, "answering");
-
-        verifierEvaluated++;
-        const dialogueResult = await runProbeDialogueStage({
-          evalStore,
-          invokeTracked,
-          probeId,
-          source,
-          current,
-          criticPrompt,
-          referencePrompt,
-          verifierPrompt,
-          adversaryPrompt,
-          rubricPrompt,
-          maxCriticRevisions,
-          maxAnswerAttempts,
-          makeTag,
-          onProgress: options.onProgress,
-        });
-        if (dialogueResult.verifierPassed) {
-          verifierPassed++;
-        }
       } catch (error) {
-        probeErrors++;
-        const msg = publicErrorMessage(error);
-        evalStore.setProbeStatus(probeId, "error", msg);
-        options.onProgress?.(`${makeTag()} error: ${msg}`);
+        errors++;
+        options.onProgress?.(`${tag} 出题失败：${publicErrorMessage(error)}`);
       }
     });
 
@@ -452,49 +523,16 @@ export async function runProbeBuild(options: RunProbeBuildOptions): Promise<RunP
     throw toPublicError(error);
   }
 
-  const probes = evalStore.listProbes({ runId });
-  const statusCounts: Record<string, number> = {};
-  const acceptedByType: Record<string, number> = {};
-  const acceptedByPersona: Record<string, number> = {};
-  let acceptedAnchorVerified = 0;
-  let acceptedTurns = 0;
-
-  for (const p of probes) {
-    statusCounts[p.status] = (statusCounts[p.status] ?? 0) + 1;
-    if (p.status === "accepted") {
-      acceptedByType[p.probeType] = (acceptedByType[p.probeType] ?? 0) + 1;
-      acceptedByPersona[p.persona] = (acceptedByPersona[p.persona] ?? 0) + 1;
-      if (p.anchorVerified) acceptedAnchorVerified++;
-      acceptedTurns += evalStore.getProbeDialogue(p.id).length;
-    }
-  }
-
-  const accepted = statusCounts.accepted ?? 0;
-
   return {
     runId,
-    modelId,
-    ...(bareModelId ? { bareModelId } : {}),
-    videos: sources.length,
-    skippedVideos,
-    plannedSlots,
-    draftedProbes,
-    draftErrors,
-    criticEvaluated,
-    criticAccepted,
-    criticAcceptRate: criticEvaluated > 0 ? Number((criticAccepted / criticEvaluated).toFixed(4)) : 0,
-    bareChecked,
-    bareTriggeredRevisions,
-    verifierEvaluated,
-    verifierPassed,
-    verifierPassRate: verifierEvaluated > 0 ? Number((verifierPassed / verifierEvaluated).toFixed(4)) : 0,
-    statusCounts,
+    sourcesProcessed,
+    sourcesSkipped,
+    probesCreated,
     accepted,
-    acceptedTurns,
-    acceptedByType,
-    acceptedByPersona,
-    anchorVerifiedRate: accepted > 0 ? Number((acceptedAnchorVerified / accepted).toFixed(4)) : 0,
+    rejected,
+    dropped,
+    errors,
+    byType,
     totalAgentCalls: evalStore.countAgentCalls(runRef),
-    errors: draftErrors + probeErrors,
   };
 }

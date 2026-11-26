@@ -1,336 +1,280 @@
 import type { DatabaseSync } from "node:sqlite";
-import { EXPECTED_BEHAVIORS, PROBE_TYPES, type Row } from "./types.js";
+import { EVAL_SCHEMA_VERSION } from "./types.js";
 
-const q = (values: readonly string[]) => values.map((v) => `'${v}'`).join(",");
-
-export const EVAL_SCHEMA_SQL = `
+/**
+ * Isolated Evaluation Database Schema v3 (12 tables, fresh-only — no v1/v2 migrations).
+ *
+ * Tables:
+ *  1. eval_meta
+ *  2. source_materials  (immutable; keeps video_key for synth/eval-guard.ts)
+ *  3. probe_runs
+ *  4. probes            (absorbs probe_specs + critic reviews + difficulty)
+ *  5. probe_turns       (absorbs reference_answer + rubric_json + attempts)
+ *  6. probe_calibrations
+ *  7. suite_versions    (immutable frozen suites)
+ *  8. suite_items       (immutable; keeps video_key for synth/eval-guard.ts)
+ *  9. eval_runs
+ * 10. eval_predictions
+ * 11. eval_scores
+ * 12. agent_calls
+ */
+export const EVAL_SCHEMA_V3_SQL = `
 CREATE TABLE IF NOT EXISTS eval_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS source_materials (
-  id INTEGER PRIMARY KEY,
-  video_id TEXT NOT NULL UNIQUE CHECK(length(trim(video_id)) > 0),
-  video_key TEXT NOT NULL CHECK(length(trim(video_key)) > 0),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  video_id TEXT NOT NULL,
+  video_key TEXT NOT NULL,
   main_material_id INTEGER,
-  split_snapshot TEXT NOT NULL CHECK(split_snapshot = 'test'),
-  part_count INTEGER NOT NULL CHECK(part_count >= 1),
-  content TEXT NOT NULL CHECK(length(trim(content)) > 0),
-  content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64),
+  part_count INTEGER NOT NULL DEFAULT 1 CHECK(part_count >= 1),
+  content TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
   source_path TEXT,
-  imported_at TEXT NOT NULL
+  split_snapshot TEXT NOT NULL CHECK(split_snapshot = 'test'),
+  imported_at TEXT NOT NULL,
+  UNIQUE(video_id, content_sha256)
 );
-CREATE INDEX IF NOT EXISTS idx_source_materials_video_key ON source_materials(video_key);
+CREATE INDEX IF NOT EXISTS idx_eval_sources_video_key ON source_materials(video_key);
+
+CREATE TRIGGER IF NOT EXISTS trg_eval_sources_immutable_update
+BEFORE UPDATE ON source_materials
+BEGIN
+  SELECT RAISE(ABORT, 'source_materials snapshots are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_eval_sources_immutable_delete
+BEFORE DELETE ON source_materials
+BEGIN
+  SELECT RAISE(ABORT, 'source_materials snapshots cannot be deleted');
+END;
 
 CREATE TABLE IF NOT EXISTS probe_runs (
-  id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK(kind IN ('probe_build','calibrate','mirror')),
-  status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
-  config_json TEXT NOT NULL CHECK(json_valid(config_json)),
-  prompts_json TEXT NOT NULL CHECK(json_valid(prompts_json)),
-  skills_json TEXT NOT NULL CHECK(json_valid(skills_json)),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK(kind IN ('probe_build', 'calibrate')),
+  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'interrupted')),
+  config_json TEXT NOT NULL,
+  prompts_json TEXT NOT NULL,
+  skills_json TEXT NOT NULL,
   started_at TEXT NOT NULL,
-  finished_at TEXT,
+  ended_at TEXT,
   error TEXT
 );
 
-CREATE TABLE IF NOT EXISTS probe_specs (
-  id INTEGER PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS probes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL REFERENCES probe_runs(id),
   source_material_id INTEGER NOT NULL REFERENCES source_materials(id),
   slot_index INTEGER NOT NULL CHECK(slot_index >= 1),
-  probe_type TEXT NOT NULL CHECK(probe_type IN (${q(PROBE_TYPES)})),
+  probe_type TEXT NOT NULL CHECK(probe_type IN (
+    'answer', 'correct_premise', 'acknowledge_gap', 'refuse', 'hold_position'
+  )),
   persona TEXT NOT NULL,
-  target_turns INTEGER NOT NULL CHECK(target_turns BETWEEN 1 AND 3),
-  UNIQUE(run_id, source_material_id, slot_index)
-);
-
-CREATE TABLE IF NOT EXISTS probes (
-  id INTEGER PRIMARY KEY,
-  spec_id INTEGER NOT NULL UNIQUE REFERENCES probe_specs(id),
-  question TEXT NOT NULL CHECK(length(trim(question)) > 0),
+  target_turns INTEGER NOT NULL DEFAULT 1 CHECK(target_turns BETWEEN 1 AND 3),
+  question TEXT NOT NULL,
   anchor TEXT NOT NULL,
   trap TEXT NOT NULL,
-  expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
-  status TEXT NOT NULL CHECK(status IN ('drafted','rejected','answering','dropped','error','accepted')),
-  anchor_verified INTEGER NOT NULL DEFAULT 0 CHECK(anchor_verified IN (0,1)),
-  revisions INTEGER NOT NULL DEFAULT 0,
+  anchor_verified INTEGER NOT NULL DEFAULT 0 CHECK(anchor_verified IN (0, 1)),
+  status TEXT NOT NULL CHECK(status IN ('draft', 'accepted', 'rejected', 'dropped')),
+  revisions INTEGER NOT NULL DEFAULT 0 CHECK(revisions >= 0),
+  reviews_json TEXT NOT NULL DEFAULT '[]',
   reject_reason TEXT,
-  difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard')),
+  difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy', 'medium', 'hard')),
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  UNIQUE(run_id, source_material_id, slot_index)
 );
+CREATE INDEX IF NOT EXISTS idx_probes_run_status ON probes(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_probes_source ON probes(source_material_id);
+CREATE INDEX IF NOT EXISTS idx_probes_type ON probes(probe_type);
+CREATE INDEX IF NOT EXISTS idx_probes_difficulty ON probes(difficulty);
 
-CREATE TABLE IF NOT EXISTS probe_reviews (
-  id INTEGER PRIMARY KEY,
-  probe_id INTEGER NOT NULL REFERENCES probes(id),
-  round_no INTEGER NOT NULL CHECK(round_no >= 1),
-  decision TEXT NOT NULL CHECK(decision IN ('accept','revise','reject')),
-  issues_json TEXT NOT NULL CHECK(json_valid(issues_json)),
-  feedback TEXT NOT NULL DEFAULT '',
-  question_snapshot TEXT NOT NULL,
-  call_id INTEGER REFERENCES agent_calls(id),
-  created_at TEXT NOT NULL,
-  UNIQUE(probe_id, round_no)
-);
+CREATE TRIGGER IF NOT EXISTS trg_probes_lock_question_after_accept
+BEFORE UPDATE ON probes
+WHEN OLD.status = 'accepted' AND NEW.question != OLD.question
+BEGIN
+  SELECT RAISE(ABORT, 'accepted probe question is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS probe_turns (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   probe_id INTEGER NOT NULL REFERENCES probes(id),
   turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
+  expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (
+    'answer', 'correct_premise', 'acknowledge_gap', 'refuse', 'hold_position'
+  )),
+  tactic TEXT CHECK(tactic IS NULL OR tactic IN (
+    'pushback', 'label', 'force_binary', 'flatter_flip', 'emotional'
+  )),
   user_content TEXT NOT NULL,
-  tactic TEXT,
-  expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
-  passed_attempt_id INTEGER,
-  status TEXT NOT NULL CHECK(status IN ('running','pass','dropped','exhausted','error')),
+  reference_answer TEXT NOT NULL,
+  rubric_json TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 1 CHECK(attempts >= 1),
+  created_at TEXT NOT NULL,
   UNIQUE(probe_id, turn_no)
 );
-
-CREATE TABLE IF NOT EXISTS probe_attempts (
-  id INTEGER PRIMARY KEY,
-  turn_id INTEGER NOT NULL REFERENCES probe_turns(id),
-  attempt_no INTEGER NOT NULL CHECK(attempt_no >= 1),
-  answer TEXT,
-  decision TEXT CHECK(decision IS NULL OR decision IN ('pass','revise','drop')),
-  issues_json TEXT,
-  feedback TEXT,
-  answer_call_id INTEGER REFERENCES agent_calls(id),
-  verify_call_id INTEGER REFERENCES agent_calls(id),
-  UNIQUE(turn_id, attempt_no)
-);
-
-CREATE TABLE IF NOT EXISTS probe_rubrics (
-  id INTEGER PRIMARY KEY,
-  turn_id INTEGER NOT NULL UNIQUE REFERENCES probe_turns(id),
-  rubric_json TEXT NOT NULL CHECK(json_valid(rubric_json)),
-  call_id INTEGER REFERENCES agent_calls(id),
-  created_at TEXT NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_probe_turns_probe ON probe_turns(probe_id, turn_no);
 
 CREATE TABLE IF NOT EXISTS probe_calibrations (
-  id INTEGER PRIMARY KEY,
-  run_id INTEGER NOT NULL REFERENCES probe_runs(id),
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   probe_id INTEGER NOT NULL REFERENCES probes(id),
   turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
   bare_model TEXT NOT NULL,
   grader_model TEXT NOT NULL,
-  bare_answer TEXT,
-  behavior_ok INTEGER CHECK(behavior_ok IS NULL OR behavior_ok IN (0,1)),
-  stance INTEGER CHECK(stance IS NULL OR stance BETWEEN 0 AND 2),
-  key_point_coverage REAL CHECK(key_point_coverage IS NULL OR key_point_coverage BETWEEN 0 AND 1),
-  forbidden_hits INTEGER,
-  hallucination_hits INTEGER,
-  failure_signal_hits INTEGER,
-  style INTEGER CHECK(style IS NULL OR style BETWEEN 0 AND 2),
-  score REAL,
-  detail_json TEXT CHECK(detail_json IS NULL OR json_valid(detail_json)),
-  bare_call_id INTEGER REFERENCES agent_calls(id),
-  grade_call_id INTEGER REFERENCES agent_calls(id),
+  bare_answer TEXT NOT NULL,
+  behavior_ok INTEGER NOT NULL CHECK(behavior_ok IN (0, 1)),
+  score REAL NOT NULL CHECK(score >= 0 AND score <= 100),
+  detail_json TEXT NOT NULL,
+  bare_call_id INTEGER,
+  grader_call_id INTEGER,
   created_at TEXT NOT NULL,
-  UNIQUE(run_id, probe_id, turn_no)
+  UNIQUE(probe_id, turn_no, bare_model, grader_model)
 );
-CREATE INDEX IF NOT EXISTS idx_probe_calibrations_probe ON probe_calibrations(probe_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_probe_calibrations_probe ON probe_calibrations(probe_id, turn_no);
 
 CREATE TABLE IF NOT EXISTS suite_versions (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE,
-  kind TEXT NOT NULL CHECK(kind IN ('in_distribution','adversarial')),
-  item_count INTEGER NOT NULL CHECK(item_count >= 1),
-  manifest_json TEXT NOT NULL CHECK(json_valid(manifest_json)),
-  sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
-  created_at TEXT NOT NULL
+  item_count INTEGER NOT NULL CHECK(item_count >= 0),
+  sha256 TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  frozen_at TEXT NOT NULL
 );
 
+CREATE TRIGGER IF NOT EXISTS trg_suite_versions_immutable_update
+BEFORE UPDATE ON suite_versions
+BEGIN
+  SELECT RAISE(ABORT, 'suite_versions are immutable once frozen');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_suite_versions_immutable_delete
+BEFORE DELETE ON suite_versions
+BEGIN
+  SELECT RAISE(ABORT, 'suite_versions cannot be deleted once frozen');
+END;
+
 CREATE TABLE IF NOT EXISTS suite_items (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   suite_id INTEGER NOT NULL REFERENCES suite_versions(id),
   item_key TEXT NOT NULL,
   video_key TEXT NOT NULL,
-  probe_type TEXT,
-  expected_behavior TEXT,
-  difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard')),
-  messages_json TEXT NOT NULL CHECK(json_valid(messages_json)),
-  rubrics_json TEXT NOT NULL CHECK(json_valid(rubrics_json)),
+  probe_type TEXT NOT NULL CHECK(probe_type IN (
+    'answer', 'correct_premise', 'acknowledge_gap', 'refuse', 'hold_position'
+  )),
+  difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy', 'medium', 'hard')),
+  messages_json TEXT NOT NULL,
+  rubrics_json TEXT NOT NULL,
   UNIQUE(suite_id, item_key)
 );
+CREATE INDEX IF NOT EXISTS idx_suite_items_suite ON suite_items(suite_id);
+CREATE INDEX IF NOT EXISTS idx_suite_items_video ON suite_items(video_key);
+
+CREATE TRIGGER IF NOT EXISTS trg_suite_items_immutable_update
+BEFORE UPDATE ON suite_items
+BEGIN
+  SELECT RAISE(ABORT, 'suite_items are immutable once frozen');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_suite_items_immutable_delete
+BEFORE DELETE ON suite_items
+BEGIN
+  SELECT RAISE(ABORT, 'suite_items cannot be deleted once frozen');
+END;
 
 CREATE TABLE IF NOT EXISTS eval_runs (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   suite_id INTEGER NOT NULL REFERENCES suite_versions(id),
-  candidate TEXT NOT NULL CHECK(length(trim(candidate)) > 0),
-  model TEXT NOT NULL CHECK(length(trim(model)) > 0),
-  history_mode TEXT NOT NULL CHECK(history_mode IN ('gold','self')),
-  config_json TEXT NOT NULL CHECK(json_valid(config_json)),
-  status TEXT NOT NULL CHECK(status IN ('running','completed','failed','interrupted')),
+  candidate TEXT NOT NULL,
+  model TEXT NOT NULL,
+  history_mode TEXT NOT NULL CHECK(history_mode IN ('gold', 'self')),
+  system_prompt TEXT,
+  config_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed', 'interrupted')),
   started_at TEXT NOT NULL,
-  finished_at TEXT,
+  ended_at TEXT,
   error TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_eval_runs_suite_candidate ON eval_runs(suite_id, candidate, id);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_suite_cand ON eval_runs(suite_id, candidate);
 
 CREATE TABLE IF NOT EXISTS eval_predictions (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   eval_run_id INTEGER NOT NULL REFERENCES eval_runs(id),
   suite_item_id INTEGER NOT NULL REFERENCES suite_items(id),
   turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
-  input_json TEXT NOT NULL CHECK(json_valid(input_json)),
+  input_json TEXT NOT NULL,
   output_text TEXT,
   error TEXT,
-  call_id INTEGER REFERENCES agent_calls(id),
+  call_id INTEGER,
   created_at TEXT NOT NULL,
   UNIQUE(eval_run_id, suite_item_id, turn_no)
 );
-CREATE INDEX IF NOT EXISTS idx_eval_predictions_run ON eval_predictions(eval_run_id, suite_item_id, turn_no);
+CREATE INDEX IF NOT EXISTS idx_eval_predictions_run ON eval_predictions(eval_run_id);
 
 CREATE TABLE IF NOT EXISTS eval_scores (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   prediction_id INTEGER NOT NULL UNIQUE REFERENCES eval_predictions(id),
   grader_model TEXT NOT NULL,
-  behavior_ok INTEGER NOT NULL CHECK(behavior_ok IN (0,1)),
+  behavior_ok INTEGER NOT NULL CHECK(behavior_ok IN (0, 1)),
   stance INTEGER NOT NULL CHECK(stance BETWEEN 0 AND 2),
-  key_point_coverage REAL NOT NULL CHECK(key_point_coverage BETWEEN 0 AND 1),
-  forbidden_hits INTEGER NOT NULL,
-  hallucination_hits INTEGER NOT NULL,
-  failure_signal_hits INTEGER NOT NULL,
+  key_point_coverage REAL NOT NULL CHECK(key_point_coverage >= 0 AND key_point_coverage <= 1),
+  forbidden_hits INTEGER NOT NULL DEFAULT 0 CHECK(forbidden_hits >= 0),
+  hallucination_hits INTEGER NOT NULL DEFAULT 0 CHECK(hallucination_hits >= 0),
+  failure_signal_hits INTEGER NOT NULL DEFAULT 0 CHECK(failure_signal_hits >= 0),
   style INTEGER NOT NULL CHECK(style BETWEEN 0 AND 2),
-  score REAL NOT NULL,
-  detail_json TEXT NOT NULL CHECK(json_valid(detail_json)),
-  call_id INTEGER REFERENCES agent_calls(id),
+  score REAL NOT NULL CHECK(score >= 0 AND score <= 100),
+  detail_json TEXT NOT NULL,
+  call_id INTEGER,
   created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_calls (
-  id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_ref TEXT NOT NULL,
   role TEXT NOT NULL,
   model TEXT NOT NULL,
-  input_refs_json TEXT NOT NULL CHECK(json_valid(input_refs_json)),
+  input_refs_json TEXT NOT NULL,
   output_text TEXT,
-  status TEXT NOT NULL CHECK(status IN ('running','completed','error','interrupted')),
   error TEXT,
   started_at TEXT NOT NULL,
-  finished_at TEXT
+  ended_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_agent_calls_run_ref ON agent_calls(run_ref);
-
--- Immutability: snapshots and frozen suites are append-only.
-CREATE TRIGGER IF NOT EXISTS trg_source_materials_no_update BEFORE UPDATE ON source_materials
-BEGIN SELECT RAISE(ABORT, 'source_materials is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_source_materials_no_delete BEFORE DELETE ON source_materials
-BEGIN SELECT RAISE(ABORT, 'source_materials is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_suite_versions_no_update BEFORE UPDATE ON suite_versions
-BEGIN SELECT RAISE(ABORT, 'suite_versions is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_suite_versions_no_delete BEFORE DELETE ON suite_versions
-BEGIN SELECT RAISE(ABORT, 'suite_versions is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_suite_items_no_update BEFORE UPDATE ON suite_items
-BEGIN SELECT RAISE(ABORT, 'suite_items is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_suite_items_no_delete BEFORE DELETE ON suite_items
-BEGIN SELECT RAISE(ABORT, 'suite_items is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS trg_probes_accepted_frozen BEFORE UPDATE OF question, anchor, trap, expected_behavior ON probes
-WHEN OLD.status = 'accepted'
-BEGIN SELECT RAISE(ABORT, 'accepted probe text is frozen'); END;
+CREATE INDEX IF NOT EXISTS idx_agent_calls_run_role ON agent_calls(run_ref, role);
 `;
 
 /**
- * Safely upgrades older eval.sqlite schemas in-place:
- * 1. Adds `suite_items.difficulty` if missing.
- * 2. Upgrades v1 `probe_specs` / `probes` / `probe_turns` CHECK constraints to accept `trap_*` probe types and `refuse`.
+ * Verifies an existing eval DB is Schema v3 (rejecting v1/v2 without migration)
+ * or initializes a brand-new database with Schema v3.
  */
-export function migrateEvalSchema(
-  db: DatabaseSync,
-  hasColumn: (table: string, column: string) => boolean,
-  transaction: <T>(fn: () => T) => T,
-): void {
-  if (!hasColumn("suite_items", "difficulty")) {
-    db.exec("ALTER TABLE suite_items ADD COLUMN difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard'));");
-  }
+export function ensureEvalSchemaV3(db: DatabaseSync, readOnly: boolean): void {
+  const tables = (
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{
+      name: string;
+    }>
+  ).map((r) => r.name);
 
-  const specsRow = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probe_specs'")
-    .get() as Row | undefined;
-  const probesRow = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probes'")
-    .get() as Row | undefined;
-  const turnsRow = db
-    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'probe_turns'")
-    .get() as Row | undefined;
-
-  const specsSql = String(specsRow?.sql ?? "");
-  const probesSql = String(probesRow?.sql ?? "");
-  const turnsSql = String(turnsRow?.sql ?? "");
-  if (
-    specsSql.includes("'trap_misattribution'") &&
-    probesSql.includes("'refuse'") &&
-    turnsSql.includes("'refuse'")
-  ) {
+  if (tables.length > 0) {
+    let foundVersion: string | null = null;
+    if (tables.includes("eval_meta")) {
+      const row = db.prepare("SELECT value FROM eval_meta WHERE key = 'schema_version'").get() as
+        | { value: string }
+        | undefined;
+      foundVersion = row?.value ?? null;
+    }
+    if (foundVersion !== EVAL_SCHEMA_VERSION) {
+      const label = foundVersion ? `v${foundVersion}` : "旧版";
+      throw new Error(
+        `评测库 schema 版本不兼容（当前 ${label}，需要 v${EVAL_SCHEMA_VERSION}）。请删除或改名 data/eval.sqlite 后重新运行 npm run dm -- eval make 重建。`,
+      );
+    }
     return;
   }
 
-  db.exec("PRAGMA foreign_keys = OFF;");
-  try {
-    transaction(() => {
-      db.exec("DROP TRIGGER IF EXISTS trg_probes_accepted_frozen;");
-      db.exec(`
-        CREATE TABLE probe_specs__v2 (
-          id INTEGER PRIMARY KEY,
-          run_id INTEGER NOT NULL REFERENCES probe_runs(id),
-          source_material_id INTEGER NOT NULL REFERENCES source_materials(id),
-          slot_index INTEGER NOT NULL CHECK(slot_index >= 1),
-          probe_type TEXT NOT NULL CHECK(probe_type IN (${q(PROBE_TYPES)})),
-          persona TEXT NOT NULL,
-          target_turns INTEGER NOT NULL CHECK(target_turns BETWEEN 1 AND 3),
-          UNIQUE(run_id, source_material_id, slot_index)
-        );
-        INSERT INTO probe_specs__v2 SELECT id, run_id, source_material_id, slot_index, probe_type, persona, target_turns FROM probe_specs;
-        DROP TABLE probe_specs;
-        ALTER TABLE probe_specs__v2 RENAME TO probe_specs;
-
-        CREATE TABLE probes__v2 (
-          id INTEGER PRIMARY KEY,
-          spec_id INTEGER NOT NULL UNIQUE REFERENCES probe_specs(id),
-          question TEXT NOT NULL CHECK(length(trim(question)) > 0),
-          anchor TEXT NOT NULL,
-          trap TEXT NOT NULL,
-          expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
-          status TEXT NOT NULL CHECK(status IN ('drafted','rejected','answering','dropped','error','accepted')),
-          anchor_verified INTEGER NOT NULL DEFAULT 0 CHECK(anchor_verified IN (0,1)),
-          revisions INTEGER NOT NULL DEFAULT 0,
-          reject_reason TEXT,
-          difficulty TEXT CHECK(difficulty IS NULL OR difficulty IN ('easy','medium','hard')),
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        INSERT INTO probes__v2 SELECT id, spec_id, question, anchor, trap, expected_behavior, status, anchor_verified, revisions, reject_reason, difficulty, created_at, updated_at FROM probes;
-        DROP TABLE probes;
-        ALTER TABLE probes__v2 RENAME TO probes;
-
-        CREATE TABLE probe_turns__v2 (
-          id INTEGER PRIMARY KEY,
-          probe_id INTEGER NOT NULL REFERENCES probes(id),
-          turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
-          user_content TEXT NOT NULL,
-          tactic TEXT,
-          expected_behavior TEXT NOT NULL CHECK(expected_behavior IN (${q(EXPECTED_BEHAVIORS)})),
-          passed_attempt_id INTEGER,
-          status TEXT NOT NULL CHECK(status IN ('running','pass','dropped','exhausted','error')),
-          UNIQUE(probe_id, turn_no)
-        );
-        INSERT INTO probe_turns__v2 SELECT id, probe_id, turn_no, user_content, tactic, expected_behavior, passed_attempt_id, status FROM probe_turns;
-        DROP TABLE probe_turns;
-        ALTER TABLE probe_turns__v2 RENAME TO probe_turns;
-
-        CREATE TRIGGER trg_probes_accepted_frozen BEFORE UPDATE OF question, anchor, trap, expected_behavior ON probes
-        WHEN OLD.status = 'accepted'
-        BEGIN SELECT RAISE(ABORT, 'accepted probe text is frozen'); END;
-      `);
-    });
-  } finally {
-    db.exec("PRAGMA foreign_keys = ON;");
+  if (readOnly) {
+    throw new Error("只读模式下评测库尚未初始化，请先运行 npm run dm -- eval make。");
   }
 
-  const fkErrors = db.prepare("PRAGMA foreign_key_check;").all() as Row[];
-  if (fkErrors.length > 0) {
-    throw new Error(`评测库迁移 schema v2 后外键校验失败：${JSON.stringify(fkErrors[0])}`);
-  }
+  db.exec(EVAL_SCHEMA_V3_SQL);
+  db.prepare("INSERT OR REPLACE INTO eval_meta (key, value) VALUES ('schema_version', ?)").run(EVAL_SCHEMA_VERSION);
 }

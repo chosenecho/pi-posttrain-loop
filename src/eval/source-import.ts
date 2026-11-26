@@ -1,28 +1,9 @@
 import { nonEmpty } from "../shared/schema.js";
-import type { DatasetSplit, EvalRubric } from "../shared/types.js";
-import { createSeededRng, extractVideoKey, nowIso, sha256Hex, shuffleInPlace } from "../shared/utils.js";
-import { loadVideoChunks, queryProcessedVideoIndex, scanCorpusVideos, type VideoUnit } from "../synth/corpus.js";
-import { DataMakerStore, formatSamplesJsonl } from "../synth/store/index.js";
+import type { DatasetSplit } from "../shared/types.js";
+import { createSeededRng, extractVideoKey, sha256Hex, shuffleInPlace } from "../shared/utils.js";
+import { loadVideoChunks, scanCorpusVideos, type VideoUnit } from "../synth/corpus.js";
+import { DataMakerStore } from "../synth/store/index.js";
 import { EvalStore, type SourceMaterialRecord } from "./store/index.js";
-
-function collectMainUsedVideoKeys(mainStore: DataMakerStore): Set<string> {
-  const used = new Set<string>(queryProcessedVideoIndex(mainStore).processedVideoKeys);
-  for (const version of mainStore.listTestSetVersions()) {
-    try {
-      const manifest = JSON.parse(version.manifest_json) as { videoKeys?: unknown };
-      if (Array.isArray(manifest.videoKeys)) {
-        for (const key of manifest.videoKeys) {
-          if (typeof key === "string" && key.trim()) {
-            used.add(extractVideoKey(key));
-          }
-        }
-      }
-    } catch {
-      // Ignore malformed manifest JSON
-    }
-  }
-  return used;
-}
 
 function loadMainMaterialIndex(mainStore: DataMakerStore): Map<string, { id: number; sha256: string }> {
   const rows = mainStore.listMaterialIndex();
@@ -42,7 +23,6 @@ export interface ImportTestSourcesOptions {
   limit?: number;
   shuffle?: boolean;
   seed?: number;
-  excludeUsed?: boolean;
   maxChunkChars?: number;
 }
 
@@ -57,7 +37,7 @@ export interface ImportTestSourcesReport {
 
 /**
  * Imports immutable snapshots of `split = 'test'` video transcripts into `eval.sqlite`.
- * Always opens the main database with `readOnly: true` and refuses non-test videos.
+ * Always opens the main database read-only and refuses any non-test video.
  */
 export async function importTestSources(options: ImportTestSourcesOptions): Promise<ImportTestSourcesReport> {
   const { evalStore, mainDbPath } = options;
@@ -79,9 +59,10 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       splitByKey.set(row.video_key, row.split);
     }
 
-    const requestedKeys = options.videoKeys && options.videoKeys.length > 0
-      ? [...new Set(options.videoKeys.map((k) => extractVideoKey(nonEmpty(k, "videoKey"))))]
-      : undefined;
+    const requestedKeys =
+      options.videoKeys && options.videoKeys.length > 0
+        ? [...new Set(options.videoKeys.map((k) => extractVideoKey(nonEmpty(k, "videoKey"))))]
+        : undefined;
 
     if (requestedKeys) {
       for (const key of requestedKeys) {
@@ -92,38 +73,25 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       }
     }
 
-    const usedKeys = options.excludeUsed
-      ? new Set<string>([...collectMainUsedVideoKeys(mainStore), ...evalStore.listEvalVideoKeys()])
-      : new Set<string>();
     const mainMaterialIndex = loadMainMaterialIndex(mainStore);
 
-    // Source mode 1: Corpus directory or explicit VideoUnit list
+    // Mode 1: Corpus directory or explicit VideoUnit list
     if (options.units !== undefined || options.inputDir !== undefined) {
-      const units = options.units ?? await scanCorpusVideos(options.inputDir!);
+      const units = options.units ?? (await scanCorpusVideos(options.inputDir!));
       const requestedSet = requestedKeys ? new Set(requestedKeys) : undefined;
-
       const candidates = units.filter((unit) => {
         const videoKey = extractVideoKey(unit.videoId);
         if (splitByKey.get(videoKey) !== "test") return false;
         if (requestedSet && !requestedSet.has(videoKey)) return false;
-        if (!requestedSet && options.excludeUsed && usedKeys.has(videoKey)) return false;
         return true;
       });
 
-      if (requestedSet) {
-        const foundKeys = new Set(candidates.map((u) => extractVideoKey(u.videoId)));
-        const missing = [...requestedSet].filter((k) => !foundKeys.has(k));
-        if (missing.length > 0) {
-          throw new Error(`语料目录中未找到请求的 test 视频：${missing.join(", ")}`);
-        }
-      }
-
-      const pool = [...candidates];
+      const ordered = [...candidates];
       if (options.shuffle) {
         const rng = options.seed !== undefined ? createSeededRng(options.seed) : Math.random;
-        shuffleInPlace(pool, rng);
+        shuffleInPlace(ordered, rng);
       }
-      const selected = options.limit !== undefined ? pool.slice(0, options.limit) : pool;
+      const selected = options.limit !== undefined ? ordered.slice(0, options.limit) : ordered;
 
       let importedChunks = 0;
       let skippedExistingChunks = 0;
@@ -131,7 +99,6 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
 
       for (const unit of selected) {
         const videoKey = extractVideoKey(unit.videoId);
-        // Re-verify split right before inserting
         const splitSnapshot = splitByKey.get(videoKey);
         if (splitSnapshot !== "test") {
           throw new Error(`导入守卫拦截：视频 ${videoKey} 实际为 ${splitSnapshot ?? "未注册"}`);
@@ -171,16 +138,14 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       };
     }
 
-    // Source mode 2: Fallback to main DB's `materials` table (only `split = 'test'`)
+    // Mode 2: Fallback to main DB's `materials` table (only `split = 'test'`)
     const rows = mainStore.listAllMaterials();
-
     const requestedSet = requestedKeys ? new Set(requestedKeys) : undefined;
     const byVideoKey = new Map<string, typeof rows>();
     for (const row of rows) {
       const videoKey = extractVideoKey(row.video_id);
       if (splitByKey.get(videoKey) !== "test") continue;
       if (requestedSet && !requestedSet.has(videoKey)) continue;
-      if (!requestedSet && options.excludeUsed && usedKeys.has(videoKey)) continue;
       const list = byVideoKey.get(videoKey);
       if (list) list.push(row);
       else byVideoKey.set(videoKey, [row]);
@@ -235,7 +200,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
 }
 
 /**
- * Cross-DB guard executed before every `eval build`:
+ * Cross-DB guard executed before every build and freeze:
  * re-checks every source material's `video_key` in the main DB (read-only) to confirm
  * it is still registered in `split = 'test'`, and verifies content sha256 integrity.
  */
@@ -253,159 +218,20 @@ export function verifySourceSplits(mainDbPath: string, sources: SourceMaterialRe
 
   const mainStore = new DataMakerStore(mainDbPath, { readOnly: true });
   try {
+    const splitByKey = new Map<string, DatasetSplit>();
+    for (const row of mainStore.listVideoSplits()) {
+      splitByKey.set(row.video_key, row.split);
+    }
+    const invalid: string[] = [];
     for (const source of sources) {
-      const splitRec = mainStore.getVideoSplit(source.videoKey);
-      if (!splitRec || splitRec.split !== "test") {
-        throw new Error(
-          `跨库分区复核失败：${source.videoKey} 在主库中不是 test 分区（实际为 ${splitRec?.split ?? "未注册"}），中止构建`,
-        );
-      }
-      if (source.mainMaterialId !== null) {
-        const mainSha = mainStore.getMaterialSha256(source.mainMaterialId);
-        if (mainSha !== undefined && mainSha !== source.contentSha256) {
-          throw new Error(
-            `跨库快照一致性校验失败：${source.videoId}（main_material_id=${source.mainMaterialId}）sha256 与主库不一致`,
-          );
-        }
+      const assigned = splitByKey.get(source.videoKey);
+      if (assigned !== "test") {
+        invalid.push(`${source.videoKey}(实际=${assigned ?? "未注册"})`);
       }
     }
-  } finally {
-    mainStore.close();
-  }
-}
-
-export interface MirrorMainVersionOptions {
-  evalStore: EvalStore;
-  mainDbPath: string;
-  fromVersion: string;
-  asSuiteName: string;
-}
-
-export interface MirrorMainVersionReport {
-  created: boolean;
-  fromVersion: string;
-  suiteName: string;
-  kind: "in_distribution";
-  itemCount: number;
-  videoCount: number;
-  rubricTurns: number;
-  missingRubricTurns: number;
-  sha256: string;
-}
-
-/**
- * Mirrors an immutable frozen `test` version (e.g. `test-v1`) from the main DB (read-only)
- * into `eval.sqlite` as an `in_distribution` suite (e.g. `indist-v1`), verifying exact sha256 parity.
- */
-export function mirrorMainVersion(options: MirrorMainVersionOptions): MirrorMainVersionReport {
-  const fromVersion = nonEmpty(options.fromVersion, "fromVersion");
-  const asSuiteName = nonEmpty(options.asSuiteName, "asSuiteName");
-
-  const mainStore = new DataMakerStore(options.mainDbPath, { readOnly: true });
-  try {
-    const version = mainStore.getTestSetVersion(fromVersion);
-    if (!version) {
-      throw new Error(`主库中未找到测试集版本：${fromVersion}`);
+    if (invalid.length > 0) {
+      throw new Error(`跨库分区复核失败：以下评测材料不属于主库 test 分区：${invalid.slice(0, 10).join(", ")}`);
     }
-    if (version.split !== "test") {
-      throw new Error(`镜像守卫拦截：版本 ${fromVersion} 属于 ${version.split} 分区，仅允许镜像 test 分区版本`);
-    }
-
-    const merged = mainStore.exportMergedDataset({
-      versionName: fromVersion,
-      split: "test",
-    });
-
-    const jsonl = formatSamplesJsonl(merged.train.map((r) => r.sample));
-    const computedSha256 = sha256Hex(jsonl);
-    if (computedSha256 !== version.sha256) {
-      throw new Error(
-        `版本 ${fromVersion} sha256 校验失败：主库记录 ${version.sha256}，重新导出计算为 ${computedSha256}`,
-      );
-    }
-
-    const materialInfo = mainStore.getMaterialVideoAndSplitMap();
-    const videoKeys = new Set<string>();
-    let rubricTurns = 0;
-    let missingRubricTurns = 0;
-
-    const items = merged.train.map((record) => {
-      const info = materialInfo.get(record.materialId);
-      if (!info || info.split !== "test") {
-        throw new Error(
-          `镜像守卫拦截：样本 result_id=${record.resultId} 的材料不属于 test 分区（实际为 ${info?.split ?? "未知"}）`,
-        );
-      }
-      videoKeys.add(info.videoKey);
-
-      const rubrics: Array<{ turnNo: number; rubric: EvalRubric | null }> = [];
-      for (let turnNo = 1; turnNo <= record.turnCount; turnNo++) {
-        const rec = mainStore.getEvalRubric(record.resultId, turnNo);
-        if (rec) {
-          rubricTurns++;
-          rubrics.push({ turnNo, rubric: rec.rubric });
-        } else {
-          missingRubricTurns++;
-          rubrics.push({ turnNo, rubric: null });
-        }
-      }
-
-      return {
-        itemKey: `${fromVersion}:result:${record.resultId}`,
-        videoKey: info.videoKey,
-        probeType: null,
-        expectedBehavior: null,
-        messages: record.sample.messages,
-        rubrics,
-      };
-    });
-
-    const { created, suite } = options.evalStore.freezeSuite({
-      name: asSuiteName,
-      kind: "in_distribution",
-      sha256: version.sha256,
-      manifest: {
-        sourceVersion: fromVersion,
-        sourceSplit: version.split,
-        sourceMainDb: options.mainDbPath,
-        sampleCount: items.length,
-        videoCount: videoKeys.size,
-        videoKeys: [...videoKeys].sort(),
-        rubricTurns,
-        missingRubricTurns,
-        sourceSha256: version.sha256,
-        mirroredAt: nowIso(),
-      },
-      items,
-    });
-
-    if (created) {
-      const runId = options.evalStore.createRun({
-        kind: "mirror",
-        config: {
-          fromVersion,
-          asSuiteName,
-          mainDbPath: options.mainDbPath,
-          itemCount: items.length,
-          sha256: version.sha256,
-        },
-        prompts: {},
-        skills: [],
-      });
-      options.evalStore.finishRun(runId, "completed");
-    }
-
-    return {
-      created,
-      fromVersion,
-      suiteName: suite.name,
-      kind: "in_distribution",
-      itemCount: suite.itemCount,
-      videoCount: videoKeys.size,
-      rubricTurns,
-      missingRubricTurns,
-      sha256: suite.sha256,
-    };
   } finally {
     mainStore.close();
   }

@@ -1,54 +1,34 @@
-export { nowIso, sha256Hex } from "../../shared/utils.js";
+import type { EvalRole } from "../../shared/types.js";
 
-/**
- * Domain constants and record interfaces for the independent evaluation store (`data/eval.sqlite`).
- * Data only flows main DB -> eval DB; the eval pipeline never writes the main DB.
- */
-
-export const EVAL_SCHEMA_VERSION = "2";
-
-export const ADVERSARIAL_PROBE_TYPES = [
-  "wild_short",
-  "premise_trap",
-  "contrast",
-  "transfer",
-  "hallucination_bait",
-  "pressure",
-] as const;
-
-export const TRAP_PROBE_TYPES = [
-  "trap_misattribution",
-  "trap_unknown_detail",
-  "trap_forced_decision",
-  "trap_unfounded_judgment",
-] as const;
+export const EVAL_SCHEMA_VERSION = "3";
 
 export const PROBE_TYPES = [
-  ...ADVERSARIAL_PROBE_TYPES,
-  ...TRAP_PROBE_TYPES,
-] as const;
-export type ProbeType = (typeof PROBE_TYPES)[number];
-
-export type EvalProfile = "adversarial" | "trap";
-
-export function isTrapProbeType(probeType: ProbeType): boolean {
-  return (TRAP_PROBE_TYPES as readonly string[]).includes(probeType);
-}
-
-export function probeTypesForProfile(profile: EvalProfile): readonly ProbeType[] {
-  return profile === "trap" ? TRAP_PROBE_TYPES : ADVERSARIAL_PROBE_TYPES;
-}
-
-export const EXPECTED_BEHAVIORS = [
   "answer",
   "correct_premise",
   "acknowledge_gap",
-  "hold_position",
   "refuse",
+  "hold_position",
 ] as const;
-export type ExpectedBehavior = (typeof EXPECTED_BEHAVIORS)[number];
 
-export const PRESSURE_ADVERSARY_TACTICS = [
+export type ProbeType = (typeof PROBE_TYPES)[number];
+
+/** Expected behavior shares the exact same 5 values as ProbeType. */
+export const EXPECTED_BEHAVIORS = PROBE_TYPES;
+export type ExpectedBehavior = ProbeType;
+
+/**
+ * Turn-level expected behavior rule:
+ * - Single-turn types (`answer`, `correct_premise`, `acknowledge_gap`, `refuse`): same as `probeType`.
+ * - Multi-turn `hold_position`: Turn 1 expects `answer`; Turn 2..N expect `hold_position`.
+ */
+export function expectedBehaviorForTurn(probeType: ProbeType, turnNo: number): ExpectedBehavior {
+  if (probeType === "hold_position") {
+    return turnNo <= 1 ? "answer" : "hold_position";
+  }
+  return probeType;
+}
+
+export const ADVERSARY_TACTICS = [
   "pushback",
   "label",
   "force_binary",
@@ -56,42 +36,31 @@ export const PRESSURE_ADVERSARY_TACTICS = [
   "emotional",
 ] as const;
 
-export const TRAP_ADVERSARY_TACTICS = [
-  "nudge_estimate",
-  "assume_premise",
-  "push_decision",
-] as const;
-
-export const ADVERSARY_TACTICS = [
-  ...PRESSURE_ADVERSARY_TACTICS,
-  ...TRAP_ADVERSARY_TACTICS,
-] as const;
 export type AdversaryTactic = (typeof ADVERSARY_TACTICS)[number];
 
-export const DIFFICULTY_LEVELS = ["easy", "medium", "hard"] as const;
-export type DifficultyLevel = (typeof DIFFICULTY_LEVELS)[number];
-
-/** Expected behavior is decided by code from the probe type, never by the writer model. */
-export const EXPECTED_BEHAVIOR_BY_TYPE: Record<ProbeType, ExpectedBehavior> = {
-  wild_short: "answer",
-  premise_trap: "correct_premise",
-  contrast: "answer",
-  transfer: "answer",
-  hallucination_bait: "acknowledge_gap",
-  pressure: "answer",
-  trap_misattribution: "refuse",
-  trap_unknown_detail: "refuse",
-  trap_forced_decision: "refuse",
-  trap_unfounded_judgment: "refuse",
-};
-
-export type ProbeStatus = "drafted" | "rejected" | "answering" | "dropped" | "error" | "accepted";
-export type ProbeRunStatus = "running" | "completed" | "failed" | "interrupted";
-export type ProbeRunKind = "probe_build" | "calibrate" | "mirror";
+export type ProbeStatus = "draft" | "accepted" | "rejected" | "dropped";
+export type DifficultyLevel = "easy" | "medium" | "hard";
+export type ProbeRunKind = "probe_build" | "calibrate";
+export type RunLifecycleStatus = "running" | "completed" | "failed" | "interrupted";
 export type EvalHistoryMode = "gold" | "self";
-export type EvalSuiteKind = "in_distribution" | "adversarial";
 
-export type Row = Record<string, unknown>;
+export interface ProbeRubric {
+  expectedBehavior: ExpectedBehavior;
+  stance: string;
+  keyPoints: string[];
+  forbidden: string[];
+  mustNotHallucinate: string[];
+  failureSignals: string[];
+}
+
+export interface ProbeReviewEntry {
+  roundNo: number;
+  decision: "accept" | "revise" | "reject";
+  issues: string[];
+  feedback: string;
+  callId: number | null;
+  createdAt: string;
+}
 
 export interface SourceMaterialRecord {
   id: number;
@@ -102,97 +71,86 @@ export interface SourceMaterialRecord {
   content: string;
   contentSha256: string;
   sourcePath: string | null;
+  splitSnapshot: string;
   importedAt: string;
+}
+
+export interface ProbeRunRecord {
+  id: number;
+  kind: ProbeRunKind;
+  status: RunLifecycleStatus;
+  config: Record<string, unknown>;
+  prompts: Record<string, unknown>;
+  skills: unknown[];
+  startedAt: string;
+  endedAt: string | null;
+  error: string | null;
 }
 
 export interface ProbeRecord {
   id: number;
-  specId: number;
   runId: number;
   sourceMaterialId: number;
   slotIndex: number;
   probeType: ProbeType;
+  expectedBehavior: ExpectedBehavior;
   persona: string;
   targetTurns: number;
   question: string;
   anchor: string;
   trap: string;
-  expectedBehavior: ExpectedBehavior;
-  status: ProbeStatus;
   anchorVerified: boolean;
+  status: ProbeStatus;
   revisions: number;
+  reviews: ProbeReviewEntry[];
   rejectReason: string | null;
   difficulty: DifficultyLevel | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
-export interface ProbeRunRecord {
+export interface ProbeTurnRecord {
   id: number;
-  kind: string;
-  status: ProbeRunStatus;
-  config: Record<string, unknown>;
-  skills: unknown[];
-  startedAt: string;
-  finishedAt: string | null;
-  error: string | null;
-}
-
-export interface ProbeReviewRecord {
-  id: number;
-  roundNo: number;
-  decision: "accept" | "revise" | "reject";
-  issues: string[];
-  feedback: string;
-  questionSnapshot: string;
-  callId: number | null;
+  probeId: number;
+  turnNo: number;
+  expectedBehavior: ExpectedBehavior;
+  tactic: AdversaryTactic | null;
+  userContent: string;
+  referenceAnswer: string;
+  rubric: ProbeRubric;
+  attempts: number;
   createdAt: string;
 }
 
-export interface ProbeAttemptRecord {
-  turnNo: number;
-  attemptNo: number;
-  answer: string | null;
-  decision: "pass" | "revise" | "drop" | null;
-  issues: string[];
-  feedback: string | null;
-}
-
-export interface ProbeDialogueTurn {
-  turnNo: number;
-  user: string;
-  answer: string;
-  expectedBehavior: ExpectedBehavior;
-  tactic: string | null;
-  rubric: unknown;
-}
-
-export interface CalibrationTurnRecord {
+export interface ProbeCalibrationRecord {
   id: number;
-  runId: number;
   probeId: number;
   turnNo: number;
   bareModel: string;
   graderModel: string;
-  bareAnswer: string | null;
+  bareAnswer: string;
   behaviorOk: boolean;
-  stance: number;
-  keyPointCoverage: number;
-  forbiddenHits: number;
-  hallucinationHits: number;
-  failureSignalHits: number;
-  style: number;
   score: number;
-  detail: Record<string, unknown> | null;
+  detail: Record<string, unknown>;
+  bareCallId: number | null;
+  graderCallId: number | null;
   createdAt: string;
+}
+
+export interface SuiteRubricEntry {
+  turnNo: number;
+  expectedBehavior: ExpectedBehavior;
+  tactic: AdversaryTactic | null;
+  rubric: ProbeRubric;
 }
 
 export interface SuiteVersionRecord {
   id: number;
   name: string;
-  kind: EvalSuiteKind;
   itemCount: number;
   sha256: string;
   manifest: Record<string, unknown>;
-  createdAt: string;
+  frozenAt: string;
 }
 
 export interface SuiteItemRecord {
@@ -200,25 +158,24 @@ export interface SuiteItemRecord {
   suiteId: number;
   itemKey: string;
   videoKey: string;
-  probeType: string | null;
-  expectedBehavior: string | null;
+  probeType: ProbeType;
   difficulty: DifficultyLevel | null;
-  messages: Array<{ role: "user" | "assistant" | "system"; content: string }>;
-  rubrics: unknown[];
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+  rubrics: SuiteRubricEntry[];
 }
 
 export interface EvalRunRecord {
   id: number;
   suiteId: number;
   suiteName: string;
-  suiteKind: EvalSuiteKind;
   candidate: string;
   model: string;
   historyMode: EvalHistoryMode;
+  systemPrompt: string | null;
   config: Record<string, unknown>;
-  status: ProbeRunStatus;
+  status: RunLifecycleStatus;
   startedAt: string;
-  finishedAt: string | null;
+  endedAt: string | null;
   error: string | null;
 }
 
@@ -237,51 +194,99 @@ export interface EvalPredictionRecord {
 export interface EvalScoreRecord {
   id: number;
   predictionId: number;
-  evalRunId: number;
-  suiteItemId: number;
-  itemKey: string;
-  videoKey: string;
-  probeType: string | null;
-  itemExpectedBehavior: string | null;
-  difficulty: DifficultyLevel | null;
-  turnNo: number;
   graderModel: string;
   behaviorOk: boolean;
-  stance: number;
+  stance: 0 | 1 | 2;
   keyPointCoverage: number;
   forbiddenHits: number;
   hallucinationHits: number;
   failureSignalHits: number;
-  style: number;
+  style: 0 | 1 | 2;
   score: number;
   detail: Record<string, unknown>;
   callId: number | null;
   createdAt: string;
 }
 
-export interface EvalRunSummaryRow {
-  id: number;
-  suiteName: string;
-  candidate: string;
+export interface InsertSourceMaterialInput {
+  videoId: string;
+  videoKey?: string;
+  mainMaterialId?: number | null;
+  partCount?: number;
+  content: string;
+  sourcePath?: string | null;
+  splitSnapshot?: string;
+}
+
+export interface CreateProbeInput {
+  runId: number;
+  sourceMaterialId: number;
+  slotIndex: number;
+  probeType: ProbeType;
+  persona: string;
+  targetTurns: number;
+  question: string;
+  anchor: string;
+  trap: string;
+  anchorVerified: boolean;
+}
+
+export interface SaveProbeTurnInput {
+  probeId: number;
+  turnNo: number;
+  expectedBehavior: ExpectedBehavior;
+  tactic?: AdversaryTactic | null;
+  userContent: string;
+  referenceAnswer: string;
+  rubric: ProbeRubric;
+  attempts?: number;
+}
+
+export interface StartAgentCallInput {
+  runRef: string;
+  role: EvalRole;
   model: string;
-  historyMode: EvalHistoryMode;
-  status: ProbeRunStatus;
-  predictions: number;
-  scores: number;
-  startedAt: string;
+  inputRefs: Record<string, unknown>;
 }
 
 export interface EvalStoreSummary {
-  schemaVersion: string | undefined;
-  mainDbPath: string | undefined;
+  schemaVersion: string;
   sourceMaterials: number;
-  unbuiltSourceMaterials: number;
-  sourceVideoKeys: number;
-  probeRuns: number;
+  sourceVideos: number;
+  probeRuns: Record<string, number>;
   probesByStatus: Record<string, number>;
-  acceptedByType: Record<string, number>;
-  acceptedByDifficulty: Record<string, number>;
-  suites: Array<{ name: string; kind: string; itemCount: number; sha256: string; createdAt: string }>;
-  evalRuns: EvalRunSummaryRow[];
+  probesByType: Record<string, number>;
+  probesByDifficulty: Record<string, number>;
+  probeTurns: number;
+  probeCalibrations: number;
+  suites: Array<{
+    name: string;
+    itemCount: number;
+    sha256: string;
+    frozenAt: string;
+  }>;
+  evalRuns: number;
+  evalPredictions: number;
+  evalScores: number;
   agentCalls: number;
+}
+
+export function parseJsonObject(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+export function parseJsonArray<T = unknown>(raw: string): T[] {
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
 }

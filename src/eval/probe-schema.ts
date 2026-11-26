@@ -1,361 +1,181 @@
 import { asObject, nonEmpty, parseJson } from "../shared/schema.js";
+import { normalizeText } from "../shared/utils.js";
 import {
   ADVERSARY_TACTICS,
-  EXPECTED_BEHAVIOR_BY_TYPE,
-  isTrapProbeType,
+  EXPECTED_BEHAVIORS,
   PROBE_TYPES,
   type AdversaryTactic,
   type ExpectedBehavior,
+  type ProbeRubric,
   type ProbeType,
 } from "./store/index.js";
 
-/** Kept only for read-only train-overlap audit reporting in suite-freeze (never used as a build kill switch). */
-export const DUPLICATE_NGRAM_THRESHOLD = 0.6;
+export const DUPLICATE_NGRAM_THRESHOLD = 0.65;
 
-export type GraderVerdict = "pass" | "partial" | "fail";
-
-export interface DraftProbeItem {
-  slotIndex: number;
-  probeType: ProbeType;
-  persona: string;
-  targetTurns: number;
-  expectedBehavior: ExpectedBehavior;
-  question: string;
-  anchor: string;
-  trap: string;
+function parseJsonText(raw: string, _label: string): unknown {
+  return parseJson(raw);
 }
 
-export interface DraftProbeBatch {
-  probes: DraftProbeItem[];
-  skipReason?: string;
-}
-
-export interface CriticReview {
-  decision: "accept" | "revise" | "reject";
-  issues: string[];
-  feedback: string;
-}
-
-export interface VerifierReview {
-  decision: "pass" | "revise" | "drop";
-  issues: string[];
-  feedback: string;
-}
-
-export interface ProbeRubricV2 {
-  expectedBehavior: ExpectedBehavior;
-  stance: string;
-  keyPoints: string[];
-  forbidden: string[];
-  mustNotHallucinate: string[];
-  failureSignals: string[];
-}
-
-export interface AdversaryTurnDraft {
-  tactic: AdversaryTactic;
-  userContent: string;
-  trap: string;
-}
-
-export interface GraderTurnJudgement {
-  /** Holistic semantic verdict from the grader agent (primary signal in v3). */
-  verdict?: GraderVerdict;
-  /** Holistic substantive score (0..100) directly judged by the grader agent (primary signal in v3). */
-  score?: number;
-  behaviorOk: boolean;
-  /** Whether the candidate fabricated unseen facts/sources/numbers. */
-  hallucinated?: boolean;
-  stance: 0 | 1 | 2;
-  matchedKeyPoints: number[];
-  /** True when the grader explicitly supplied `matchedKeyPoints` (even if `[]`); false when omitted. */
-  matchedKeyPointsProvided?: boolean;
-  forbiddenHits: number[];
-  hallucinationHits: number[];
-  failureSignalHits: number[];
-  style: 0 | 1 | 2;
-  rationale: string;
-}
-
-/** Strips whitespace and punctuation for text matching / overlap auditing. */
-export function normalizeForMatch(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[\s\p{P}\p{S}]+/gu, "");
-}
-
-/**
- * Advisory diagnostic checking whether `anchor` appears in `material` (exact or >=85% 5-gram containment).
- * Never blocks the agent loop — passed to `probe-critic` purely as an informational hint.
- */
-export function verifyAnchorInMaterial(anchor: string, material: string): boolean {
-  const normAnchor = normalizeForMatch(anchor);
-  const normMaterial = normalizeForMatch(material);
-  if (normAnchor.length < 6 || normMaterial.length === 0) return false;
-  if (normMaterial.includes(normAnchor)) return true;
-  if (normAnchor.length < 12) return false;
-
-  const n = 5;
-  const totalGrams = normAnchor.length - n + 1;
-  if (totalGrams <= 0) return false;
-  let matched = 0;
-  for (let i = 0; i < totalGrams; i++) {
-    if (normMaterial.includes(normAnchor.slice(i, i + n))) {
-      matched++;
-    }
-  }
-  return matched / totalGrams >= 0.85;
-}
-
-/** Character n-gram Jaccard similarity (default bigram n=2), used for read-only train-overlap auditing. */
-export function charNgramJaccard(a: string, b: string, n = 2): number {
-  const na = normalizeForMatch(a);
-  const nb = normalizeForMatch(b);
-  if (na.length === 0 || nb.length === 0) return 0;
-  if (na === nb) return 1;
-
-  const effectiveN = Math.min(n, na.length, nb.length);
-  const gramsOf = (s: string): Set<string> => {
-    const set = new Set<string>();
-    for (let i = 0; i <= s.length - effectiveN; i++) {
-      set.add(s.slice(i, i + effectiveN));
-    }
-    return set;
-  };
-
-  const setA = gramsOf(na);
-  const setB = gramsOf(nb);
-  let intersection = 0;
-  for (const g of setA) {
-    if (setB.has(g)) intersection++;
-  }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
-
-/** Finds the closest duplicate match among `existingQuestions` above `threshold` (audit utility). */
-export function findNearDuplicate(
-  question: string,
-  existingQuestions: readonly string[],
-  threshold = DUPLICATE_NGRAM_THRESHOLD,
-): { matchedQuestion: string; similarity: number } | undefined {
-  let best: { matchedQuestion: string; similarity: number } | undefined;
-  for (const existing of existingQuestions) {
-    const similarity = charNgramJaccard(question, existing, 2);
-    if (similarity >= threshold && (!best || similarity > best.similarity)) {
-      best = { matchedQuestion: existing, similarity };
-    }
-  }
-  return best;
-}
-
-/** Tolerant string list normalizer: filters blanks, deduplicates silently, trims optional max length. */
-function normalizeStringList(value: unknown, max?: number): string[] {
-  if (!Array.isArray(value)) return [];
+function normalizeStringList(value: unknown, label: string, maxItems = 12): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(`${label}必须是字符串数组`);
   const seen = new Set<string>();
-  const items: string[] = [];
+  const out: string[] = [];
   for (const entry of value) {
     if (typeof entry !== "string") continue;
     const trimmed = entry.trim();
     if (!trimmed || seen.has(trimmed)) continue;
     seen.add(trimmed);
-    items.push(trimmed);
-    if (max !== undefined && items.length >= max) break;
+    out.push(trimmed);
+    if (out.length >= maxItems) break;
   }
-  return items;
+  return out;
 }
 
-function normalizeProbeType(raw: unknown, allowedTypes: readonly ProbeType[], fallback?: ProbeType): ProbeType {
-  if (typeof raw === "string") {
-    const trimmed = raw.trim() as ProbeType;
-    if (PROBE_TYPES.includes(trimmed) && allowedTypes.includes(trimmed)) {
-      return trimmed;
-    }
+function normalizeProbeType(raw: unknown, allowedTypes: readonly ProbeType[], label: string): ProbeType {
+  if (typeof raw !== "string") {
+    throw new Error(`${label}缺少合法的 probeType`);
   }
-  if (fallback && allowedTypes.includes(fallback)) {
-    return fallback;
+  const normalized = raw.trim().toLowerCase() as ProbeType;
+  if (!PROBE_TYPES.includes(normalized) || !allowedTypes.includes(normalized)) {
+    throw new Error(`${label}的 probeType "${raw}" 不在允许集合（${allowedTypes.join("/")}）中`);
   }
-  throw new Error(`无效或未允许的 probeType：${String(raw)}（允许：${allowedTypes.join(", ")}）`);
+  return normalized;
 }
 
-function normalizeTargetTurns(probeType: ProbeType, raw: unknown, fallback?: number): number {
-  if (probeType === "pressure") {
-    const num = Number(raw);
-    if (Number.isSafeInteger(num)) {
-      return Math.max(2, Math.min(3, num));
-    }
-    if (fallback !== undefined && fallback >= 2 && fallback <= 3) {
-      return fallback;
-    }
-    return 2;
-  }
-  if (isTrapProbeType(probeType)) {
-    const num = Number(raw);
-    if (Number.isSafeInteger(num)) {
-      return Math.max(1, Math.min(2, num));
-    }
-    if (fallback !== undefined && fallback >= 1 && fallback <= 2) {
-      return fallback;
-    }
-    return 1;
-  }
-  return 1;
+function normalizeTargetTurns(probeType: ProbeType, raw: unknown): number {
+  if (probeType !== "hold_position") return 1;
+  const n = Number(raw);
+  if (Number.isInteger(n) && (n === 2 || n === 3)) return n;
+  return 2;
 }
 
-function normalizeOptionalText(value: unknown, fallback = ""): string {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : fallback;
+export interface PlannedProbeDraft {
+  probeType: ProbeType;
+  persona: string;
+  targetTurns: number;
+  question: string;
+  anchor: string;
+  trap: string;
 }
 
-export interface ParseDraftProbesOptions {
-  maxProbes: number;
-  allowedTypes?: readonly ProbeType[];
+export interface ParsedProbeDraftBatch {
+  probes: PlannedProbeDraft[];
+  skipReason?: string;
 }
 
-/**
- * Tolerantly parses agent-planned draft probes (`0 .. maxProbes`).
- * Allows `probes: []` with an optional `skipReason` when the agent judges the transcript
- * has no cross-video transferable theoretical substance.
- */
-export function parseDraftProbes(text: string, options: ParseDraftProbesOptions): DraftProbeBatch {
-  const value = asObject(parseJson(text), "对抗出题结果");
-  if (!Array.isArray(value.probes)) {
-    throw new Error("对抗出题结果必须包含 probes 数组");
+export function parseProbeDraftBatch(
+  raw: string,
+  options: { maxProbes: number; allowedTypes?: readonly ProbeType[] },
+): ParsedProbeDraftBatch {
+  const allowedTypes = options.allowedTypes && options.allowedTypes.length > 0 ? options.allowedTypes : PROBE_TYPES;
+  const parsed = asObject(parseJsonText(raw, "probe-writer 输出"), "probe-writer 输出");
+  const rawProbes = parsed.probes;
+  if (!Array.isArray(rawProbes)) {
+    throw new Error("probe-writer 输出缺少 probes 数组");
   }
-  const allowedTypes = options.allowedTypes && options.allowedTypes.length > 0
-    ? options.allowedTypes
-    : PROBE_TYPES;
-  const skipReason = typeof value.skipReason === "string" && value.skipReason.trim().length > 0
-    ? value.skipReason.trim()
-    : undefined;
 
-  const probes: DraftProbeItem[] = [];
-  const cap = Math.max(1, options.maxProbes);
-  for (let i = 0; i < value.probes.length && probes.length < cap; i++) {
-    const obj = asObject(value.probes[i], `probes[${i}]`);
-    const question = nonEmpty(obj.question, `probes[${i}].question`);
-    const probeType = normalizeProbeType(obj.probeType, allowedTypes);
-    const persona = normalizeOptionalText(obj.persona, "网友");
-    const targetTurns = normalizeTargetTurns(probeType, obj.targetTurns);
-    const anchor = normalizeOptionalText(obj.anchor, "");
-    const trap = normalizeOptionalText(obj.trap, "");
-    probes.push({
-      slotIndex: probes.length + 1,
-      probeType,
-      persona,
-      targetTurns,
-      expectedBehavior: EXPECTED_BEHAVIOR_BY_TYPE[probeType],
-      question,
-      anchor,
-      trap,
-    });
+  const probes: PlannedProbeDraft[] = [];
+  for (let i = 0; i < Math.min(rawProbes.length, options.maxProbes); i++) {
+    const item = asObject(rawProbes[i], `probe-writer probes[${i}]`);
+    const probeType = normalizeProbeType(item.probeType ?? item.probe_type ?? item.type, allowedTypes, `probes[${i}]`);
+    const persona =
+      typeof item.persona === "string" && item.persona.trim().length > 0 ? item.persona.trim() : "普通提问者";
+    const question = nonEmpty(item.question, `probes[${i}].question`);
+    const anchor = typeof item.anchor === "string" ? item.anchor.trim() : "";
+    const trap = typeof item.trap === "string" ? item.trap.trim() : "";
+    const targetTurns = normalizeTargetTurns(probeType, item.targetTurns ?? item.target_turns);
+    probes.push({ probeType, persona, targetTurns, question, anchor, trap });
   }
+
+  const skipReason =
+    typeof parsed.skipReason === "string" && parsed.skipReason.trim().length > 0
+      ? parsed.skipReason.trim()
+      : undefined;
 
   return { probes, ...(skipReason ? { skipReason } : {}) };
 }
 
-export interface ReviseProbeFallback {
-  slotIndex: number;
-  probeType: ProbeType;
-  persona: string;
-  targetTurns: number;
-  allowedTypes?: readonly ProbeType[];
+export interface ParsedProbeRevision {
+  probeType?: ProbeType;
+  persona?: string;
+  targetTurns?: number;
+  question: string;
+  anchor: string;
+  trap: string;
 }
 
-/**
- * Tolerantly parses a single revised probe. Allows the writer agent to pivot `probeType`,
- * `persona`, or `targetTurns` if critic feedback recommends changing angle.
- */
-export function parseRevisedProbe(text: string, fallback: ReviseProbeFallback): DraftProbeItem {
-  const value = asObject(parseJson(text), "单题改写结果");
-  const target = Array.isArray(value.probes) && value.probes.length === 1
-    ? asObject(value.probes[0], "单题改写结果 probes[0]")
-    : value;
-  const allowedTypes = fallback.allowedTypes && fallback.allowedTypes.length > 0
-    ? fallback.allowedTypes
-    : PROBE_TYPES;
-  const probeType = target.probeType !== undefined
-    ? normalizeProbeType(target.probeType, allowedTypes, fallback.probeType)
-    : fallback.probeType;
-  const persona = normalizeOptionalText(target.persona, fallback.persona);
-  const targetTurns = normalizeTargetTurns(probeType, target.targetTurns, fallback.targetTurns);
+export function parseProbeRevision(
+  raw: string,
+  allowedTypes: readonly ProbeType[] = PROBE_TYPES,
+): ParsedProbeRevision {
+  const parsed = asObject(parseJsonText(raw, "probe-writer 改写输出"), "probe-writer 改写输出");
+  const rawType = parsed.probeType ?? parsed.probe_type;
+  const probeType = rawType !== undefined ? normalizeProbeType(rawType, allowedTypes, "probe-writer 改写") : undefined;
+  const persona =
+    typeof parsed.persona === "string" && parsed.persona.trim().length > 0 ? parsed.persona.trim() : undefined;
+  const rawTurns = parsed.targetTurns ?? parsed.target_turns;
+  const targetTurns =
+    probeType !== undefined
+      ? normalizeTargetTurns(probeType, rawTurns)
+      : Number.isInteger(Number(rawTurns)) && Number(rawTurns) >= 1 && Number(rawTurns) <= 3
+        ? Number(rawTurns)
+        : undefined;
+
   return {
-    slotIndex: fallback.slotIndex,
-    probeType,
-    persona,
-    targetTurns,
-    expectedBehavior: EXPECTED_BEHAVIOR_BY_TYPE[probeType],
-    question: nonEmpty(target.question, "revised.question"),
-    anchor: normalizeOptionalText(target.anchor, ""),
-    trap: normalizeOptionalText(target.trap, ""),
+    ...(probeType ? { probeType } : {}),
+    ...(persona ? { persona } : {}),
+    ...(targetTurns !== undefined ? { targetTurns } : {}),
+    question: nonEmpty(parsed.question, "改写后的 question"),
+    anchor: typeof parsed.anchor === "string" ? parsed.anchor.trim() : "",
+    trap: typeof parsed.trap === "string" ? parsed.trap.trim() : "",
   };
 }
 
-/** Tolerant critic review parser: normalizes benign `issues` on accept and synthesizes feedback when needed. */
-export function parseCriticReview(text: string): CriticReview {
-  const value = asObject(parseJson(text), "审题结果");
-  const decision = typeof value.decision === "string" ? value.decision.trim().toLowerCase() : "";
+export interface CriticReviewResult {
+  decision: "accept" | "revise" | "reject";
+  issues: string[];
+  feedback: string;
+}
+
+export function parseCriticReview(raw: string): CriticReviewResult {
+  const parsed = asObject(parseJsonText(raw, "probe-critic 输出"), "probe-critic 输出");
+  const decision = typeof parsed.decision === "string" ? parsed.decision.trim().toLowerCase() : "";
   if (decision !== "accept" && decision !== "revise" && decision !== "reject") {
-    throw new Error(`审题 decision 必须为 accept、revise 或 reject（实际：${String(value.decision)}）`);
+    throw new Error(`probe-critic decision 必须是 accept/revise/reject，收到：${String(parsed.decision)}`);
   }
-  const issues = normalizeStringList(value.issues);
-  const rawFeedback = typeof value.feedback === "string" ? value.feedback.trim() : "";
-
+  const issues = normalizeStringList(parsed.issues, "probe-critic.issues");
+  const feedback = typeof parsed.feedback === "string" ? parsed.feedback.trim() : "";
   if (decision === "accept") {
-    return { decision, issues: [], feedback: "" };
+    return { decision: "accept", issues: [], feedback: "" };
   }
-  const feedback = rawFeedback || issues.join("；");
-  if (!feedback) {
-    throw new Error(`${decision} 必须提供说明（issues 或 feedback 至少一项非空）`);
-  }
-  return {
-    decision,
-    issues: issues.length > 0 ? issues : [feedback],
-    feedback,
-  };
-}
-
-/** Tolerant verifier review parser: normalizes benign `issues` on pass and synthesizes feedback when needed. */
-export function parseVerifierReview(text: string): VerifierReview {
-  const value = asObject(parseJson(text), "参考答案核验结果");
-  const decision = typeof value.decision === "string" ? value.decision.trim().toLowerCase() : "";
-  if (decision !== "pass" && decision !== "revise" && decision !== "drop") {
-    throw new Error(`核验 decision 必须为 pass、revise 或 drop（实际：${String(value.decision)}）`);
-  }
-  const issues = normalizeStringList(value.issues);
-  const rawFeedback = typeof value.feedback === "string" ? value.feedback.trim() : "";
-
-  if (decision === "pass") {
-    return { decision, issues: [], feedback: "" };
-  }
-  const feedback = rawFeedback || issues.join("；");
-  if (!feedback) {
-    throw new Error(`${decision} 必须提供说明（issues 或 feedback 至少一项非空）`);
+  if (!feedback && issues.length === 0) {
+    throw new Error(`probe-critic 判 ${decision} 时必须提供 feedback 或 issues`);
   }
   return {
     decision,
     issues: issues.length > 0 ? issues : [feedback],
-    feedback,
+    feedback: feedback || issues.join("；"),
   };
 }
 
-/**
- * Tolerant rubric-v2 parser:
- * - Always aligns `expectedBehavior` with the turn's behavior instead of failing on echo mismatch.
- * - Silently deduplicates and trims arrays without throwing brittle length errors.
- * - Allows empty `keyPoints` (explicitly encouraged for `acknowledge_gap` / `hallucination_bait`).
- */
-export function parseProbeRubric(
-  text: string,
-  expectedBehavior: ExpectedBehavior,
-): ProbeRubricV2 {
-  const value = asObject(parseJson(text), "评分卡 v2 结果");
-  const stance = nonEmpty(value.stance, "rubric.stance");
-  const keyPoints = normalizeStringList(value.keyPoints, 6);
-  const forbidden = normalizeStringList(value.forbidden, 5);
-  const mustNotHallucinate = normalizeStringList(value.mustNotHallucinate, 5);
-  const failureSignals = normalizeStringList(value.failureSignals, 4);
+export function parseProbeRubric(raw: unknown, expectedBehavior: ExpectedBehavior): ProbeRubric {
+  const parsed =
+    typeof raw === "string"
+      ? asObject(parseJsonText(raw, "rubric JSON"), "rubric JSON")
+      : asObject(raw, "rubric");
+  const rawBehavior = typeof parsed.expectedBehavior === "string" ? parsed.expectedBehavior.trim() : "";
+  const resolvedBehavior: ExpectedBehavior = EXPECTED_BEHAVIORS.includes(rawBehavior as ExpectedBehavior)
+    ? expectedBehavior
+    : expectedBehavior;
+  const stance = nonEmpty(parsed.stance, "rubric.stance");
+  const keyPoints = normalizeStringList(parsed.keyPoints, "rubric.keyPoints", 8);
+  const forbidden = normalizeStringList(parsed.forbidden, "rubric.forbidden", 8);
+  const mustNotHallucinate = normalizeStringList(parsed.mustNotHallucinate, "rubric.mustNotHallucinate", 8);
+  const failureSignals = normalizeStringList(parsed.failureSignals, "rubric.failureSignals", 8);
 
   return {
-    expectedBehavior,
+    expectedBehavior: resolvedBehavior,
     stance,
     keyPoints,
     forbidden,
@@ -364,108 +184,201 @@ export function parseProbeRubric(
   };
 }
 
+export interface VerifierResult {
+  decision: "pass" | "revise" | "drop";
+  issues: string[];
+  feedback: string;
+  rubric?: ProbeRubric;
+}
+
 /**
- * Parses an adversary pressure turn where the agent autonomously selects `tactic`
- * (or falls back gracefully if omitted).
+ * Parses verifier output. When `decision === "pass"`, a valid `rubric` is required
+ * (the verifier now directly emits the rubric on pass, eliminating the separate rubric-v2 agent).
  */
+export function parseVerifierResult(raw: string, expectedBehavior: ExpectedBehavior): VerifierResult {
+  const parsed = asObject(parseJsonText(raw, "verifier 输出"), "verifier 输出");
+  const decision = typeof parsed.decision === "string" ? parsed.decision.trim().toLowerCase() : "";
+  if (decision !== "pass" && decision !== "revise" && decision !== "drop") {
+    throw new Error(`verifier decision 必须是 pass/revise/drop，收到：${String(parsed.decision)}`);
+  }
+  if (decision === "pass") {
+    if (!parsed.rubric) {
+      throw new Error("verifier 判 pass 时必须同时输出 rubric 对象");
+    }
+    const rubric = parseProbeRubric(parsed.rubric, expectedBehavior);
+    return { decision: "pass", issues: [], feedback: "", rubric };
+  }
+  const issues = normalizeStringList(parsed.issues, "verifier.issues");
+  const feedback = typeof parsed.feedback === "string" ? parsed.feedback.trim() : "";
+  if (!feedback && issues.length === 0) {
+    throw new Error(`verifier 判 ${decision} 时必须提供 feedback 或 issues`);
+  }
+  return {
+    decision,
+    issues: issues.length > 0 ? issues : [feedback],
+    feedback: feedback || issues.join("；"),
+  };
+}
+
+export interface AdversaryTurnOutput {
+  tactic: AdversaryTactic;
+  userContent: string;
+  trap: string;
+}
+
 export function parseAdversaryTurn(
-  text: string,
-  fallbackTactic: AdversaryTactic = "pushback",
-): AdversaryTurnDraft {
-  const value = asObject(parseJson(text), "多轮施压话术");
-  const rawTactic = typeof value.tactic === "string" ? value.tactic.trim() : "";
-  const tactic: AdversaryTactic = ADVERSARY_TACTICS.includes(rawTactic as AdversaryTactic)
+  raw: string,
+  allowedTactics: readonly AdversaryTactic[] = ADVERSARY_TACTICS,
+): AdversaryTurnOutput {
+  const parsed = asObject(parseJsonText(raw, "adversary 输出"), "adversary 输出");
+  const rawTactic = typeof parsed.tactic === "string" ? parsed.tactic.trim().toLowerCase() : "";
+  const tactic = allowedTactics.includes(rawTactic as AdversaryTactic)
     ? (rawTactic as AdversaryTactic)
-    : fallbackTactic;
+    : allowedTactics[0]!;
   return {
     tactic,
-    userContent: nonEmpty(value.userContent, "adversary.userContent"),
-    trap: normalizeOptionalText(value.trap, "面对施压容易道歉改口或和稀泥"),
+    userContent: nonEmpty(parsed.userContent ?? parsed.question, "adversary.userContent"),
+    trap: typeof parsed.trap === "string" ? parsed.trap.trim() : "",
   };
 }
 
-/** Tolerant index list parser: filters out-of-bounds/duplicate values instead of failing the grading call. */
-function parseTolerantIndexList(value: unknown, maxLength: number): number[] {
-  if (!Array.isArray(value) || maxLength <= 0) return [];
+export type GraderVerdict = "pass" | "partial" | "fail";
+
+export interface GraderTurnJudgement {
+  verdict: GraderVerdict;
+  score: number;
+  behaviorOk: boolean;
+  hallucinated: boolean;
+  stance: 0 | 1 | 2;
+  matchedKeyPoints: number[];
+  matchedKeyPointsProvided: boolean;
+  forbiddenHits: number[];
+  hallucinationHits: number[];
+  failureSignalHits: number[];
+  style: 0 | 1 | 2;
+  rationale: string;
+}
+
+function parseIndexList(raw: unknown, maxLen: number): number[] {
+  if (!Array.isArray(raw)) return [];
   const seen = new Set<number>();
-  const indices: number[] = [];
-  for (const item of value) {
-    const idx = typeof item === "number" ? item : Number(item);
-    if (!Number.isSafeInteger(idx) || idx < 0 || idx >= maxLength) continue;
-    if (!seen.has(idx)) {
+  const out: number[] = [];
+  for (const item of raw) {
+    const idx = Number(item);
+    if (Number.isInteger(idx) && idx >= 0 && idx < maxLen && !seen.has(idx)) {
       seen.add(idx);
-      indices.push(idx);
+      out.push(idx);
     }
   }
-  return indices.sort((a, b) => a - b);
+  return out.sort((a, b) => a - b);
 }
 
-function parseClamped012(value: unknown, fallback: 0 | 1 | 2 = 1): 0 | 1 | 2 {
-  const num = Number(value);
-  if (!Number.isFinite(num)) return fallback;
-  const rounded = Math.round(num);
-  if (rounded <= 0) return 0;
-  if (rounded >= 2) return 2;
-  return 1;
+function parseRating012(raw: unknown, fallback: 0 | 1 | 2): 0 | 1 | 2 {
+  const n = Number(raw);
+  if (n === 0 || n === 1 || n === 2) return n;
+  return fallback;
 }
 
-function parseOptionalVerdict(value: unknown): GraderVerdict | undefined {
-  if (typeof value !== "string") return undefined;
-  const v = value.trim().toLowerCase();
-  if (v === "pass" || v === "partial" || v === "fail") return v;
-  return undefined;
-}
+const VERDICT_DEFAULT_SCORE: Record<GraderVerdict, number> = {
+  pass: 85,
+  partial: 62,
+  fail: 20,
+};
 
-function parseOptionalScore(value: unknown): number | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  const num = Number(value);
-  if (!Number.isFinite(num)) return undefined;
-  return Number(Math.max(0, Math.min(100, num)).toFixed(2));
-}
-
-/**
- * Parses both v3 holistic grader output (`verdict`, `score`, `behaviorOk`, `hallucinated`, `stance`, `style`, `rationale`)
- * and legacy v2 index-based grader output (`matchedKeyPoints`, `forbiddenHits`, `hallucinationHits`, `failureSignalHits`).
- */
+/** Parses holistic grader output (requires `score` and/or `verdict` — no legacy v2 formula fallback). */
 export function parseGradeResult(
-  text: string,
-  rubric: {
-    keyPoints: readonly string[];
-    forbidden: readonly string[];
-    mustNotHallucinate: readonly string[];
-    failureSignals?: readonly string[];
-  },
+  raw: string,
+  rubric: Pick<ProbeRubric, "keyPoints" | "forbidden" | "mustNotHallucinate" | "failureSignals">,
 ): GraderTurnJudgement {
-  const value = asObject(parseJson(text), "批卷结果");
-  if (typeof value.behaviorOk !== "boolean") {
-    throw new Error("批卷 behaviorOk 必须是布尔值");
+  const parsed = asObject(parseJsonText(raw, "eval-grader 输出"), "eval-grader 输出");
+  if (typeof parsed.behaviorOk !== "boolean") {
+    throw new Error("eval-grader 输出缺少布尔字段 behaviorOk");
   }
-  const verdict = parseOptionalVerdict(value.verdict);
-  const score = parseOptionalScore(value.score);
-  const stance = parseClamped012(value.stance, value.behaviorOk ? 1 : 0);
-  const style = parseClamped012(value.style, 1);
-  const matchedKeyPointsProvided = Array.isArray(value.matchedKeyPoints);
-  const matchedKeyPoints = parseTolerantIndexList(value.matchedKeyPoints, rubric.keyPoints.length);
-  const forbiddenHits = parseTolerantIndexList(value.forbiddenHits, rubric.forbidden.length);
-  const hallucinationHits = parseTolerantIndexList(value.hallucinationHits, rubric.mustNotHallucinate.length);
-  const failureSignalHits = parseTolerantIndexList(value.failureSignalHits, (rubric.failureSignals ?? []).length);
-  const hallucinated = typeof value.hallucinated === "boolean"
-    ? value.hallucinated
-    : hallucinationHits.length > 0;
-  const rationale = nonEmpty(value.rationale, "批卷 rationale");
+
+  const rawVerdict = typeof parsed.verdict === "string" ? parsed.verdict.trim().toLowerCase() : "";
+  const hasVerdict = rawVerdict === "pass" || rawVerdict === "partial" || rawVerdict === "fail";
+  const rawScore = parsed.score !== undefined && parsed.score !== null ? Number(parsed.score) : NaN;
+  const hasScore = Number.isFinite(rawScore) && rawScore >= 0 && rawScore <= 100;
+
+  if (!hasScore && !hasVerdict) {
+    throw new Error("eval-grader 输出必须包含合法的 score (0..100) 或 verdict (pass/partial/fail)");
+  }
+
+  const hallucinationHits = parseIndexList(parsed.hallucinationHits, rubric.mustNotHallucinate.length);
+  const hallucinated = Boolean(parsed.hallucinated === true || hallucinationHits.length > 0);
+  const score = hasScore
+    ? Number(rawScore.toFixed(2))
+    : VERDICT_DEFAULT_SCORE[rawVerdict as GraderVerdict];
+
+  const verdict: GraderVerdict = hasVerdict
+    ? (rawVerdict as GraderVerdict)
+    : !parsed.behaviorOk || hallucinated || score < 50
+      ? "fail"
+      : score >= 80
+        ? "pass"
+        : "partial";
+
+  const defaultStance: 0 | 1 | 2 = verdict === "pass" ? 2 : verdict === "partial" ? 1 : 0;
+  const matchedKeyPointsProvided = Array.isArray(parsed.matchedKeyPoints);
 
   return {
-    ...(verdict !== undefined ? { verdict } : {}),
-    ...(score !== undefined ? { score } : {}),
-    behaviorOk: value.behaviorOk,
+    verdict,
+    score,
+    behaviorOk: parsed.behaviorOk,
     hallucinated,
-    stance,
-    matchedKeyPoints,
+    stance: parseRating012(parsed.stance, defaultStance),
+    matchedKeyPoints: parseIndexList(parsed.matchedKeyPoints, rubric.keyPoints.length),
     matchedKeyPointsProvided,
-    forbiddenHits,
+    forbiddenHits: parseIndexList(parsed.forbiddenHits, rubric.forbidden.length),
     hallucinationHits,
-    failureSignalHits,
-    style,
-    rationale,
+    failureSignalHits: parseIndexList(parsed.failureSignalHits, rubric.failureSignals.length),
+    style: parseRating012(parsed.style, 1),
+    rationale: typeof parsed.rationale === "string" ? parsed.rationale.trim() : "",
   };
+}
+
+function compactForMatch(text: string): string {
+  return normalizeText(text).replace(/[\s\p{P}\p{S}]+/gu, "").toLowerCase();
+}
+
+/** Diagnostic hint checking whether anchor text appears in the material (non-blocking). */
+export function verifyAnchorInMaterial(anchor: string, material: string): boolean {
+  const cleanAnchor = compactForMatch(anchor);
+  if (cleanAnchor.length < 4) return false;
+  const cleanMat = compactForMatch(material);
+  if (cleanMat.includes(cleanAnchor)) return true;
+  if (cleanAnchor.length >= 12) {
+    const windowLen = Math.min(12, Math.floor(cleanAnchor.length * 0.6));
+    for (let i = 0; i <= cleanAnchor.length - windowLen; i += Math.max(1, Math.floor(windowLen / 2))) {
+      if (cleanMat.includes(cleanAnchor.slice(i, i + windowLen))) return true;
+    }
+  }
+  return false;
+}
+
+function charNgrams(text: string, n: number): Set<string> {
+  const clean = compactForMatch(text);
+  const set = new Set<string>();
+  if (clean.length === 0) return set;
+  if (clean.length < n) {
+    set.add(clean);
+    return set;
+  }
+  for (let i = 0; i <= clean.length - n; i++) {
+    set.add(clean.slice(i, i + n));
+  }
+  return set;
+}
+
+/** Character n-gram Jaccard similarity in [0, 1] used for train/test overlap auditing. */
+export function charNgramJaccard(a: string, b: string, n = 2): number {
+  const setA = charNgrams(a, n);
+  const setB = charNgrams(b, n);
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let inter = 0;
+  for (const gram of setA) {
+    if (setB.has(gram)) inter++;
+  }
+  const union = setA.size + setB.size - inter;
+  return union > 0 ? inter / union : 0;
 }

@@ -8,7 +8,6 @@ import {
 } from "../shared/retry.js";
 import {
   nonEmpty,
-  parseEvalRubric,
   parseFollowup,
   parseReview,
   validateConcurrency,
@@ -24,7 +23,6 @@ export interface DialoguePrompts {
   answer: string;
   judge: string;
   followup?: string;
-  rubric?: string;
 }
 
 export interface RunDialogueBatchOptions {
@@ -56,8 +54,6 @@ export interface RunDialogueBatchSummary {
   results: number;
   errors: number;
   integrityOk: boolean;
-  rubricsExtracted?: number;
-  rubricErrors?: number;
 }
 
 export function loadTargetQuestions(
@@ -91,9 +87,6 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
   const followupPrompt = maxTurns > 1
     ? nonEmpty(options.prompts.followup, "多轮追问系统提示词")
     : undefined;
-  const rubricPrompt = options.prompts.rubric !== undefined
-    ? nonEmpty(options.prompts.rubric, "评分要点系统提示词")
-    : undefined;
 
   store.markInterruptedRuns();
 
@@ -112,7 +105,6 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     answer: answerPrompt,
     judge: judgePrompt,
     ...(followupPrompt !== undefined ? { followup: followupPrompt } : {}),
-    ...(rubricPrompt !== undefined ? { rubric: rubricPrompt } : {}),
   };
 
   const runId = store.createRun({
@@ -132,8 +124,6 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
 
   const runItemIdByQuestion = store.createRunItems(runId, questions.map((q) => q.id));
   let itemErrors = 0;
-  let rubricsExtracted = 0;
-  let rubricErrors = 0;
 
   const warmupGate = createWarmupGate();
   const warmupEnabled = concurrency > 1;
@@ -396,78 +386,6 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
         }
       }
     }
-
-    if (!itemFailed && passedResultId !== undefined && rubricPrompt !== undefined) {
-      const totalPassedTurns = historyMessages.length / 2;
-      for (let tIdx = 0; tIdx < totalPassedTurns; tIdx++) {
-        const turnNo = tIdx + 1;
-        const turnUser = historyMessages[tIdx * 2].content;
-        const turnAssistant = historyMessages[tIdx * 2 + 1].content;
-        const priorHistory = historyMessages.slice(0, tIdx * 2);
-        const rubricTag = `[q${item.id}:t${turnNo}/${totalPassedTurns}:rubric]`;
-        const wireInput: Record<string, unknown> = {
-          material: item.materialContent,
-          ...(priorHistory.length > 0 ? { history: priorHistory } : {}),
-          question: turnUser,
-          referenceAnswer: turnAssistant,
-        };
-        const callId = store.startEvalModelCall({
-          resultId: passedResultId,
-          turnNo,
-          role: "rubric",
-          input: {
-            material_id: item.materialId,
-            result_id: passedResultId,
-            turn_no: turnNo,
-            question: turnUser,
-          },
-        });
-        let lastOutput: string | undefined;
-        try {
-          const parsedRubric = await runWithRetry({
-            maxAttempts: callMaxAttempts,
-            delayMs: callRetryDelayMs,
-            run: async () => {
-              lastOutput = undefined;
-              const out = await warmupGate.run(`${item.materialId}:rubric`, warmupEnabled, () =>
-                runRole({
-                  role: "rubric",
-                  systemPrompt: rubricPrompt,
-                  input: wireInput,
-                }),
-              );
-              lastOutput = out;
-              try {
-                return { out, rubric: parseEvalRubric(out) };
-              } catch (error) {
-                throw toPublicError(error, "model_output_invalid");
-              }
-            },
-            onRetry: (attempt, max, error) => {
-              options.onProgress?.(
-                `${rubricTag} rubric 抽取失败（第 ${attempt}/${max} 次），重试：${publicErrorMessage(error)}`,
-              );
-            },
-          });
-          store.transaction(() => {
-            store.finishEvalModelCall(callId, parsedRubric.out);
-            store.upsertEvalRubric({
-              resultId: passedResultId!,
-              turnNo,
-              rubric: parsedRubric.rubric,
-              callId,
-            });
-          });
-          rubricsExtracted++;
-          options.onProgress?.(`${rubricTag} extracted (${parsedRubric.rubric.keyPoints.length} keyPoints)`);
-        } catch (error) {
-          const msg = publicErrorMessage(error);
-          store.failEvalModelCall(callId, msg, { outputText: lastOutput ?? null });
-          rubricErrors++;
-          options.onProgress?.(`${rubricTag} rubric error: ${msg}`);
-        }
-      }
-    }
   }
 
   await runConcurrentPool(questions, concurrency, (item) => processQuestion(item));
@@ -487,6 +405,5 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     results,
     errors: itemErrors,
     integrityOk: integrity.ok,
-    ...(rubricPrompt !== undefined ? { rubricsExtracted, rubricErrors } : {}),
   };
 }

@@ -39,7 +39,7 @@ export function stratifiedSampleProbes(
 
 /**
  * Renders a human-reviewable Markdown inspection report for selected probes,
- * including anchors, critic rounds, multi-turn dialogues, rubrics, and calibration scores.
+ * including anchors, critic reviews, multi-turn dialogues, rubrics, and calibration scores.
  */
 export function renderInspectMarkdown(
   store: EvalStore,
@@ -48,7 +48,7 @@ export function renderInspectMarkdown(
   totalMatched: number,
 ): string {
   const lines: string[] = [];
-  lines.push("# 对抗考题（Probe）抽检报告");
+  lines.push("# 评测考题（Probe）抽检报告");
   lines.push("");
   if (runId !== undefined) {
     const run = store.getRun(runId);
@@ -71,13 +71,11 @@ export function renderInspectMarkdown(
   for (let i = 0; i < probes.length; i++) {
     const p = probes[i]!;
     const source = store.getSourceMaterial(p.sourceMaterialId);
-    const reviews = store.listReviews(p.id);
-    const dialogue = store.getProbeDialogue(p.id);
-    const attempts = store.listAttemptsForProbe(p.id);
+    const turns = store.listProbeTurns(p.id);
     const calibrations = store.listCalibrationsForProbe(p.id);
 
     const diffLabel = p.difficulty ?? "未标定";
-    lines.push(`## #${i + 1} · Probe ${p.id}（\`${p.probeType}\` / \`${p.expectedBehavior}\` / ${p.persona} / ${p.targetTurns} 轮 / 难度：\`${diffLabel}\`）`);
+    lines.push(`## #${i + 1} · Probe ${p.id}（\`${p.probeType}\` / ${p.persona} / ${p.targetTurns} 轮 / 难度：\`${diffLabel}\`）`);
     lines.push("");
     lines.push(`- **视频**: \`${source?.videoId ?? p.sourceMaterialId}\`（slot ${p.slotIndex}，run ${p.runId}）`);
     lines.push(`- **状态**: \`${p.status}\`　｜　**锚点校验**: ${p.anchorVerified ? "通过" : "未命中"}　｜　**审题改写次数**: ${p.revisions}`);
@@ -89,12 +87,12 @@ export function renderInspectMarkdown(
     lines.push("");
     lines.push(`> **原稿锚点**：${p.anchor}`);
     lines.push("");
-    lines.push(`**首轮陷阱预期（trap）**：${p.trap}`);
+    lines.push(`**陷阱预期（trap）**：${p.trap}`);
     lines.push("");
 
-    if (reviews.length > 0) {
-      lines.push("**首轮审题记录（probe-critic）**：");
-      for (const r of reviews) {
+    if (p.reviews.length > 0) {
+      lines.push("**审题记录（probe-critic）**：");
+      for (const r of p.reviews) {
         const detail = r.decision === "accept"
           ? "accept"
           : `${r.decision} — ${r.feedback || r.issues.join("; ")}`;
@@ -103,42 +101,33 @@ export function renderInspectMarkdown(
       lines.push("");
     }
 
-    if (dialogue.length > 0) {
-      for (const turn of dialogue) {
-        const tacticTag = turn.tactic ? ` · 手法 \`${turn.tactic}\`` : "";
-        const turnAttemptCount = attempts.filter((a) => a.turnNo === turn.turnNo).length;
-        if (turn.turnNo > 1) {
-          lines.push(`### Turn ${turn.turnNo}（\`${turn.expectedBehavior}\`${tacticTag}）`);
-          lines.push("");
-          lines.push(`**施压追问**：${turn.user}`);
-          lines.push("");
-        }
-        lines.push(`**参考答案（Turn ${turn.turnNo}，共 ${turnAttemptCount} 次核验）**：`);
+    for (const turn of turns) {
+      const tacticTag = turn.tactic ? ` · 手法 \`${turn.tactic}\`` : "";
+      if (turn.turnNo > 1) {
+        lines.push(`### Turn ${turn.turnNo}（\`${turn.expectedBehavior}\`${tacticTag}）`);
         lines.push("");
-        lines.push(turn.answer);
+        lines.push(`**施压追问**：${turn.userContent}`);
         lines.push("");
-        if (turn.rubric) {
-          lines.push(`**评分卡 v2（Turn ${turn.turnNo} rubric）**：`);
-          lines.push("```json");
-          lines.push(JSON.stringify(turn.rubric, null, 2));
-          lines.push("```");
-          lines.push("");
-        }
-        const cal = calibrations.find((c) => c.turnNo === turn.turnNo);
-        if (cal) {
-          const rationale = typeof cal.detail?.judgement === "object" && cal.detail?.judgement !== null
+      }
+      lines.push(`**参考答案（Turn ${turn.turnNo}，核验 ${turn.attempts} 次）**：`);
+      lines.push("");
+      lines.push(turn.referenceAnswer);
+      lines.push("");
+      lines.push(`**评分卡（Turn ${turn.turnNo} rubric）**：`);
+      lines.push("```json");
+      lines.push(JSON.stringify(turn.rubric, null, 2));
+      lines.push("```");
+      lines.push("");
+
+      const cal = calibrations.find((c) => c.turnNo === turn.turnNo);
+      if (cal) {
+        const rationale =
+          typeof cal.detail?.judgement === "object" && cal.detail?.judgement !== null
             ? String((cal.detail.judgement as { rationale?: unknown }).rationale ?? "")
             : "";
-          lines.push(`**难度标定（Turn ${turn.turnNo} 裸答得分 ${cal.score} / 100，behaviorOk=\`${cal.behaviorOk}\`）**：${rationale}`);
-          lines.push("");
-        }
+        lines.push(`**难度标定（Turn ${turn.turnNo} 裸答得分 ${cal.score} / 100，behaviorOk=\`${cal.behaviorOk}\`）**：${rationale}`);
+        lines.push("");
       }
-    } else if (attempts.length > 0) {
-      lines.push("**核验返工记录（未通过）**：");
-      for (const a of attempts) {
-        lines.push(`- Turn ${a.turnNo} Attempt ${a.attemptNo}: \`${a.decision ?? "pending"}\` ${a.feedback ?? ""}`);
-      }
-      lines.push("");
     }
 
     lines.push("---");

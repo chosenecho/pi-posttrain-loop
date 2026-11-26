@@ -15,12 +15,12 @@
 [outcomes](<../output/database-trial-CkXhqo/outcomes.jsonl>)（全部 12 题过程记录）已完成迁移验证；
 所有业务入口已收敛至统一单入口 [src/cli/index.ts](<../src/cli/index.ts>)（`npm run dm -- synth | cot | eval`），统一落盘到 SQLite，不再以 `candidates.jsonl` 等 JSONL 文件作为主存储。
 
-## 2. 统一库结构：核心 8 表 + 分区/盲测 4 表 + CoT 补写 2 表（共 14 表）
+## 2. 统一库结构：核心 8 表 + 分区 1 表 + CoT 补写 2 表（共 11 表）
 
 主库位于 `data/data-maker.sqlite`。现有早期单表问题库 `data/questions.sqlite` 保留作只读来源和备份，不原地改写。
 
 - **核心业务 8 表**（由 [src/synth/store/index.ts](<../src/synth/store/index.ts>) 管理）：`materials`、`runs`、`questions`、`run_items`、`turns`、`attempts`、`model_calls`、`results`
-- **分区与盲测扩展 4 表**（由 [src/synth/store/index.ts](<../src/synth/store/index.ts>) 与 [src/synth/splits.ts](<../src/synth/splits.ts>) 管理）：`video_splits`、`test_set_versions`、`eval_model_calls`、`eval_rubrics`
+- **分区注册 1 表**（由 [src/synth/store/index.ts](<../src/synth/store/index.ts>) 与 [src/synth/splits.ts](<../src/synth/splits.ts>) 管理）：`video_splits`（原主库侧 `test_set_versions` / `eval_rubrics` / `eval_model_calls` 已退役并在打开主库时自动清理，所有评测数据统一迁入独立评测库 `data/eval.sqlite`）
 - **CoT 逆向补写扩展 2 表**（由 [src/reasoning/store.ts](<../src/reasoning/store.ts>) 管理）：`reasoning_runs`、`reasoning_traces`
 
 ### materials：材料版本

@@ -22,10 +22,6 @@ export async function readFollowupPrompt(directory = DEFAULT_PROMPTS_DIR): Promi
   return nonEmpty(await readFile(join(directory, "followup.md"), "utf8"), "followup 系统提示词");
 }
 
-export async function readRubricPrompt(directory = DEFAULT_PROMPTS_DIR): Promise<string> {
-  return nonEmpty(await readFile(join(directory, "rubric.md"), "utf8"), "rubric 系统提示词");
-}
-
 export function questionPrompt(systemPrompt: string, skillBody: string): string {
   return `${systemPrompt}\n\n<question-design>\n${skillBody}\n</question-design>`;
 }
@@ -40,8 +36,4 @@ export function answerPrompt(systemPrompt: string, skillBody: string): string {
 
 export function judgePrompt(systemPrompt: string, skillBody: string): string {
   return `${systemPrompt}\n\n<judging-skill>\n${skillBody}\n</judging-skill>`;
-}
-
-export function evalRubricPrompt(systemPrompt: string, skillBody: string): string {
-  return `${systemPrompt}\n\n<eval-rubric>\n${skillBody}\n</eval-rubric>`;
 }

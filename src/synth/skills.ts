@@ -10,12 +10,10 @@ import { isEvalSkillPath, readSkillFile } from "../shared/skill-loader.js";
 import type { Material, Rubric, Skill, SkillSnapshot, SynthProfile } from "../shared/types.js";
 import {
   answerPrompt,
-  evalRubricPrompt,
   followupPrompt as composeFollowupPrompt,
   judgePrompt,
   questionPrompt,
   readQuestionGeneratorPrompt,
-  readRubricPrompt,
 } from "./prompts.js";
 
 export { isEvalSkillPath, readSkillFile };
@@ -24,7 +22,6 @@ export const DEFAULT_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "question-design/
 export const DEFAULT_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "followup-strategy/SKILL.md");
 export const DEFAULT_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "answer-style/SKILL.md");
 export const DEFAULT_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "quality-judge/SKILL.md");
-export const DEFAULT_EVAL_RUBRIC_SKILL = join(DEFAULT_SKILLS_DIR, "eval-rubric/SKILL.md");
 
 export const SHORT_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "short/question-design/SKILL.md");
 export const SHORT_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "short/followup-strategy/SKILL.md");
@@ -111,23 +108,17 @@ export function readRubric(path = DEFAULT_QUALITY_JUDGE): Promise<Rubric> {
   return readTrainingSkill(path, "判断 Skill");
 }
 
-export function readEvalRubricSkill(path = DEFAULT_EVAL_RUBRIC_SKILL): Promise<Skill> {
-  return readTrainingSkill(path, "评测要点 Skill");
-}
-
 export interface SynthSkillOverrides {
   questionSkill?: string;
   followupSkill?: string;
   answerStyle?: string;
   qualityJudge?: string;
-  rubricSkill?: string;
 }
 
 export interface ResolveSynthBundleOptions {
   profile: SynthProfile;
   noSkill?: boolean;
   maxTurns: number;
-  extractRubric?: boolean;
   includeQuestionGenerator?: boolean;
   promptsDir?: string;
   overrides?: SynthSkillOverrides;
@@ -140,7 +131,6 @@ export interface ResolvedSynthBundle {
     answer: string;
     judge: string;
     followup?: string;
-    rubric?: string;
   };
   questionSkills: SkillSnapshot[];
   dialogueSkills: SkillSnapshot[];
@@ -154,13 +144,12 @@ export interface ResolvedSynthBundle {
 export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Promise<ResolvedSynthBundle> {
   const { profile, maxTurns } = options;
   const noSkill = Boolean(options.noSkill);
-  const extractRubric = Boolean(options.extractRubric);
   const ov = options.overrides ?? {};
 
   if (noSkill && profile !== "standard") {
     throw new Error(`--no-skill 不能与 --profile ${profile} 同时指定`);
   }
-  if (noSkill && (ov.questionSkill || ov.followupSkill || ov.answerStyle || ov.qualityJudge || ov.rubricSkill)) {
+  if (noSkill && (ov.questionSkill || ov.followupSkill || ov.answerStyle || ov.qualityJudge)) {
     throw new Error("--no-skill 不能与任何 Skill 参数同时指定");
   }
 
@@ -174,9 +163,6 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
   let judgeSystemPrompt = nonEmpty(await readFile(join(promptDir, "judge.md"), "utf8"), "质检系统提示词");
   let followupSystemPrompt = maxTurns > 1
     ? nonEmpty(await readFile(join(promptDir, "followup.md"), "utf8"), "多轮追问系统提示词")
-    : undefined;
-  let rubricSystemPrompt = extractRubric
-    ? await readRubricPrompt(promptDir).catch(() => readRubricPrompt(DEFAULT_PROMPTS_DIR))
     : undefined;
 
   const questionSkills: SkillSnapshot[] = [];
@@ -208,19 +194,6 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
       followupSystemPrompt = composeFollowupPrompt(followupSystemPrompt, fSkill.body);
       dialogueSkills.push({ name: "followup-strategy", path: fSkillPath, status: fSkill.status, body: fSkill.body, sha256: fSkill.sha256 });
     }
-
-    if (extractRubric && rubricSystemPrompt !== undefined) {
-      const evalRubricSkillPath = resolve(ov.rubricSkill ?? DEFAULT_EVAL_RUBRIC_SKILL);
-      const evalRubricSkill = await readEvalRubricSkill(evalRubricSkillPath);
-      rubricSystemPrompt = evalRubricPrompt(rubricSystemPrompt, evalRubricSkill.body);
-      dialogueSkills.push({
-        name: "eval-rubric",
-        path: evalRubricSkillPath,
-        status: evalRubricSkill.status,
-        body: evalRubricSkill.body,
-        sha256: evalRubricSkill.sha256,
-      });
-    }
   }
 
   return {
@@ -230,7 +203,6 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
       answer: answerSystemPrompt,
       judge: judgeSystemPrompt,
       followup: followupSystemPrompt,
-      rubric: rubricSystemPrompt,
     },
     questionSkills,
     dialogueSkills,

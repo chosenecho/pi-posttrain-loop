@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateMaxAttempts, validateMaxTurns, validateSplit } from "../../shared/schema.js";
-import type { DatasetSplit, EvalRubric, Review } from "../../shared/types.js";
+import type { DatasetSplit, Review } from "../../shared/types.js";
 import { nowIso } from "../../shared/utils.js";
 import type { CorpusRepository } from "./corpus-repo.js";
 import {
@@ -8,7 +8,6 @@ import {
   assertObjectJson,
   type CallRole,
   type CreateRunInput,
-  type EvalRubricRecord,
   type InterruptedCounts,
   type ResultTurnRow,
   type RunRecord,
@@ -41,12 +40,6 @@ export class RunRepository {
       const runs = Number(this.db.prepare(
         "UPDATE runs SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
       ).run(timestamp).changes);
-
-      if (this.hasTable("eval_model_calls")) {
-        this.db.prepare(
-          "UPDATE eval_model_calls SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-        ).run(timestamp);
-      }
 
       return { runs, runItems, turns, attempts, modelCalls };
     });
@@ -375,85 +368,5 @@ export class RunRepository {
     const counts: Record<string, number> = {};
     for (const row of rows) counts[row.status] = Number(row.count);
     return counts;
-  }
-
-  upsertEvalRubric(input: {
-    resultId: number;
-    turnNo: number;
-    rubric: EvalRubric;
-    callId?: number | null;
-    createdAt?: string;
-  }): EvalRubricRecord {
-    const createdAt = input.createdAt ?? nowIso();
-    const rubricJson = assertObjectJson(input.rubric, "rubric");
-    this.db.prepare(`
-      INSERT INTO eval_rubrics (result_id, turn_no, rubric_json, call_id, created_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(result_id, turn_no) DO UPDATE SET
-        rubric_json = excluded.rubric_json,
-        call_id = excluded.call_id,
-        created_at = excluded.created_at
-    `).run(input.resultId, input.turnNo, rubricJson, input.callId ?? null, createdAt);
-    const record = this.getEvalRubric(input.resultId, input.turnNo);
-    if (!record) throw new Error(`无法读取 eval_rubric (result_id=${input.resultId}, turn_no=${input.turnNo})`);
-    return record;
-  }
-
-  getEvalRubric(resultId: number, turnNo: number): EvalRubricRecord | undefined {
-    if (!this.hasTable("eval_rubrics")) return undefined;
-    const row = this.db.prepare(
-      "SELECT id, result_id, turn_no, rubric_json, call_id, created_at FROM eval_rubrics WHERE result_id = ? AND turn_no = ?",
-    ).get(resultId, turnNo) as {
-      id: number;
-      result_id: number;
-      turn_no: number;
-      rubric_json: string;
-      call_id: number | null;
-      created_at: string;
-    } | undefined;
-    if (!row) return undefined;
-    return {
-      id: Number(row.id),
-      result_id: Number(row.result_id),
-      turn_no: Number(row.turn_no),
-      rubric: JSON.parse(row.rubric_json) as EvalRubric,
-      rubric_json: row.rubric_json,
-      call_id: row.call_id !== null ? Number(row.call_id) : null,
-      created_at: row.created_at,
-    };
-  }
-
-  startEvalModelCall(input: {
-    resultId?: number | null;
-    turnNo?: number | null;
-    role: "rubric";
-    input: Record<string, unknown>;
-    startedAt?: string;
-  }): number {
-    const info = this.db.prepare(`
-      INSERT INTO eval_model_calls (result_id, turn_no, role, status, input_json, started_at)
-      VALUES (?, ?, ?, 'running', ?, ?)
-    `).run(
-      input.resultId ?? null,
-      input.turnNo ?? null,
-      input.role,
-      assertObjectJson(input.input, "eval input_json"),
-      input.startedAt ?? nowIso(),
-    );
-    return Number(info.lastInsertRowid);
-  }
-
-  finishEvalModelCall(callId: number, outputText: string, finishedAt = nowIso()): void {
-    this.db.prepare(`
-      UPDATE eval_model_calls SET status = 'completed', output_text = ?, finished_at = ? WHERE id = ?
-    `).run(outputText, finishedAt, callId);
-  }
-
-  failEvalModelCall(callId: number, error: string, options: { outputText?: string | null; finishedAt?: string } = {}): void {
-    this.db.prepare(`
-      UPDATE eval_model_calls
-      SET status = 'error', error = ?, output_text = COALESCE(?, output_text), finished_at = ?
-      WHERE id = ?
-    `).run(error, options.outputText ?? null, options.finishedAt ?? nowIso(), callId);
   }
 }

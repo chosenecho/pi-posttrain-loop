@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseEvalRubric, parseQuestions, parseReview, validateMaxAttempts } from "../src/shared/schema.js";
+import { parseQuestions, parseReview, validateMaxAttempts } from "../src/shared/schema.js";
 
 test("questions accepts exactly zero to three nonempty questions and trims their text", () => {
   for (const questions of [[], ["一？"], ["一？", "二？"], ["一？", "二？", "三？"]]) {
@@ -83,34 +83,5 @@ test("maxAttempts accepts every integer from one through ten", () => {
 test("maxAttempts rejects zero, negatives, fractions, values above ten and nonfinite numbers", () => {
   for (const attempts of [0, -1, 11, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
     assert.throws(() => validateMaxAttempts(attempts), /1–10 的整数/, String(attempts));
-  }
-});
-
-test("parseEvalRubric validates stance, keyPoints, forbidden, and mustNotHallucinate contracts", () => {
-  assert.deepEqual(
-    parseEvalRubric(
-      JSON.stringify({
-        stance: "  核心立场  ",
-        keyPoints: [" 要点一 ", "要点二"],
-        forbidden: ["误区一"],
-        mustNotHallucinate: [],
-      }),
-    ),
-    {
-      stance: "核心立场",
-      keyPoints: ["要点一", "要点二"],
-      forbidden: ["误区一"],
-      mustNotHallucinate: [],
-    },
-  );
-
-  for (const bad of [
-    { value: {}, error: /stance/ },
-    { value: { stance: "立场", keyPoints: [] }, error: /1–6/ },
-    { value: { stance: "立场", keyPoints: ["1", "2", "3", "4", "5", "6", "7"] }, error: /1–6/ },
-    { value: { stance: "立场", keyPoints: ["重复", " 重复 "] }, error: /重复/ },
-    { value: { stance: "立场", keyPoints: ["要点"], forbidden: ["1", "2", "3", "4", "5", "6"] }, error: /0–5/ },
-  ]) {
-    assert.throws(() => parseEvalRubric(JSON.stringify(bad.value)), bad.error);
   }
 });

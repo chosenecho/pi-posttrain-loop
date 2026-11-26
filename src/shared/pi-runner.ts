@@ -14,7 +14,6 @@ const ROLE_THINKING_ENV: ReadonlyArray<[DialogueRole, string]> = [
   ["answer", "LLM_ANSWER_THINKING_LEVEL"],
   ["judge", "LLM_JUDGE_THINKING_LEVEL"],
   ["followup", "LLM_FOLLOWUP_THINKING_LEVEL"],
-  ["rubric", "LLM_RUBRIC_THINKING_LEVEL"],
 ];
 
 export interface PiConfig {

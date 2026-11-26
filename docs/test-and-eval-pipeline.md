@@ -1,6 +1,6 @@
-# 测试集（`test`）、DPO 采题池（`dpo`）与评测流水线设计
+# 测试集（`test`）、DPO 采题池（`dpo`）与三分区防泄漏设计
 
-本文档记录 `pi-posttrain-loop` 的持久化三分区防泄漏架构、结构化评分要点（`eval_rubrics`）抽取、不可变测试集版本冻结（`test_set_versions`）、首版盲测基线 `test-v1`，以及后续脱稿盲测与 On-policy DPO 闭环演进路线。
+> **架构更新说明**：原主库侧的 `eval_rubrics`、`test_set_versions` 与 `test-v1` 盲测链路已全面退役并由独立评测库 `data/eval.sqlite`（Schema v3）统一承接，`synth` 命令现已禁止在 `test` 分区生产数据。当前评测集制作与盲测流程请直接参阅 [独立评测库设计（eval-probe-pipeline.md）](eval-probe-pipeline.md)。本文档保留持久化三分区（`video_splits`）设计规范供参考。
 
 ---
 

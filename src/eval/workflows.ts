@@ -9,56 +9,41 @@ import {
   validateCallMaxAttempts,
   validateCallRetryDelayMs,
 } from "../shared/retry.js";
-import { nonEmpty, validateConcurrency, validateMaxAttempts } from "../shared/schema.js";
-import { createSeededRng, shuffleInPlace } from "../shared/utils.js";
-import {
-  renderCalibrationReportMarkdown,
-  runProbeCalibration,
-  summarizeCalibrationFromStore,
-} from "./calibrate.js";
-import { createOpenAiCandidateRunner, readCandidateConfig } from "./candidate-client.js";
-import { gradeEvalRun } from "./eval-grader.js";
+import { nonEmpty, validateConcurrency } from "../shared/schema.js";
+import type { RoleRunner } from "../shared/types.js";
+import { runProbeCalibration, type RunProbeCalibrationSummary } from "./calibrate.js";
+import { createOpenAiCandidateRunner, readCandidateConfig, type CandidateRunner } from "./candidate-client.js";
+import { gradeEvalRun, type GradeEvalRunSummary } from "./eval-grader.js";
 import {
   loadCalibrationPromptBundle,
-  loadEvalPromptBundle,
+  loadEvalBuildPromptBundle,
   resolveCandidateSystemPrompt,
 } from "./eval-prompts.js";
-import { runSuiteEvaluation } from "./eval-runner.js";
+import { runSuiteEvaluation, type RunSuiteEvaluationSummary } from "./eval-runner.js";
 import { renderInspectMarkdown, stratifiedSampleProbes } from "./inspect.js";
 import {
   DEFAULT_MAX_ANSWER_ATTEMPTS,
-  DEFAULT_MAX_BARE_REFINEMENTS,
   DEFAULT_MAX_CRITIC_REVISIONS,
-  DEFAULT_PROBES_PER_VIDEO,
-  runProbeBuild,
+  DEFAULT_MAX_PROBES_PER_VIDEO,
+  runProbeBuildLoop,
+  type RunProbeBuildLoopSummary,
 } from "./probe-loop.js";
-import { DEFAULT_TRAP_PROBE_MIX } from "./probe-planner.js";
-import { buildEvalReport, renderEvalReportMarkdown } from "./report.js";
-import { importTestSources, mirrorMainVersion } from "./source-import.js";
+import { buildEvalReport, renderEvalReportMarkdown, type EvalComparisonReport } from "./report.js";
+import { importTestSources, verifySourceSplits, type ImportTestSourcesReport } from "./source-import.js";
 import {
   EvalStore,
   PROBE_TYPES,
-  probeTypesForProfile,
   type EvalHistoryMode,
-  type EvalProfile,
+  type EvalStoreSummary,
   type ProbeStatus,
   type ProbeType,
 } from "./store/index.js";
-import { DEFAULT_MAX_EASY_RATIO, freezeAdversarialSuite } from "./suite-freeze.js";
+import { DEFAULT_MAX_EASY_RATIO, freezeEvalSuite, type FreezeSuiteReport } from "./suite-freeze.js";
 
 function requireEvalDbExists(evalDbPath: string): void {
   if (!existsSync(evalDbPath)) {
-    throw new Error(`评测库不存在：${evalDbPath}（请先运行 npm run dm -- eval init）`);
+    throw new Error(`评测库不存在：${evalDbPath}（请先运行 npm run dm -- eval make）`);
   }
-}
-
-export function parseEvalProfile(raw: string | undefined): EvalProfile | undefined {
-  if (raw === undefined) return undefined;
-  const profile = raw.trim();
-  if (profile !== "adversarial" && profile !== "trap") {
-    throw new Error(`--profile 必须是 adversarial 或 trap（实际 ${profile}）`);
-  }
-  return profile;
 }
 
 export function parseEvalHistoryMode(raw: string | undefined): EvalHistoryMode {
@@ -78,12 +63,22 @@ export function parseProbeTypeFilter(raw: string | undefined): ProbeType | undef
   return probeType;
 }
 
-function resolveProbeRunFilter(store: EvalStore, raw: string | undefined, defaultToLatest: boolean): number | undefined {
-  if (raw === undefined) {
-    return defaultToLatest ? store.latestRunId("probe_build") : undefined;
+export function parseProbeTypeList(raw: readonly string[] | undefined): ProbeType[] | undefined {
+  if (!raw || raw.length === 0) return undefined;
+  const out: ProbeType[] = [];
+  for (const item of raw) {
+    const t = item.trim() as ProbeType;
+    if (!PROBE_TYPES.includes(t)) {
+      throw new Error(`未知题型 "${item}"（可选：${PROBE_TYPES.join(", ")}）`);
+    }
+    if (!out.includes(t)) out.push(t);
   }
-  if (raw === "latest") return store.latestRunId("probe_build");
-  if (raw === "all") return undefined;
+  return out;
+}
+
+function resolveProbeRunFilter(store: EvalStore, raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === "all") return undefined;
+  if (raw === "latest") return store.getLatestRun("probe_build")?.id;
   const id = Number(raw.trim());
   if (!Number.isSafeInteger(id) || id < 1) {
     throw new Error(`--run 必须是正整数、latest 或 all（实际 ${raw}）`);
@@ -91,375 +86,228 @@ function resolveProbeRunFilter(store: EvalStore, raw: string | undefined, defaul
   return id;
 }
 
-export function initEvalStoreWorkflow(options: { evalDbPath?: string; mainDbPath?: string } = {}): Record<string, unknown> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  const mainDbPath = resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
-  const store = new EvalStore(evalDbPath);
-  try {
-    store.setMeta("main_db_path", mainDbPath);
-    return {
-      action: "init",
-      evalDb: evalDbPath,
-      mainDb: mainDbPath,
-      ...store.getSummary(),
-    };
-  } finally {
-    store.close();
-  }
-}
-
-export function getEvalStatusWorkflow(options: { evalDbPath?: string } = {}): Record<string, unknown> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  requireEvalDbExists(evalDbPath);
-  const store = new EvalStore(evalDbPath, { readOnly: true });
-  try {
-    return { evalDb: evalDbPath, ...store.getSummary() };
-  } finally {
-    store.close();
-  }
-}
-
-export function mirrorEvalSuiteWorkflow(options: {
+export interface MakeEvalSuiteOptions {
   evalDbPath?: string;
   mainDbPath?: string;
-  fromVersion: string;
-  asSuiteName: string;
-}): Record<string, unknown> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  const mainDbPath = resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
-  const fromVersion = nonEmpty(options.fromVersion, "--from-version");
-  const asSuiteName = nonEmpty(options.asSuiteName, "--as");
-  const store = new EvalStore(evalDbPath);
-  try {
-    store.setMeta("main_db_path", mainDbPath);
-    const report = mirrorMainVersion({
-      evalStore: store,
-      mainDbPath,
-      fromVersion,
-      asSuiteName,
-    });
-    return { evalDb: evalDbPath, mainDb: mainDbPath, ...report };
-  } finally {
-    store.close();
-  }
-}
-
-export async function importEvalSourcesWorkflow(options: {
-  evalDbPath?: string;
-  mainDbPath?: string;
+  suiteName?: string;
+  noFreeze?: boolean;
   inputDir?: string;
-  fromMainMaterials?: boolean;
   videoKeys?: string[];
   limit?: number;
   shuffle?: boolean;
   seed?: number;
-  excludeUsed?: boolean;
   maxChunkChars?: number;
-}): Promise<Record<string, unknown>> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  const mainDbPath = resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
-  const inputDir = options.fromMainMaterials
-    ? undefined
-    : resolve(options.inputDir ?? DEFAULT_CORPUS_DIR);
-  const store = new EvalStore(evalDbPath);
-  try {
-    store.setMeta("main_db_path", mainDbPath);
-    const report = await importTestSources({
-      evalStore: store,
-      mainDbPath,
-      inputDir,
-      videoKeys: options.videoKeys,
-      limit: options.limit,
-      shuffle: Boolean(options.shuffle),
-      seed: options.seed,
-      excludeUsed: Boolean(options.excludeUsed),
-      maxChunkChars: options.maxChunkChars,
-    });
-    return { evalDb: evalDbPath, mainDb: mainDbPath, ...report };
-  } finally {
-    store.close();
-  }
-}
-
-export async function buildEvalProbesWorkflow(options: {
-  evalDbPath?: string;
-  mainDbPath?: string;
-  skipMainVerify?: boolean;
-  profile?: EvalProfile;
-  videosSpec?: string;
-  limit?: number;
-  shuffle?: boolean;
-  probesPerVideo?: number;
-  mix?: Partial<Record<ProbeType, number>>;
-  seed?: number;
-  maxCriticRevisions?: number;
-  maxBareRefinements?: number;
-  bareCheck?: boolean;
-  bareModel?: string;
+  probeTypes?: readonly ProbeType[];
+  maxProbesPerVideo?: number;
+  maxRevisions?: number;
   maxAnswerAttempts?: number;
-  concurrency?: number;
-  callMaxAttempts?: number;
-  callRetryDelayMs?: number;
-  onProgress?: (message: string) => void;
-}): Promise<Record<string, unknown>> {
-  const profile: EvalProfile = options.profile ?? "adversarial";
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  const mainDbPath = options.skipMainVerify
-    ? undefined
-    : resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
-  const videosSpec = (options.videosSpec ?? "imported").trim();
-  const defaultProbesPerVideo = profile === "trap" ? 3 : DEFAULT_PROBES_PER_VIDEO;
-  const probesPerVideo = options.probesPerVideo ?? defaultProbesPerVideo;
-  const mix = options.mix ?? (profile === "trap" ? { ...DEFAULT_TRAP_PROBE_MIX } : undefined);
-  const maxCriticRevisions = options.maxCriticRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS;
-  const maxBareRefinements = options.maxBareRefinements ?? DEFAULT_MAX_BARE_REFINEMENTS;
-  const maxAnswerAttempts = validateMaxAttempts(options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS);
-  const concurrency = validateConcurrency(options.concurrency ?? 1);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-
-  const bundle = await loadEvalPromptBundle({ profile });
-  if (!bundle.allReady) {
-    throw new Error(`存在未就绪的 eval Skill（profile=${profile}），无法启动正式评测考题构建`);
-  }
-  const config = readEvalPiConfig();
-  const runRole = createPiRunner(config);
-
-  const bareCheckEnabled = options.bareCheck ?? true;
-  let runBareModel: ReturnType<typeof createPiRunner> | undefined;
-  let barePrompt: string | undefined;
-  let bareModelId: string | undefined;
-  if (bareCheckEnabled) {
-    const calBundle = await loadCalibrationPromptBundle();
-    barePrompt = calBundle.prompts.bareAnswer;
-    bareModelId = options.bareModel?.trim() || config.modelId;
-    runBareModel = createPiRunner({ ...config, modelId: bareModelId });
-  }
-
-  const store = new EvalStore(evalDbPath);
-  try {
-    let sources = videosSpec === "imported"
-      ? store.listUnbuiltSourceMaterials(probeTypesForProfile(profile))
-      : videosSpec === "all"
-        ? store.listSourceMaterials()
-        : store.listSourceMaterialsByVideoKeys(videosSpec.split(",").map((s) => s.trim()).filter(Boolean));
-
-    if (options.shuffle && sources.length > 1) {
-      const rng = options.seed !== undefined ? createSeededRng(options.seed) : Math.random;
-      sources = shuffleInPlace([...sources], rng);
-    }
-    if (options.limit !== undefined) {
-      if (!Number.isSafeInteger(options.limit) || options.limit < 1) {
-        throw new Error("--limit 必须是正整数");
-      }
-      sources = sources.slice(0, options.limit);
-    }
-    if (sources.length === 0) {
-      throw new Error(`未找到符合条件（--profile ${profile}, --videos ${videosSpec}）的材料快照，请先运行 npm run dm -- eval import`);
-    }
-
-    options.onProgress?.(
-      `=== 对抗考题 Agent Loop 构建（profile=${profile}，${sources.length} 份材料，单篇上限 ${probesPerVideo} 题，裸答回流=${bareCheckEnabled ? bareModelId : "off"}，并发 ${concurrency}，模型 ${config.modelId}）===`,
-    );
-    const summary = await runProbeBuild({
-      evalStore: store,
-      sources,
-      mainDbPath,
-      profile,
-      prompts: bundle.prompts,
-      skills: bundle.skills,
-      runRole,
-      modelId: config.modelId,
-      probesPerVideo,
-      mix,
-      seed: options.seed,
-      maxCriticRevisions,
-      maxAnswerAttempts,
-      ...(runBareModel && barePrompt ? { runBareModel, barePrompt, bareModelId, maxBareRefinements } : {}),
-      concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
-      onProgress: options.onProgress,
-    });
-    return { evalDb: evalDbPath, ...summary };
-  } finally {
-    store.close();
-  }
-}
-
-export async function calibrateEvalProbesWorkflow(options: {
-  evalDbPath?: string;
-  runSpec?: string;
-  profile?: EvalProfile;
-  probeType?: ProbeType;
-  onlyUncalibrated?: boolean;
-  reportOnly?: boolean;
-  limit?: number;
+  rebuild?: boolean;
+  recalibrate?: boolean;
   bareModel?: string;
   graderModel?: string;
-  concurrency?: number;
-  callMaxAttempts?: number;
-  callRetryDelayMs?: number;
-  outPath?: string;
-  onProgress?: (message: string) => void;
-}): Promise<Record<string, unknown>> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  requireEvalDbExists(evalDbPath);
-  const probeTypesFilter = options.profile ? probeTypesForProfile(options.profile) : undefined;
-
-  if (options.reportOnly) {
-    const store = new EvalStore(evalDbPath, { readOnly: true });
-    try {
-      const runFilter = resolveProbeRunFilter(store, options.runSpec, true);
-      let probes = store.listProbes({
-        runId: runFilter,
-        status: "accepted",
-        probeType: options.probeType,
-        probeTypes: probeTypesFilter,
-      });
-      if (options.limit !== undefined) {
-        if (options.limit < 1) throw new Error("--limit 必须是正整数");
-        probes = probes.slice(0, options.limit);
-      }
-      if (probes.length === 0) {
-        throw new Error("未找到符合条件的已通过考题（accepted probes）可供汇总");
-      }
-      const summary = summarizeCalibrationFromStore({ evalStore: store, probes });
-      const reportPath = options.outPath
-        ? await writeOutputFile(nonEmpty(options.outPath, "--out"), renderCalibrationReportMarkdown(summary))
-        : undefined;
-      const { items: _items, ...compactSummary } = summary;
-      return {
-        evalDb: evalDbPath,
-        reportOnly: true,
-        ...compactSummary,
-        ...(reportPath ? { reportPath } : {}),
-      };
-    } finally {
-      store.close();
-    }
-  }
-
-  const concurrency = validateConcurrency(options.concurrency ?? 1);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-
-  const bundle = await loadCalibrationPromptBundle();
-  if (!bundle.allReady) {
-    throw new Error("eval-grader Skill 未就绪，无法执行难度标定");
-  }
-
-  const baseConfig = readPiConfig();
-  const graderConfig = readEvalPiConfig();
-  const bareModelId = options.bareModel?.trim() || baseConfig.modelId;
-  const graderModelId = options.graderModel?.trim() || graderConfig.modelId;
-  const runBareModel = createPiRunner({ ...baseConfig, modelId: bareModelId });
-  const runGrader = createPiRunner({ ...graderConfig, modelId: graderModelId });
-
-  const store = new EvalStore(evalDbPath);
-  try {
-    const runFilter = resolveProbeRunFilter(store, options.runSpec, true);
-    let probes = store.listProbes({
-      runId: runFilter,
-      status: "accepted",
-      probeType: options.probeType,
-      probeTypes: probeTypesFilter,
-      onlyUncalibrated: Boolean(options.onlyUncalibrated),
-    });
-    if (options.limit !== undefined) {
-      if (options.limit < 1) throw new Error("--limit 必须是正整数");
-      probes = probes.slice(0, options.limit);
-    }
-    if (probes.length === 0) {
-      throw new Error("未找到符合条件的已通过考题（accepted probes）可供标定");
-    }
-
-    options.onProgress?.(
-      `=== 难度标定（${probes.length} 道考题，裸答模型 ${bareModelId}，批卷模型 ${graderModelId}，并发 ${concurrency}）===`,
-    );
-    const summary = await runProbeCalibration({
-      evalStore: store,
-      probes,
-      prompts: bundle.prompts,
-      skills: bundle.skills,
-      runBareModel,
-      bareModelId,
-      runGrader,
-      graderModelId,
-      concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
-      onProgress: options.onProgress,
-    });
-
-    const reportPath = options.outPath
-      ? await writeOutputFile(nonEmpty(options.outPath, "--out"), renderCalibrationReportMarkdown(summary))
-      : undefined;
-    const { items: _items, ...compactSummary } = summary;
-    return {
-      evalDb: evalDbPath,
-      ...compactSummary,
-      ...(reportPath ? { reportPath } : {}),
-    };
-  } finally {
-    store.close();
-  }
-}
-
-export async function freezeEvalSuiteWorkflow(options: {
-  evalDbPath?: string;
-  mainDbPath?: string;
-  name: string;
-  runSpec?: string;
-  profile?: EvalProfile;
   maxEasyRatio?: number;
   allowUncalibrated?: boolean;
   allowActiveRuns?: boolean;
-  skipMainVerify?: boolean;
   failOnTrainSim?: number;
   exportPath?: string;
   manifestOutPath?: string;
-}): Promise<Record<string, unknown>> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  requireEvalDbExists(evalDbPath);
-  const name = nonEmpty(options.name, "--name");
-  const probeTypesFilter = options.profile ? probeTypesForProfile(options.profile) : undefined;
-  const maxEasyRatio = options.maxEasyRatio ?? DEFAULT_MAX_EASY_RATIO;
-  const mainDbPath = options.skipMainVerify
-    ? undefined
-    : resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
-  const exportPath = options.exportPath ? resolve(nonEmpty(options.exportPath, "--export")) : undefined;
-  const manifestOutPath = options.manifestOutPath
-    ? resolve(nonEmpty(options.manifestOutPath, "--manifest-out"))
-    : undefined;
+  concurrency?: number;
+  callMaxAttempts?: number;
+  callRetryDelayMs?: number;
+  promptsDir?: string;
+  skillsDir?: string;
+  answerStylePath?: string;
+  /** Optional injectable runners & model IDs for tests. */
+  runRole?: RoleRunner;
+  runBareModel?: RoleRunner;
+  runGrader?: RoleRunner;
+  modelId?: string;
+  onProgress?: (message: string) => void;
+}
 
-  const store = new EvalStore(evalDbPath);
+export interface MakeEvalSuiteResult {
+  action: "make";
+  evalDb: string;
+  mainDb: string;
+  import: ImportTestSourcesReport;
+  build: RunProbeBuildLoopSummary | { skipped: true; reason: string };
+  calibrate: RunProbeCalibrationSummary | { skipped: true; reason: string };
+  freeze: FreezeSuiteReport | { skipped: true; reason: string };
+}
+
+/**
+ * Unified one-command suite maker (`eval make`):
+ * import(test split) -> build(unbuilt sources) -> calibrate(uncalibrated accepted probes) -> freeze(suite).
+ * Fully resumable and idempotent across partial runs.
+ */
+export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Promise<MakeEvalSuiteResult> {
+  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
+  const mainDbPath = resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
+  if (!options.noFreeze && !options.suiteName?.trim()) {
+    throw new Error("请指定 --suite <套卷名>（或传入 --no-freeze 只造题标定不冻结）");
+  }
+  if (!existsSync(mainDbPath)) {
+    throw new Error(`主库不存在：${mainDbPath}`);
+  }
+
+  const concurrency = validateConcurrency(options.concurrency ?? 4);
+  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
+  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
+
+  const effectiveInputDir =
+    options.inputDir !== undefined
+      ? resolve(options.inputDir)
+      : mainDbPath === resolve(DEFAULT_MAIN_DB) && existsSync(DEFAULT_CORPUS_DIR)
+        ? DEFAULT_CORPUS_DIR
+        : undefined;
+
+  const evalStore = new EvalStore(evalDbPath);
   try {
-    const runId = resolveProbeRunFilter(store, options.runSpec, false);
-    const report = await freezeAdversarialSuite({
-      evalStore: store,
-      name,
-      runId,
-      probeTypes: probeTypesFilter,
-      maxEasyRatio,
-      allowUncalibrated: Boolean(options.allowUncalibrated),
-      allowActiveRuns: Boolean(options.allowActiveRuns),
-      mainDbPath: mainDbPath && existsSync(mainDbPath) ? mainDbPath : undefined,
-      failOnTrainSim: options.failOnTrainSim,
-      exportPath,
-      manifestOutPath,
+    evalStore.setMeta("main_db_path", mainDbPath);
+
+    // 1. Import test split (read-only from main DB, idempotent)
+    options.onProgress?.("[eval make 1/4] 导入主库 test 分区材料快照...");
+    const importReport = await importTestSources({
+      evalStore,
+      mainDbPath,
+      inputDir: effectiveInputDir,
+      videoKeys: options.videoKeys,
+      limit: options.limit,
+      shuffle: options.shuffle,
+      seed: options.seed,
+      maxChunkChars: options.maxChunkChars,
     });
-    return { evalDb: evalDbPath, ...report };
+    options.onProgress?.(
+      `[eval make 1/4] 导入完成：新增视频 ${importReport.importedVideos}，新增分块 ${importReport.importedChunks}，跳过已有 ${importReport.skippedExistingChunks}`,
+    );
+
+    // 2. Build probes for unbuilt sources (or all matching sources if --rebuild)
+    const targetSources = options.rebuild
+      ? evalStore.listSourceMaterials({ videoKeys: options.videoKeys, limit: options.limit })
+      : evalStore.listUnbuiltSourceMaterials({ videoKeys: options.videoKeys, limit: options.limit });
+
+    let buildResult: RunProbeBuildLoopSummary | { skipped: true; reason: string };
+    if (targetSources.length === 0) {
+      buildResult = { skipped: true, reason: "全部目标材料均已出题（如需重出请传 --rebuild）" };
+      options.onProgress?.("[eval make 2/4] 跳过出题：目标材料均已处理");
+    } else {
+      verifySourceSplits(mainDbPath, targetSources);
+      const bundle = await loadEvalBuildPromptBundle({
+        promptsDir: options.promptsDir,
+        skillsDir: options.skillsDir,
+        answerStylePath: options.answerStylePath,
+      });
+      const evalPi = options.runRole ? undefined : readEvalPiConfig();
+      const modelId = options.modelId ?? evalPi!.modelId;
+      const runRole = options.runRole ?? createPiRunner(evalPi!);
+
+      options.onProgress?.(`[eval make 2/4] 开始出题（${targetSources.length} 份材料，模型=${modelId}）...`);
+      buildResult = await runProbeBuildLoop({
+        evalStore,
+        sources: targetSources,
+        prompts: bundle.prompts,
+        skills: bundle.skills,
+        modelId,
+        runRole,
+        allowedTypes: options.probeTypes,
+        maxProbesPerVideo: options.maxProbesPerVideo ?? DEFAULT_MAX_PROBES_PER_VIDEO,
+        maxRevisions: options.maxRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS,
+        maxAnswerAttempts: options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS,
+        concurrency,
+        callMaxAttempts,
+        callRetryDelayMs,
+        onProgress: options.onProgress,
+      });
+    }
+
+    // 3. Calibrate uncalibrated accepted probes (or all accepted if --recalibrate)
+    const probesToCalibrate = evalStore.listProbes({
+      status: "accepted",
+      probeTypes: options.probeTypes,
+      ...(options.recalibrate ? {} : { difficulty: "uncalibrated" }),
+    });
+
+    let calibrateResult: RunProbeCalibrationSummary | { skipped: true; reason: string };
+    if (probesToCalibrate.length === 0) {
+      calibrateResult = { skipped: true, reason: "全部已通过考题均已标定难度" };
+      options.onProgress?.("[eval make 3/4] 跳过标定：无待标定考题");
+    } else {
+      const calBundle = await loadCalibrationPromptBundle({
+        promptsDir: options.promptsDir,
+        skillsDir: options.skillsDir,
+      });
+      const barePi = options.runBareModel
+        ? undefined
+        : readPiConfig({ ...process.env, ...(options.bareModel ? { LLM_MODEL: options.bareModel } : {}) });
+      const graderPi = options.runGrader
+        ? undefined
+        : readEvalPiConfig({ ...process.env, ...(options.graderModel ? { EVAL_LLM_MODEL: options.graderModel } : {}) });
+
+      const bareModelId = options.bareModel ?? barePi?.modelId ?? options.modelId ?? "bare-model";
+      const graderModelId = options.graderModel ?? graderPi?.modelId ?? options.modelId ?? "grader-model";
+      const runBareModel = options.runBareModel ?? createPiRunner(barePi!);
+      const runGrader = options.runGrader ?? createPiRunner(graderPi!);
+
+      options.onProgress?.(
+        `[eval make 3/4] 开始难度标定（${probesToCalibrate.length} 题，bare=${bareModelId}，grader=${graderModelId}）...`,
+      );
+      calibrateResult = await runProbeCalibration({
+        evalStore,
+        probes: probesToCalibrate,
+        prompts: calBundle.prompts,
+        skills: calBundle.skills,
+        bareModelId,
+        graderModelId,
+        runBareModel,
+        runGrader,
+        recalibrate: options.recalibrate,
+        concurrency,
+        callMaxAttempts,
+        callRetryDelayMs,
+        onProgress: options.onProgress,
+      });
+    }
+
+    // 4. Freeze suite (unless --no-freeze)
+    let freezeResult: FreezeSuiteReport | { skipped: true; reason: string };
+    if (options.noFreeze) {
+      freezeResult = { skipped: true, reason: "指定了 --no-freeze" };
+      options.onProgress?.("[eval make 4/4] 跳过冻结（--no-freeze）");
+    } else {
+      options.onProgress?.(`[eval make 4/4] 冻结套卷 "${options.suiteName}"...`);
+      freezeResult = await freezeEvalSuite({
+        evalStore,
+        name: options.suiteName!,
+        probeTypes: options.probeTypes,
+        maxEasyRatio: options.maxEasyRatio ?? DEFAULT_MAX_EASY_RATIO,
+        allowUncalibrated: options.allowUncalibrated,
+        allowActiveRuns: options.allowActiveRuns,
+        mainDbPath,
+        failOnTrainSim: options.failOnTrainSim,
+        exportPath: options.exportPath ? resolve(options.exportPath) : undefined,
+        manifestOutPath: options.manifestOutPath ? resolve(options.manifestOutPath) : undefined,
+      });
+    }
+
+    return {
+      action: "make",
+      evalDb: evalDbPath,
+      mainDb: mainDbPath,
+      import: importReport,
+      build: buildResult,
+      calibrate: calibrateResult,
+      freeze: freezeResult,
+    };
   } finally {
-    store.close();
+    evalStore.close();
   }
 }
 
-export async function runEvalCandidateWorkflow(options: {
+export interface EvaluateCandidateWorkflowOptions {
   evalDbPath?: string;
   suiteName: string;
   candidate: string;
-  model?: string;
+  modelId?: string;
   baseUrl?: string;
   apiKey?: string;
   historyMode?: EvalHistoryMode;
@@ -471,190 +319,128 @@ export async function runEvalCandidateWorkflow(options: {
   timeoutMs?: number;
   resumeRunId?: number;
   limit?: number;
+  graderModel?: string;
+  allowSameModel?: boolean;
+  regrade?: boolean;
   concurrency?: number;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
+  outPath?: string;
+  jsonOutPath?: string;
+  promptsDir?: string;
+  skillsDir?: string;
+  runCandidate?: CandidateRunner;
+  runGrader?: RoleRunner;
   onProgress?: (message: string) => void;
-}): Promise<Record<string, unknown> & { evalRunId: number }> {
+}
+
+export interface EvaluateCandidateWorkflowResult {
+  action: "evaluate";
+  evalDb: string;
+  run: RunSuiteEvaluationSummary;
+  grade: GradeEvalRunSummary;
+  reportOutPath?: string;
+  jsonOutPath?: string;
+}
+
+export async function evaluateEvalCandidateWorkflow(
+  options: EvaluateCandidateWorkflowOptions,
+): Promise<EvaluateCandidateWorkflowResult> {
   const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
   requireEvalDbExists(evalDbPath);
   const suiteName = nonEmpty(options.suiteName, "--suite");
   const candidate = nonEmpty(options.candidate, "--candidate");
-  const historyMode: EvalHistoryMode = options.historyMode ?? "gold";
-  const concurrency = validateConcurrency(options.concurrency ?? 4);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
+  const historyMode = options.historyMode ?? "gold";
 
-  const resolvedPrompt = await resolveCandidateSystemPrompt({
+  const resolvedSys = await resolveCandidateSystemPrompt({
     systemPrompt: options.systemPrompt,
     systemPromptFile: options.systemPromptFile,
     noSystemPrompt: options.noSystemPrompt,
     isResuming: options.resumeRunId !== undefined,
   });
-  const promptSourceLabel: Record<typeof resolvedPrompt.source, string> = {
-    cli: "CLI(--system-prompt)",
-    cli_file: "CLI(--system-prompt-file)",
-    env: "ENV(CANDIDATE_LLM_SYSTEM_PROMPT)",
-    env_file: "ENV(CANDIDATE_LLM_SYSTEM_PROMPT_FILE)",
-    default_file: "默认(prompts/eval/candidate-system.md)",
-    none: "无(--no-system-prompt)",
-    resume_inherit: "继承原run",
-  };
 
-  const candidateConfig = readCandidateConfig({
-    baseUrl: options.baseUrl,
-    modelId: options.model,
-    apiKey: options.apiKey,
-    temperature: options.temperature,
-    maxTokens: options.maxTokens,
-    timeoutMs: options.timeoutMs,
+  const candCfg = options.runCandidate
+    ? undefined
+    : readCandidateConfig({
+        baseUrl: options.baseUrl,
+        modelId: options.modelId,
+        apiKey: options.apiKey,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens,
+        timeoutMs: options.timeoutMs,
+      });
+  const modelId = options.modelId ?? candCfg!.modelId;
+  const runCandidate = options.runCandidate ?? createOpenAiCandidateRunner(candCfg!);
+
+  const calBundle = await loadCalibrationPromptBundle({
+    promptsDir: options.promptsDir,
+    skillsDir: options.skillsDir,
   });
-  const runCandidate = createOpenAiCandidateRunner(candidateConfig);
+  const graderPi = options.runGrader
+    ? undefined
+    : readEvalPiConfig({ ...process.env, ...(options.graderModel ? { EVAL_LLM_MODEL: options.graderModel } : {}) });
+  const graderModelId = options.graderModel ?? graderPi!.modelId;
+  const runGrader = options.runGrader ?? createPiRunner(graderPi!);
 
-  const store = new EvalStore(evalDbPath);
+  const evalStore = new EvalStore(evalDbPath);
   try {
-    options.onProgress?.(
-      `=== 候选模型脱稿评测（suite=${suiteName}, candidate=${candidate}, model=${candidateConfig.modelId}, history=${historyMode}, systemPrompt=${promptSourceLabel[resolvedPrompt.source]}, 并发 ${concurrency}）===`,
-    );
-    const summary = await runSuiteEvaluation({
-      evalStore: store,
+    options.onProgress?.(`[eval evaluate 1/2] 候选模型 "${candidate}" (${modelId}) 盲测套卷 "${suiteName}"...`);
+    const runSummary = await runSuiteEvaluation({
+      evalStore,
       suiteName,
       candidate,
-      modelId: candidateConfig.modelId,
+      modelId,
       historyMode,
-      systemPrompt: resolvedPrompt.systemPrompt,
-      temperature: candidateConfig.temperature,
-      maxTokens: candidateConfig.maxTokens,
+      systemPrompt: resolvedSys.systemPrompt,
+      temperature: options.temperature,
+      maxTokens: options.maxTokens,
       runCandidate,
       resumeRunId: options.resumeRunId,
       limit: options.limit,
-      concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
+      concurrency: options.concurrency,
+      callMaxAttempts: options.callMaxAttempts,
+      callRetryDelayMs: options.callRetryDelayMs,
       onProgress: options.onProgress,
     });
-    return { evalDb: evalDbPath, ...summary };
-  } finally {
-    store.close();
-  }
-}
 
-export async function gradeEvalRunWorkflow(options: {
-  evalDbPath?: string;
-  runSpec?: string;
-  graderModel?: string;
-  allowSameModel?: boolean;
-  regrade?: boolean;
-  concurrency?: number;
-  callMaxAttempts?: number;
-  callRetryDelayMs?: number;
-  onProgress?: (message: string) => void;
-}): Promise<Record<string, unknown>> {
-  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
-  requireEvalDbExists(evalDbPath);
-  const concurrency = validateConcurrency(options.concurrency ?? 4);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-
-  const bundle = await loadCalibrationPromptBundle();
-  const baseConfig = readEvalPiConfig();
-  const graderModelId = options.graderModel?.trim() || baseConfig.modelId;
-  const runGrader = createPiRunner({ ...baseConfig, modelId: graderModelId });
-
-  const store = new EvalStore(evalDbPath);
-  try {
-    let evalRunId: number | undefined;
-    if (options.runSpec === undefined || options.runSpec === "latest") {
-      evalRunId = store.latestEvalRunId();
-    } else {
-      const parsed = Number(options.runSpec.trim());
-      if (!Number.isSafeInteger(parsed) || parsed < 1) {
-        throw new Error(`--run 必须是正整数或 latest（实际 ${options.runSpec}）`);
-      }
-      evalRunId = parsed;
-    }
-    if (evalRunId === undefined) {
-      throw new Error("评测库中尚未有任何 eval_run，请先运行 npm run dm -- eval run");
-    }
-
-    options.onProgress?.(`=== 脱稿批卷（eval_run #${evalRunId}，裁判模型 ${graderModelId}，并发 ${concurrency}）===`);
-    const summary = await gradeEvalRun({
-      evalStore: store,
-      evalRunId,
-      graderPrompt: bundle.prompts.evalGrader,
+    options.onProgress?.(`[eval evaluate 2/2] 批卷 eval_run #${runSummary.evalRunId}（裁判=${graderModelId}）...`);
+    const gradeSummary = await gradeEvalRun({
+      evalStore,
+      evalRunId: runSummary.evalRunId,
+      graderPrompt: calBundle.prompts.evalGrader,
       runGrader,
       graderModelId,
-      allowSameModel: Boolean(options.allowSameModel),
-      regrade: Boolean(options.regrade),
-      concurrency,
-      callMaxAttempts,
-      callRetryDelayMs,
+      allowSameModel: options.allowSameModel,
+      regrade: options.regrade,
+      concurrency: options.concurrency,
+      callMaxAttempts: options.callMaxAttempts,
+      callRetryDelayMs: options.callRetryDelayMs,
       onProgress: options.onProgress,
     });
-    return { evalDb: evalDbPath, ...summary };
+
+    let reportOutPath: string | undefined;
+    let jsonOutPath: string | undefined;
+    if (options.outPath || options.jsonOutPath) {
+      const report = buildEvalReport({ evalStore, runIds: [runSummary.evalRunId] });
+      if (options.outPath) {
+        reportOutPath = await writeOutputFile(options.outPath, renderEvalReportMarkdown(report) + "\n");
+      }
+      if (options.jsonOutPath) {
+        jsonOutPath = await writeOutputFile(options.jsonOutPath, JSON.stringify(report, null, 2) + "\n");
+      }
+    }
+
+    return {
+      action: "evaluate",
+      evalDb: evalDbPath,
+      run: runSummary,
+      grade: gradeSummary,
+      ...(reportOutPath ? { reportOutPath } : {}),
+      ...(jsonOutPath ? { jsonOutPath } : {}),
+    };
   } finally {
-    store.close();
+    evalStore.close();
   }
-}
-
-/**
- * One-shot candidate evaluation workflow: runs blind inference (`run`) and immediately grades (`grade`),
- * optionally writing a Markdown report (`--out`).
- */
-export async function evaluateEvalCandidateWorkflow(options: {
-  evalDbPath?: string;
-  suiteName: string;
-  candidate: string;
-  model?: string;
-  baseUrl?: string;
-  apiKey?: string;
-  historyMode?: EvalHistoryMode;
-  systemPrompt?: string;
-  systemPromptFile?: string;
-  noSystemPrompt?: boolean;
-  temperature?: number;
-  maxTokens?: number;
-  timeoutMs?: number;
-  resumeRunId?: number;
-  limit?: number;
-  concurrency?: number;
-  gradeConcurrency?: number;
-  graderModel?: string;
-  allowSameModel?: boolean;
-  regrade?: boolean;
-  callMaxAttempts?: number;
-  callRetryDelayMs?: number;
-  outPath?: string;
-  onProgress?: (message: string) => void;
-}): Promise<Record<string, unknown>> {
-  const runSummary = await runEvalCandidateWorkflow(options);
-  const gradeSummary = await gradeEvalRunWorkflow({
-    evalDbPath: options.evalDbPath,
-    runSpec: String(runSummary.evalRunId),
-    graderModel: options.graderModel,
-    allowSameModel: options.allowSameModel,
-    regrade: options.regrade,
-    concurrency: options.gradeConcurrency ?? options.concurrency,
-    callMaxAttempts: options.callMaxAttempts,
-    callRetryDelayMs: options.callRetryDelayMs,
-    onProgress: options.onProgress,
-  });
-
-  let reportInfo: Record<string, unknown> | undefined;
-  if (options.outPath !== undefined) {
-    const built = await buildEvalReportWorkflow({
-      evalDbPath: options.evalDbPath,
-      runIds: [runSummary.evalRunId],
-      outPath: options.outPath,
-    });
-    reportInfo = built.summary;
-  }
-
-  return {
-    run: runSummary,
-    grade: gradeSummary,
-    ...(reportInfo ? { report: reportInfo } : {}),
-  };
 }
 
 export async function buildEvalReportWorkflow(options: {
@@ -667,51 +453,46 @@ export async function buildEvalReportWorkflow(options: {
   topFailures?: number;
   outPath?: string;
   jsonOutPath?: string;
-}): Promise<{ markdown: string; summary: Record<string, unknown> }> {
+}): Promise<{ report: EvalComparisonReport; markdown: string; summary: Record<string, unknown> }> {
   const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
   requireEvalDbExists(evalDbPath);
-  const topFailures = options.topFailures ?? 6;
-
-  const store = new EvalStore(evalDbPath, { readOnly: true });
+  const evalStore = new EvalStore(evalDbPath, { readOnly: true });
   try {
     const report = buildEvalReport({
-      evalStore: store,
+      evalStore,
       suites: options.suites,
       candidates: options.candidates,
       runIds: options.runIds,
-      historyMode: options.historyMode,
       baselineCandidate: options.baselineCandidate,
+      historyMode: options.historyMode,
     });
-    const markdown = renderEvalReportMarkdown(report, topFailures);
-
-    const outPath = options.outPath
-      ? await writeOutputFile(nonEmpty(options.outPath, "--out"), markdown)
-      : undefined;
+    const markdown = renderEvalReportMarkdown(report, options.topFailures ?? 6);
+    const outPath = options.outPath ? await writeOutputFile(options.outPath, markdown + "\n") : undefined;
     const jsonOutPath = options.jsonOutPath
-      ? await writeOutputFile(nonEmpty(options.jsonOutPath, "--json-out"), JSON.stringify(report, null, 2) + "\n")
+      ? await writeOutputFile(options.jsonOutPath, JSON.stringify(report, null, 2) + "\n")
       : undefined;
 
-    const compactEntries = report.entries.map(({ items: _items, ...rest }) => rest);
-    const summary: Record<string, unknown> = {
-      evalDb: evalDbPath,
-      suites: report.suites,
-      candidates: report.candidates,
-      ...(report.baselineCandidate ? { baselineCandidate: report.baselineCandidate } : {}),
-      entries: compactEntries,
-      comparisons: report.comparisons.map(({ topImproved: _ti, topRegressed: _tr, ...c }) => c),
-      ...(outPath ? { outPath } : {}),
-      ...(jsonOutPath ? { jsonOutPath } : {}),
+    return {
+      report,
+      markdown,
+      summary: {
+        evalDb: evalDbPath,
+        suites: report.suites,
+        candidates: report.candidates,
+        entryCount: report.entries.length,
+        comparisonCount: report.comparisons.length,
+        ...(outPath ? { outPath } : {}),
+        ...(jsonOutPath ? { jsonOutPath } : {}),
+      },
     };
-    return { markdown, summary };
   } finally {
-    store.close();
+    evalStore.close();
   }
 }
 
 export async function inspectEvalProbesWorkflow(options: {
   evalDbPath?: string;
   runSpec?: string;
-  profile?: EvalProfile;
   status?: string;
   probeType?: ProbeType;
   sampleSize?: number;
@@ -720,38 +501,82 @@ export async function inspectEvalProbesWorkflow(options: {
 }): Promise<{ markdown: string; summary: Record<string, unknown> }> {
   const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
   requireEvalDbExists(evalDbPath);
-  const probeTypesFilter = options.profile ? probeTypesForProfile(options.profile) : undefined;
-
-  const store = new EvalStore(evalDbPath, { readOnly: true });
+  const evalStore = new EvalStore(evalDbPath, { readOnly: true });
   try {
-    const runId = resolveProbeRunFilter(store, options.runSpec, true);
-    const statusFilter = options.status && options.status !== "all"
-      ? (options.status as ProbeStatus)
-      : undefined;
-    const matched = store.listProbes({
+    const runId = resolveProbeRunFilter(evalStore, options.runSpec);
+    const validStatuses: ProbeStatus[] = ["draft", "accepted", "rejected", "dropped"];
+    const status =
+      options.status && options.status !== "all"
+        ? (validStatuses.includes(options.status as ProbeStatus)
+            ? (options.status as ProbeStatus)
+            : (() => {
+                throw new Error(`未知 --status "${options.status}"（可选：draft/accepted/rejected/dropped/all）`);
+              })())
+        : undefined;
+
+    const matched = evalStore.listProbes({
       runId,
-      status: statusFilter,
+      status,
       probeType: options.probeType,
-      probeTypes: probeTypesFilter,
     });
-    const seed = options.seed ?? 42;
-    const selected = options.sampleSize !== undefined
-      ? stratifiedSampleProbes(matched, options.sampleSize, seed)
-      : matched;
-    const markdown = renderInspectMarkdown(store, runId, selected, matched.length);
-    const outPath = options.outPath
-      ? await writeOutputFile(nonEmpty(options.outPath, "--out"), markdown)
-      : undefined;
+    const picked =
+      options.sampleSize !== undefined
+        ? stratifiedSampleProbes(matched, options.sampleSize, options.seed ?? 42)
+        : matched;
+    const markdown = renderInspectMarkdown(evalStore, runId, picked, matched.length);
+    const outPath = options.outPath ? await writeOutputFile(options.outPath, markdown + "\n") : undefined;
+
     return {
       markdown,
       summary: {
-        ...(outPath ? { out: outPath } : {}),
+        evalDb: evalDbPath,
         runId: runId ?? "all",
-        totalMatched: matched.length,
-        shown: selected.length,
+        matched: matched.length,
+        displayed: picked.length,
+        ...(outPath ? { outPath } : {}),
       },
     };
   } finally {
-    store.close();
+    evalStore.close();
+  }
+}
+
+export function listEvalSuitesWorkflow(options: { evalDbPath?: string } = {}): EvalStoreSummary & {
+  evalDb: string;
+  recentEvalRuns: Array<{
+    id: number;
+    suiteName: string;
+    candidate: string;
+    model: string;
+    historyMode: EvalHistoryMode;
+    status: string;
+    startedAt: string;
+  }>;
+} {
+  const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
+  requireEvalDbExists(evalDbPath);
+  const evalStore = new EvalStore(evalDbPath, { readOnly: true });
+  try {
+    const summary = evalStore.getSummary();
+    const recentEvalRuns = evalStore
+      .listEvalRuns()
+      .slice(-20)
+      .reverse()
+      .map((r) => ({
+        id: r.id,
+        suiteName: r.suiteName,
+        candidate: r.candidate,
+        model: r.model,
+        historyMode: r.historyMode,
+        status: r.status,
+        startedAt: r.startedAt,
+      }));
+    return {
+      evalDb: evalDbPath,
+      ...summary,
+      recentEvalRuns,
+    };
+  } finally {
+    evalStore.close();
   }
 }

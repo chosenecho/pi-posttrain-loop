@@ -1,6 +1,5 @@
 import type {
   DatasetSplit,
-  EvalRubric,
   FollowupDecision,
   Material,
   Review,
@@ -118,31 +117,6 @@ export function parseSynthProfile(raw: string | undefined): SynthProfile {
   const value = (raw ?? "standard").trim().toLowerCase();
   if (value === "standard" || value === "short" || value === "trap") return value;
   throw new Error(`--profile 仅支持 standard、short 或 trap，当前值：${raw}`);
-}
-
-function parseStringList(value: unknown, label: string, min: number, max: number): string[] {
-  if (!Array.isArray(value) || value.length < min || value.length > max) {
-    throw new Error(`${label} 必须是长度为 ${min}–${max} 的字符串数组`);
-  }
-  const items = value.map((item, idx) => nonEmpty(item, `${label}[${idx}]`));
-  if (new Set(items).size !== items.length) {
-    throw new Error(`${label} 包含重复项`);
-  }
-  return items;
-}
-
-export function parseEvalRubric(text: string): EvalRubric {
-  const value = asObject(parseJson(text), "评分要点结果");
-  const stance = nonEmpty(value.stance, "rubric.stance");
-  const keyPoints = parseStringList(value.keyPoints, "rubric.keyPoints", 1, 6);
-  const forbidden = parseStringList(value.forbidden ?? [], "rubric.forbidden", 0, 5);
-  const mustNotHallucinate = parseStringList(
-    value.mustNotHallucinate ?? [],
-    "rubric.mustNotHallucinate",
-    0,
-    5,
-  );
-  return { stance, keyPoints, forbidden, mustNotHallucinate };
 }
 
 export function errorMessage(error: unknown): string {

@@ -1,7 +1,6 @@
 import type {
   DatasetSplit,
   DedupPolicy,
-  EvalRubric,
   SplitAssignMethod,
   TrainingMessage,
   TrainingSampleLine,
@@ -70,7 +69,6 @@ export interface MergedExportOptions extends ExportOptions {
   runIds?: number[];
   allFormal?: boolean;
   split?: DatasetSplit;
-  versionName?: string;
   excludeRunIds?: number[];
   minTurns?: number;
   maxTurns?: number;
@@ -86,28 +84,6 @@ export interface VideoSplitRecord {
   method: SplitAssignMethod;
   salt: string;
   assigned_at: string;
-}
-
-export interface TestSetVersionRecord {
-  id: number;
-  name: string;
-  split: "test" | "dpo";
-  result_ids_json: string;
-  sample_count: number;
-  video_count: number;
-  manifest_json: string;
-  sha256: string;
-  created_at: string;
-}
-
-export interface EvalRubricRecord {
-  id: number;
-  result_id: number;
-  turn_no: number;
-  rubric: EvalRubric;
-  rubric_json: string;
-  call_id: number | null;
-  created_at: string;
 }
 
 export interface MergedExportRecord {
@@ -605,53 +581,18 @@ BEFORE DELETE ON video_splits
 BEGIN
   SELECT RAISE(ABORT, 'cannot delete assigned video_split');
 END;
+`;
 
--- Frozen test / dpo dataset versions
-CREATE TABLE IF NOT EXISTS test_set_versions (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE CHECK(length(trim(name)) > 0),
-  split TEXT NOT NULL CHECK(split IN ('test', 'dpo')),
-  result_ids_json TEXT NOT NULL CHECK(json_valid(result_ids_json) AND json_type(result_ids_json) = 'array'),
-  sample_count INTEGER NOT NULL CHECK(sample_count >= 1),
-  video_count INTEGER NOT NULL CHECK(video_count >= 1),
-  manifest_json TEXT NOT NULL CHECK(json_valid(manifest_json) AND json_type(manifest_json) = 'object'),
-  sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
-  created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0)
-);
-
-CREATE TRIGGER IF NOT EXISTS trg_test_set_versions_immutable_update
-BEFORE UPDATE ON test_set_versions
-BEGIN
-  SELECT RAISE(ABORT, 'cannot modify frozen test_set_version');
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_test_set_versions_immutable_delete
-BEFORE DELETE ON test_set_versions
-BEGIN
-  SELECT RAISE(ABORT, 'cannot delete frozen test_set_version');
-END;
-
--- Evaluation rubric calls and extracted per-turn rubrics (P1)
-CREATE TABLE IF NOT EXISTS eval_model_calls (
-  id INTEGER PRIMARY KEY,
-  result_id INTEGER REFERENCES results(id),
-  turn_no INTEGER CHECK(turn_no IS NULL OR turn_no >= 1),
-  role TEXT NOT NULL CHECK(role IN ('rubric')),
-  status TEXT NOT NULL CHECK(status IN ('running', 'completed', 'error', 'interrupted')),
-  input_json TEXT NOT NULL CHECK(json_valid(input_json) AND json_type(input_json) = 'object'),
-  output_text TEXT,
-  error TEXT,
-  started_at TEXT NOT NULL CHECK(length(trim(started_at)) > 0),
-  finished_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS eval_rubrics (
-  id INTEGER PRIMARY KEY,
-  result_id INTEGER NOT NULL REFERENCES results(id),
-  turn_no INTEGER NOT NULL CHECK(turn_no >= 1),
-  rubric_json TEXT NOT NULL CHECK(json_valid(rubric_json) AND json_type(rubric_json) = 'object'),
-  call_id INTEGER REFERENCES eval_model_calls(id),
-  created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
-  UNIQUE(result_id, turn_no)
-);
+/**
+ * Legacy test-v1 blind-test tables (frozen test versions + rubric extraction) were removed;
+ * evaluation sets are produced exclusively by the isolated eval pipeline (eval.sqlite).
+ * Dropping them is idempotent and runs on every writable main-store open. Their triggers
+ * and indexes are dropped together with the tables.
+ */
+export const LEGACY_DROP_SQL = `
+DROP TRIGGER IF EXISTS trg_test_set_versions_immutable_update;
+DROP TRIGGER IF EXISTS trg_test_set_versions_immutable_delete;
+DROP TABLE IF EXISTS eval_rubrics;
+DROP TABLE IF EXISTS eval_model_calls;
+DROP TABLE IF EXISTS test_set_versions;
 `;

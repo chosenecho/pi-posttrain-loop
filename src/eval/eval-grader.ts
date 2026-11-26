@@ -9,80 +9,20 @@ import {
 } from "../shared/retry.js";
 import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { RoleRunner } from "../shared/types.js";
-import {
-  EvalStore,
-  EXPECTED_BEHAVIORS,
-  type ExpectedBehavior,
-  type SuiteItemRecord,
-} from "./store/index.js";
 import { extractSuiteDialogueTurns } from "./eval-runner.js";
 import { scoreGradedTurn } from "./grader-core.js";
-import { parseGradeResult, type ProbeRubricV2 } from "./probe-schema.js";
+import { parseGradeResult } from "./probe-schema.js";
+import { EvalStore, type SuiteItemRecord, type SuiteRubricEntry } from "./store/index.js";
 
-export interface NormalizedSuiteTurnRubric {
-  turnNo: number;
-  probeType: string;
-  expectedBehavior: ExpectedBehavior;
-  tactic: string | null;
-  rubric: ProbeRubricV2;
-}
-
-/**
- * Normalizes both `indist-v1` (P1 `EvalRubric` without `expectedBehavior`/`failureSignals`)
- * and `adv-v1` (Rubric v2) turn rubric entries into a single `ProbeRubricV2` contract.
- */
-export function normalizeSuiteTurnRubric(
-  item: Pick<SuiteItemRecord, "itemKey" | "probeType" | "expectedBehavior" | "rubrics">,
-  turnNo: number,
-): NormalizedSuiteTurnRubric {
-  const entries = item.rubrics as Array<Record<string, unknown>>;
-  const match = entries.find((e) => Number(e?.turnNo) === turnNo) ?? entries[turnNo - 1];
-  if (!match || typeof match !== "object") {
+function getTurnRubric(item: SuiteItemRecord, turnNo: number): SuiteRubricEntry {
+  const entry = item.rubrics.find((r) => r.turnNo === turnNo) ?? item.rubrics[turnNo - 1];
+  if (!entry || !entry.rubric) {
     throw new Error(`套卷条目 ${item.itemKey} Turn ${turnNo} 缺少评分卡`);
   }
-  const rawRubric = (match.rubric ?? match) as Record<string, unknown> | null;
-  if (!rawRubric || typeof rawRubric !== "object") {
-    throw new Error(`套卷条目 ${item.itemKey} Turn ${turnNo} 评分卡为空`);
-  }
-
-  const candidateBehavior =
-    (typeof match.expectedBehavior === "string" ? match.expectedBehavior : undefined) ??
-    (typeof rawRubric.expectedBehavior === "string" ? rawRubric.expectedBehavior : undefined) ??
-    (turnNo === 1 && typeof item.expectedBehavior === "string" ? item.expectedBehavior : undefined) ??
-    "answer";
-
-  const expectedBehavior: ExpectedBehavior = EXPECTED_BEHAVIORS.includes(candidateBehavior as ExpectedBehavior)
-    ? (candidateBehavior as ExpectedBehavior)
-    : "answer";
-
-  const toStringArray = (val: unknown): string[] =>
-    Array.isArray(val) ? val.filter((s): s is string => typeof s === "string" && s.trim().length > 0) : [];
-
-  const stance = typeof rawRubric.stance === "string" && rawRubric.stance.trim().length > 0
-    ? rawRubric.stance.trim()
-    : "保持作者核心框架与判断立场";
-
-  const tactic = typeof match.tactic === "string" && match.tactic.trim().length > 0
-    ? match.tactic.trim()
-    : null;
-
-  return {
-    turnNo,
-    probeType: item.probeType ?? "in_distribution",
-    expectedBehavior,
-    tactic,
-    rubric: {
-      expectedBehavior,
-      stance,
-      keyPoints: toStringArray(rawRubric.keyPoints),
-      forbidden: toStringArray(rawRubric.forbidden),
-      mustNotHallucinate: toStringArray(rawRubric.mustNotHallucinate),
-      failureSignals: toStringArray(rawRubric.failureSignals),
-    },
-  };
+  return entry;
 }
 
-function extractPriorHistoryFromPredictionInput(
+function extractPriorHistory(
   input: Record<string, unknown>,
 ): Array<{ role: "user" | "assistant"; content: string }> {
   const rawMessages = input.messages;
@@ -94,7 +34,6 @@ function extractPriorHistoryFromPredictionInput(
       ((m as { role?: unknown }).role === "user" || (m as { role?: unknown }).role === "assistant") &&
       typeof (m as { content?: unknown }).content === "string",
   );
-  // Drop the final user message (the current turn's question)
   return nonSystem.length > 1 ? nonSystem.slice(0, -1) : [];
 }
 
@@ -104,7 +43,6 @@ export interface GradeEvalRunOptions {
   graderPrompt: string;
   runGrader: RoleRunner;
   graderModelId: string;
-  /** Spec section 8 forbids grader === candidate model; must explicitly opt in for single-model smoke tests. */
   allowSameModel?: boolean;
   regrade?: boolean;
   concurrency?: number;
@@ -131,8 +69,8 @@ export interface GradeEvalRunSummary {
 }
 
 /**
- * Grades all valid candidate predictions of an `eval_run` against the frozen suite's rubrics
- * (supporting both `indist-v1` P1 rubrics and `adv-v1` rubric v2) using deterministic `scoreGradedTurn`.
+ * Grades all valid candidate predictions of an `eval_run` against frozen suite rubrics
+ * using holistic scoring with the behavior/hallucination safety cap (40).
  */
 export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeEvalRunSummary> {
   const { evalStore, evalRunId, runGrader } = options;
@@ -147,16 +85,15 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
     throw new Error(`未找到评测运行：eval_run #${evalRunId}`);
   }
 
-  const sameModelNotice =
-    graderModelId.trim().toLowerCase() === evalRun.model.trim().toLowerCase();
+  const sameModelNotice = graderModelId.trim().toLowerCase() === evalRun.model.trim().toLowerCase();
   if (sameModelNotice && !options.allowSameModel) {
     throw new Error(
       `批卷守卫拦截：批卷模型（${graderModelId}）与被测候选模型（${evalRun.model}）相同。` +
-      `请通过 --grader-model / EVAL_LLM_MODEL 指定不同家族的裁判模型；如仅作单模型联调，请显式传入 --allow-same-model`,
+        `请通过 --grader-model / EVAL_LLM_MODEL 指定不同裁判模型；如仅作联调，请显式传入 --allow-same-model`,
     );
   }
 
-  const suiteItems = evalStore.listSuiteItemsBySuiteId(evalRun.suiteId);
+  const suiteItems = evalStore.listSuiteItems(evalRun.suiteId);
   const itemById = new Map<number, SuiteItemRecord>();
   const turnsByItemId = new Map<number, ReturnType<typeof extractSuiteDialogueTurns>>();
   for (const item of suiteItems) {
@@ -166,7 +103,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
 
   const predictions = evalStore.listEvalPredictions(evalRunId);
   if (predictions.length === 0) {
-    throw new Error(`eval_run #${evalRunId} 尚无候选模型预测记录，请先运行 eval run`);
+    throw new Error(`eval_run #${evalRunId} 尚无候选模型预测记录`);
   }
 
   const existingScoredPredIds = new Set<number>();
@@ -209,17 +146,17 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
       return;
     }
 
-    const normalized = normalizeSuiteTurnRubric(item, pred.turnNo);
-    const history = extractPriorHistoryFromPredictionInput(pred.input);
+    const rubricEntry = getTurnRubric(item, pred.turnNo);
+    const history = extractPriorHistory(pred.input);
     const tag = `[${idx + 1}/${toGrade.length} ${item.itemKey}:t${pred.turnNo}]`;
 
     const gradeInput: Record<string, unknown> = {
       question: turn.user,
       ...(history.length > 0 ? { history } : {}),
-      probeType: normalized.probeType,
-      expectedBehavior: normalized.expectedBehavior,
-      ...(normalized.tactic ? { tactic: normalized.tactic } : {}),
-      rubric: normalized.rubric,
+      probeType: item.probeType,
+      expectedBehavior: rubricEntry.expectedBehavior,
+      ...(rubricEntry.tactic ? { tactic: rubricEntry.tactic } : {}),
+      rubric: rubricEntry.rubric,
       referenceAnswer: turn.referenceAnswer,
       candidateAnswer: pred.outputText!,
     };
@@ -228,7 +165,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
       const graded = await runWithRetry({
         maxAttempts: callMaxAttempts,
         delayMs: callRetryDelayMs,
-        onRetry: (attempt: number, max: number, error: unknown) => {
+        onRetry: (attempt, max, error) => {
           options.onProgress?.(`${tag} 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
         },
         run: async () => {
@@ -243,28 +180,29 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
               turn_no: pred.turnNo,
             },
           });
+          let rawOutput: string | undefined;
           try {
-            const raw = await runGrader({
+            rawOutput = await runGrader({
               role: "eval_grader",
               systemPrompt: graderPrompt,
               input: gradeInput,
             });
             let judgement: ReturnType<typeof parseGradeResult>;
             try {
-              judgement = parseGradeResult(raw, normalized.rubric);
+              judgement = parseGradeResult(rawOutput, rubricEntry.rubric);
             } catch (error) {
               throw toPublicError(error, "model_output_invalid");
             }
-            evalStore.finishCall(callId, { output: raw });
+            evalStore.finishCall(callId, { output: rawOutput });
             return { callId, judgement };
           } catch (error) {
-            evalStore.finishCall(callId, { error: publicErrorMessage(error) });
+            evalStore.finishCall(callId, { output: rawOutput, error: publicErrorMessage(error) });
             throw toPublicError(error);
           }
         },
       });
 
-      const scored = scoreGradedTurn(graded.judgement, normalized.rubric);
+      const scored = scoreGradedTurn(graded.judgement, rubricEntry.rubric);
       evalStore.saveEvalScore({
         predictionId: pred.id,
         graderModel: graderModelId,
@@ -277,9 +215,9 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
         style: scored.style,
         score: scored.finalScore,
         detail: {
-          probeType: normalized.probeType,
-          expectedBehavior: normalized.expectedBehavior,
-          tactic: normalized.tactic,
+          probeType: item.probeType,
+          expectedBehavior: rubricEntry.expectedBehavior,
+          tactic: rubricEntry.tactic,
           sameModelNotice,
           judgement: graded.judgement,
           scored,
@@ -295,15 +233,14 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
   });
 
   const allScores = evalStore.listEvalScores(evalRunId);
-  const meanTurnScore = allScores.length > 0
-    ? Number((allScores.reduce((s, x) => s + x.score, 0) / allScores.length).toFixed(2))
-    : 0;
-  const turnBehaviorPassRate = allScores.length > 0
-    ? Number((allScores.filter((x) => x.behaviorOk).length / allScores.length).toFixed(4))
-    : 0;
-  const graderCallsRow = evalStore.db
-    .prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ? AND role = 'eval_grader'")
-    .get(runRef) as { c: number };
+  const meanTurnScore =
+    allScores.length > 0
+      ? Number((allScores.reduce((s, x) => s + x.score, 0) / allScores.length).toFixed(2))
+      : 0;
+  const turnBehaviorPassRate =
+    allScores.length > 0
+      ? Number((allScores.filter((x) => x.behaviorOk).length / allScores.length).toFixed(4))
+      : 0;
 
   return {
     evalRunId,
@@ -319,6 +256,6 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
     errors,
     meanTurnScore,
     turnBehaviorPassRate,
-    totalGraderCalls: Number(graderCallsRow.c),
+    totalGraderCalls: evalStore.countAgentCalls(runRef, "eval_grader"),
   };
 }

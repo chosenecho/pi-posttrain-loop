@@ -54,8 +54,13 @@ test("unified CLI help and presets listing work offline without model configurat
   assert.match(presetsRes.stdout, /train-standard/);
   assert.match(presetsRes.stdout, /train-val/);
   assert.match(presetsRes.stdout, /pilot/);
-  assert.match(presetsRes.stdout, /adv-full/);
-  assert.match(presetsRes.stdout, /blind-gold/);
+  assert.doesNotMatch(presetsRes.stdout, /adv-full/);
+
+  const evalHelp = await dm(["eval", "--help"], cleanEnv);
+  assert.equal(evalHelp.code, 0, evalHelp.stderr);
+  assert.match(evalHelp.stdout, /\bmake\b/);
+  assert.match(evalHelp.stdout, /\bevaluate\b/);
+  assert.match(evalHelp.stdout, /\bsuites\b/);
 
   const synthRunHelp = await dm(["synth", "run", "--help"], cleanEnv);
   assert.equal(synthRunHelp.code, 0, synthRunHelp.stderr);

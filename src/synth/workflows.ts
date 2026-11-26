@@ -39,6 +39,17 @@ import { DEFAULT_QUESTION_SKILL, readQuestionSkill, resolveSynthBundle, type Syn
 import { summarizeSplitCounts, syncCorpusSplits, type SplitBreakdown } from "./splits.js";
 import { DataMakerStore, formatSamplesJsonl, type DedupPolicy } from "./store/index.js";
 
+/** test 分区仅由独立 eval 流水线（eval.sqlite）生产，synth 侧一律拒绝。 */
+export const SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE =
+  "test 分区仅供 eval 流水线使用，请使用 npm run dm -- eval make";
+
+export function assertSynthSplit(split: DatasetSplit): DatasetSplit {
+  if (split === "test") {
+    throw new Error(SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE);
+  }
+  return split;
+}
+
 export interface SynthStatusReport {
   db: string;
   inputDir: string;
@@ -103,9 +114,7 @@ export interface SynthBatchWorkflowOptions {
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
   concurrency?: number;
-  extractRubric?: boolean;
   includeUnjudged?: boolean;
-  freezeVersion?: string;
   noSkill?: boolean;
   promptsDir?: string;
   skillOverrides?: SynthSkillOverrides;
@@ -119,13 +128,10 @@ export interface SynthBatchWorkflowOptions {
 
 export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions): Promise<Record<string, unknown>> {
   const profile = options.profile ?? "standard";
-  const targetSplit = validateSplit(options.split ?? "train", "--split");
+  const targetSplit = assertSynthSplit(validateSplit(options.split ?? "train", "--split"));
   const sortMode = options.sort ?? "id";
   if (sortMode === "core-first" && options.shuffle) {
     throw new Error("--sort core-first 不能与 --shuffle 同时指定");
-  }
-  if (options.freezeVersion !== undefined && targetSplit === "train") {
-    throw new Error("--freeze-version 仅适用于 --split test 或 --split dpo");
   }
 
   const inputDir = resolve(options.inputDir ?? DEFAULT_CORPUS_DIR);
@@ -138,13 +144,11 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
   const concurrency = validateConcurrency(options.concurrency ?? 10);
-  const extractRubric = Boolean(options.extractRubric);
 
   const bundle = await resolveSynthBundle({
     profile,
     noSkill: options.noSkill,
     maxTurns,
-    extractRubric,
     includeQuestionGenerator: true,
     promptsDir: options.promptsDir,
     overrides: options.skillOverrides,
@@ -223,7 +227,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
       };
     }
 
-    log?.(`=== 阶段 2/2：问答质检（分区 ${targetSplit}，profile=${profile}，${targetQuestionIds.length} 题，最多 ${maxTurns} 轮，每轮最多 ${maxAttempts} 次，并发 ${concurrency}${extractRubric ? "，含评分要点抽取" : ""}）===`);
+    log?.(`=== 阶段 2/2：问答质检（分区 ${targetSplit}，profile=${profile}，${targetQuestionIds.length} 题，最多 ${maxTurns} 轮，每轮最多 ${maxAttempts} 次，并发 ${concurrency}）===`);
     const dialogueSummary: RunDialogueBatchSummary = await runDialogueBatch({
       store,
       runRole,
@@ -242,7 +246,6 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
         model: sanitizedModel,
         promptDirectory: bundle.promptDir,
         questionRunId: questionSummary?.runId ?? null,
-        ...(extractRubric ? { extractRubric: true } : {}),
         inputSchemaVersion: maxTurns > 1 ? "v2-multiturn-json" : "v1-minimal-json",
       },
       skills: bundle.dialogueSkills,
@@ -257,22 +260,6 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
           },
       onProgress: log,
     });
-
-    let frozenVersion: { id: number; name: string; sampleCount: number; videoCount: number; sha256: string } | undefined;
-    if (options.freezeVersion !== undefined && (targetSplit === "test" || targetSplit === "dpo")) {
-      const ver = store.freezeTestSetVersion({
-        name: nonEmpty(options.freezeVersion, "--freeze-version"),
-        split: targetSplit,
-        systemPrompt: options.exportSystemPrompt,
-      });
-      frozenVersion = {
-        id: ver.id,
-        name: ver.name,
-        sampleCount: ver.sample_count,
-        videoCount: ver.video_count,
-        sha256: ver.sha256,
-      };
-    }
 
     let exportedPath: string | undefined;
     if (options.exportPath !== undefined) {
@@ -311,10 +298,8 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
       outcomes: dialogueSummary.outcomes,
       results: dialogueSummary.results,
       judgeErrors: dialogueSummary.errors,
-      ...(dialogueSummary.rubricsExtracted !== undefined ? { rubricsExtracted: dialogueSummary.rubricsExtracted, rubricErrors: dialogueSummary.rubricErrors ?? 0 } : {}),
       trainingEnabled,
       ...(targetSplit !== "train" ? { evalEnabled } : {}),
-      ...(frozenVersion ? { frozenVersion } : {}),
       integrityOk,
       errors: totalErrors,
       ...(exportedPath ? { exportedPath } : {}),
@@ -355,7 +340,7 @@ export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowO
     throw new Error("--sort core-first 不能与 --shuffle 同时指定");
   }
   const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
-  const targetSplit = validateSplit(options.split ?? "train", "--split");
+  const targetSplit = assertSynthSplit(validateSplit(options.split ?? "train", "--split"));
   const concurrency = validateConcurrency(options.concurrency ?? 10);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
@@ -464,7 +449,6 @@ export interface SynthJudgeWorkflowOptions {
   concurrency?: number;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
-  extractRubric?: boolean;
   videoId?: string;
   questionIds?: number[];
   onlyUnjudged?: boolean;
@@ -481,20 +465,18 @@ export interface SynthJudgeWorkflowOptions {
 export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions): Promise<Record<string, unknown>> {
   const profile = options.profile ?? "standard";
   const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
-  const targetSplit = options.split !== undefined ? validateSplit(options.split, "--split") : undefined;
+  const targetSplit = options.split !== undefined ? assertSynthSplit(validateSplit(options.split, "--split")) : undefined;
   const maxAttempts = validateMaxAttempts(options.maxAttempts ?? 3);
   const defaultMaxTurns = profile === "standard" ? 3 : 2;
   const maxTurns = validateMaxTurns(options.maxTurns ?? defaultMaxTurns);
   const concurrency = validateConcurrency(options.concurrency ?? 10);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-  const extractRubric = Boolean(options.extractRubric);
 
   const bundle = await resolveSynthBundle({
     profile,
     noSkill: options.noSkill,
     maxTurns,
-    extractRubric,
     includeQuestionGenerator: false,
     promptsDir: options.promptsDir,
     overrides: options.skillOverrides,
@@ -553,7 +535,6 @@ export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions):
         profile,
         model: sanitizedModel,
         promptDirectory: bundle.promptDir,
-        ...(extractRubric ? { extractRubric: true } : {}),
         inputSchemaVersion: maxTurns > 1 ? "v2-multiturn-json" : "v1-minimal-json",
       },
       skills: bundle.dialogueSkills,
@@ -590,9 +571,7 @@ export interface SynthExportWorkflowOptions {
   evalDbPath?: string;
   runIds?: number[];
   allFormal?: boolean;
-  versionName?: string;
   split?: DatasetSplit;
-  freezeVersion?: string;
   excludeRunIds?: number[];
   minTurns?: number;
   maxTurns?: number;
@@ -613,20 +592,12 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
   }
 
   const hasRunIds = options.runIds !== undefined && options.runIds.length > 0;
-  const hasVersion = options.versionName !== undefined;
-  const allFormal = Boolean(options.allFormal) || (!hasRunIds && !hasVersion);
-  const modeCount = [hasRunIds, Boolean(options.allFormal), hasVersion].filter(Boolean).length;
-  if (modeCount > 1) {
-    throw new Error("请在 --run、--runs、--all-formal、--version 中最多指定一种选取模式");
+  const allFormal = Boolean(options.allFormal) || !hasRunIds;
+  if (hasRunIds && Boolean(options.allFormal)) {
+    throw new Error("请在 --run、--runs、--all-formal 中最多指定一种选取模式");
   }
 
-  const targetSplit = options.split !== undefined ? validateSplit(options.split, "--split") : undefined;
-  if (options.freezeVersion !== undefined) {
-    const freezeSplit = targetSplit ?? "test";
-    if (freezeSplit === "train") {
-      throw new Error("--freeze-version 仅适用于 --split test 或 --split dpo");
-    }
-  }
+  const targetSplit = options.split !== undefined ? assertSynthSplit(validateSplit(options.split, "--split")) : undefined;
 
   const exportTimestamp = options.timestamp ? formatLocalTimestamp() : undefined;
   const resolveExportPath = (rawPath: string): string => {
@@ -638,35 +609,12 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
   const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
   const dedup: DedupPolicy = options.dedup ?? "latest";
 
-  const store = new DataMakerStore(dbPath, { readOnly: options.freezeVersion === undefined });
+  const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
-    let frozenVersion: { id: number; name: string; split: "test" | "dpo"; sampleCount: number; videoCount: number; sha256: string } | undefined;
-    if (options.freezeVersion !== undefined) {
-      const freezeSplit = (targetSplit ?? "test") as "test" | "dpo";
-      const ver = store.freezeTestSetVersion({
-        name: nonEmpty(options.freezeVersion, "--freeze-version"),
-        split: freezeSplit,
-        runIds: options.runIds,
-        dedup,
-        minTurns: options.minTurns,
-        maxTurns: options.maxTurns,
-        systemPrompt: options.systemPrompt,
-      });
-      frozenVersion = {
-        id: ver.id,
-        name: ver.name,
-        split: ver.split,
-        sampleCount: ver.sample_count,
-        videoCount: ver.video_count,
-        sha256: ver.sha256,
-      };
-    }
-
     const merged = store.exportMergedDataset({
       runIds: options.runIds,
       allFormal,
       split: targetSplit,
-      versionName: options.versionName,
       excludeRunIds: options.excludeRunIds,
       minTurns: options.minTurns,
       maxTurns: options.maxTurns,
@@ -677,7 +625,7 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
       systemPrompt: options.systemPrompt,
     });
 
-    const isTrainingExport = !hasVersion && (targetSplit === undefined || targetSplit === "train");
+    const isTrainingExport = targetSplit === undefined || targetSplit === "train";
     if (isTrainingExport) {
       const evalDbPath = resolve(options.evalDbPath ?? join(dirname(dbPath), "eval.sqlite"));
       const evalVideoKeys = readEvalVideoKeys(evalDbPath);
@@ -710,16 +658,12 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
       exportedAt: new Date().toISOString(),
       ...(exportTimestamp ? { timestamp: exportTimestamp } : {}),
       db: dbPath,
-      mode: hasVersion
-        ? "version"
-        : allFormal
-          ? "all-formal"
-          : options.runIds && options.runIds.length > 1
-            ? "runs"
-            : "single-run",
+      mode: allFormal
+        ? "all-formal"
+        : options.runIds && options.runIds.length > 1
+          ? "runs"
+          : "single-run",
       ...(targetSplit !== undefined ? { split: targetSplit } : allFormal ? { split: "train" } : {}),
-      ...(options.versionName !== undefined ? { version: options.versionName } : {}),
-      ...(frozenVersion !== undefined ? { frozenVersion } : {}),
       dedup,
       includedRunIds: merged.includedRunIds,
       countsByRunId: merged.countsByRunId,

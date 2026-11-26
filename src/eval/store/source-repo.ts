@@ -1,7 +1,18 @@
 import type { DatabaseSync } from "node:sqlite";
-import { nowIso, sha256Hex, type ProbeType, type Row, type SourceMaterialRecord } from "./types.js";
+import { nonEmpty } from "../../shared/schema.js";
+import { extractVideoKey, nowIso, sha256Hex } from "../../shared/utils.js";
+import {
+  parseJsonArray,
+  parseJsonObject,
+  type InsertSourceMaterialInput,
+  type ProbeRunKind,
+  type ProbeRunRecord,
+  type RunLifecycleStatus,
+  type SourceMaterialRecord,
+  type StartAgentCallInput,
+} from "./types.js";
 
-function mapSource(row: Row): SourceMaterialRecord {
+function mapSourceRow(row: Record<string, unknown>): SourceMaterialRecord {
   return {
     id: Number(row.id),
     videoId: String(row.video_id),
@@ -11,144 +22,194 @@ function mapSource(row: Row): SourceMaterialRecord {
     content: String(row.content),
     contentSha256: String(row.content_sha256),
     sourcePath: row.source_path === null ? null : String(row.source_path),
+    splitSnapshot: String(row.split_snapshot),
     importedAt: String(row.imported_at),
   };
 }
 
-export class EvalSourceRepository {
+function mapProbeRunRow(row: Record<string, unknown>): ProbeRunRecord {
+  return {
+    id: Number(row.id),
+    kind: String(row.kind) as ProbeRunKind,
+    status: String(row.status) as RunLifecycleStatus,
+    config: parseJsonObject(String(row.config_json)),
+    prompts: parseJsonObject(String(row.prompts_json)),
+    skills: parseJsonArray(String(row.skills_json)),
+    startedAt: String(row.started_at),
+    endedAt: row.ended_at === null ? null : String(row.ended_at),
+    error: row.error === null ? null : String(row.error),
+  };
+}
+
+export class EvalSourceRepo {
   constructor(private readonly db: DatabaseSync) {}
 
-  insertSourceMaterial(input: {
-    videoId: string;
-    videoKey: string;
-    mainMaterialId?: number | null;
-    partCount: number;
-    content: string;
-    sourcePath?: string | null;
-    splitSnapshot: string;
-  }): { record: SourceMaterialRecord; created: boolean } {
-    if (input.splitSnapshot !== "test") {
-      throw new Error(`评测库只接受 test 分区材料：${input.videoKey} 实际为 ${input.splitSnapshot}`);
+  insertSourceMaterial(input: InsertSourceMaterialInput): { created: boolean; record: SourceMaterialRecord } {
+    const videoId = nonEmpty(input.videoId, "videoId");
+    const videoKey = input.videoKey ? nonEmpty(input.videoKey, "videoKey") : extractVideoKey(videoId);
+    const content = nonEmpty(input.content, "content");
+    const splitSnapshot = input.splitSnapshot ?? "test";
+    if (splitSnapshot !== "test") {
+      throw new Error(`评测库 source_materials 仅允许导入 split='test'，收到：${splitSnapshot}`);
     }
-    const contentSha256 = sha256Hex(input.content);
-    const existing = this.getSourceMaterialByVideoId(input.videoId);
+    const contentSha256 = sha256Hex(content);
+    const existing = this.db
+      .prepare("SELECT * FROM source_materials WHERE video_id = ? AND content_sha256 = ?")
+      .get(videoId, contentSha256) as Record<string, unknown> | undefined;
     if (existing) {
-      if (existing.contentSha256 !== contentSha256) {
-        throw new Error(`材料快照 ${input.videoId} 已存在且内容不同（sha256 ${existing.contentSha256.slice(0, 12)}），禁止覆盖`);
-      }
-      return { record: existing, created: false };
+      return { created: false, record: mapSourceRow(existing) };
     }
-    this.db.prepare(`
-      INSERT INTO source_materials (video_id, video_key, main_material_id, split_snapshot, part_count, content, content_sha256, source_path, imported_at)
-      VALUES (?, ?, ?, 'test', ?, ?, ?, ?, ?)
-    `).run(
-      input.videoId,
-      input.videoKey,
-      input.mainMaterialId ?? null,
-      input.partCount,
-      input.content,
-      contentSha256,
-      input.sourcePath ?? null,
-      nowIso(),
-    );
-    const record = this.getSourceMaterialByVideoId(input.videoId);
-    if (!record) throw new Error(`无法读取材料快照：${input.videoId}`);
-    return { record, created: true };
-  }
-
-  getSourceMaterialByVideoId(videoId: string): SourceMaterialRecord | undefined {
-    const row = this.db.prepare("SELECT * FROM source_materials WHERE video_id = ?").get(videoId) as Row | undefined;
-    return row ? mapSource(row) : undefined;
+    const result = this.db
+      .prepare(
+        `INSERT INTO source_materials
+         (video_id, video_key, main_material_id, part_count, content, content_sha256, source_path, split_snapshot, imported_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'test', ?)`,
+      )
+      .run(
+        videoId,
+        videoKey,
+        input.mainMaterialId ?? null,
+        input.partCount ?? 1,
+        content,
+        contentSha256,
+        input.sourcePath ?? null,
+        nowIso(),
+      );
+    const row = this.db
+      .prepare("SELECT * FROM source_materials WHERE id = ?")
+      .get(Number(result.lastInsertRowid)) as Record<string, unknown>;
+    return { created: true, record: mapSourceRow(row) };
   }
 
   getSourceMaterial(id: number): SourceMaterialRecord | undefined {
-    const row = this.db.prepare("SELECT * FROM source_materials WHERE id = ?").get(id) as Row | undefined;
-    return row ? mapSource(row) : undefined;
+    const row = this.db
+      .prepare("SELECT * FROM source_materials WHERE id = ?")
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? mapSourceRow(row) : undefined;
   }
 
-  listSourceMaterials(): SourceMaterialRecord[] {
-    return (this.db.prepare("SELECT * FROM source_materials ORDER BY id").all() as Row[]).map(mapSource);
-  }
-
-  /** Source materials that have never been used by any probe_build run (optionally scoped to probeTypes). */
-  listUnbuiltSourceMaterials(probeTypes?: readonly ProbeType[]): SourceMaterialRecord[] {
-    if (probeTypes && probeTypes.length > 0) {
-      const placeholders = probeTypes.map(() => "?").join(", ");
-      return (this.db.prepare(`
-        SELECT * FROM source_materials m
-        WHERE NOT EXISTS (
-          SELECT 1 FROM probe_specs s
-          WHERE s.source_material_id = m.id
-            AND s.probe_type IN (${placeholders})
-        )
-        ORDER BY id
-      `).all(...probeTypes) as Row[]).map(mapSource);
+  listSourceMaterials(filter: { videoKeys?: string[]; limit?: number } = {}): SourceMaterialRecord[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter.videoKeys && filter.videoKeys.length > 0) {
+      const normalized = [...new Set(filter.videoKeys.map((k) => extractVideoKey(k)))];
+      clauses.push(`video_key IN (${normalized.map(() => "?").join(", ")})`);
+      params.push(...normalized);
     }
-    return (this.db.prepare(`
-      SELECT * FROM source_materials m
-      WHERE NOT EXISTS (SELECT 1 FROM probe_specs s WHERE s.source_material_id = m.id)
-      ORDER BY id
-    `).all() as Row[]).map(mapSource);
+    let sql = "SELECT * FROM source_materials";
+    if (clauses.length > 0) sql += ` WHERE ${clauses.join(" AND ")}`;
+    sql += " ORDER BY id ASC";
+    if (filter.limit !== undefined) {
+      sql += " LIMIT ?";
+      params.push(filter.limit);
+    }
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(mapSourceRow);
   }
 
-  listSourceMaterialsByVideoKeys(videoKeys: string[]): SourceMaterialRecord[] {
-    if (videoKeys.length === 0) return [];
-    const placeholders = videoKeys.map(() => "?").join(", ");
-    return (this.db.prepare(`
-      SELECT * FROM source_materials
-      WHERE video_key IN (${placeholders}) OR video_id IN (${placeholders})
-      ORDER BY id
-    `).all(...videoKeys, ...videoKeys) as Row[]).map(mapSource);
-  }
-
-  /**
-   * Returns existing turn-1 questions for a videoKey across frozen suites (e.g. indist-v1)
-   * and non-rejected probes, used for semantic deduplication.
-   */
-  listExistingQuestionsForVideoKey(videoKey: string): string[] {
-    const questions: string[] = [];
-    const probeRows = this.db.prepare(`
-      SELECT p.question
-      FROM probes p
-      JOIN probe_specs s ON s.id = p.spec_id
-      JOIN source_materials m ON m.id = s.source_material_id
-      WHERE m.video_key = ? AND p.status != 'rejected'
-    `).all(videoKey) as Row[];
-    for (const row of probeRows) {
-      questions.push(String(row.question));
+  /** Lists source materials that have NOT yet had any probe created (for resumable `eval make`). */
+  listUnbuiltSourceMaterials(filter: { videoKeys?: string[]; limit?: number } = {}): SourceMaterialRecord[] {
+    const clauses: string[] = [
+      "NOT EXISTS (SELECT 1 FROM probes p WHERE p.source_material_id = s.id)",
+    ];
+    const params: Array<string | number> = [];
+    if (filter.videoKeys && filter.videoKeys.length > 0) {
+      const normalized = [...new Set(filter.videoKeys.map((k) => extractVideoKey(k)))];
+      clauses.push(`s.video_key IN (${normalized.map(() => "?").join(", ")})`);
+      params.push(...normalized);
     }
-    const suiteRows = this.db.prepare(`
-      SELECT messages_json FROM suite_items WHERE video_key = ?
-    `).all(videoKey) as Row[];
-    for (const row of suiteRows) {
-      try {
-        const messages = JSON.parse(String(row.messages_json)) as Array<{ role?: string; content?: string }>;
-        const firstUser = messages.find((m) => m.role === "user" && typeof m.content === "string");
-        if (firstUser?.content) questions.push(firstUser.content);
-      } catch {
-        // Ignore malformed messages_json
-      }
+    let sql = `SELECT s.* FROM source_materials s WHERE ${clauses.join(" AND ")} ORDER BY s.id ASC`;
+    if (filter.limit !== undefined) {
+      sql += " LIMIT ?";
+      params.push(filter.limit);
     }
-    return questions;
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(mapSourceRow);
   }
 
   listEvalVideoKeys(): Set<string> {
     const keys = new Set<string>();
-    for (const row of this.db.prepare("SELECT DISTINCT video_key FROM source_materials").all() as Row[]) {
-      keys.add(String(row.video_key));
+    for (const row of this.db.prepare("SELECT DISTINCT video_key FROM source_materials").all() as Array<{ video_key: string }>) {
+      keys.add(row.video_key);
     }
-    for (const row of this.db.prepare("SELECT DISTINCT video_key FROM suite_items").all() as Row[]) {
-      keys.add(String(row.video_key));
+    for (const row of this.db.prepare("SELECT DISTINCT video_key FROM suite_items").all() as Array<{ video_key: string }>) {
+      keys.add(row.video_key);
     }
     return keys;
   }
 
-  countSummary(): { sourceMaterials: number; unbuiltSourceMaterials: number; sourceVideoKeys: number } {
-    const sourceMaterials = Number((this.db.prepare("SELECT count(*) AS c FROM source_materials").get() as Row).c);
-    const unbuiltSourceMaterials = Number((this.db.prepare(
-      "SELECT count(*) AS c FROM source_materials m WHERE NOT EXISTS (SELECT 1 FROM probe_specs s WHERE s.source_material_id = m.id)",
-    ).get() as Row).c);
-    const sourceVideoKeys = Number((this.db.prepare("SELECT count(DISTINCT video_key) AS c FROM source_materials").get() as Row).c);
-    return { sourceMaterials, unbuiltSourceMaterials, sourceVideoKeys };
+  createRun(input: {
+    kind: ProbeRunKind;
+    config: Record<string, unknown>;
+    prompts: Record<string, unknown>;
+    skills: unknown[];
+  }): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO probe_runs (kind, status, config_json, prompts_json, skills_json, started_at)
+         VALUES (?, 'running', ?, ?, ?, ?)`,
+      )
+      .run(input.kind, JSON.stringify(input.config), JSON.stringify(input.prompts), JSON.stringify(input.skills), nowIso());
+    return Number(res.lastInsertRowid);
+  }
+
+  finishRun(runId: number, status: Exclude<RunLifecycleStatus, "running">, error?: string): void {
+    this.db
+      .prepare("UPDATE probe_runs SET status = ?, ended_at = ?, error = ? WHERE id = ?")
+      .run(status, nowIso(), error ?? null, runId);
+  }
+
+  getRun(runId: number): ProbeRunRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM probe_runs WHERE id = ?").get(runId) as Record<string, unknown> | undefined;
+    return row ? mapProbeRunRow(row) : undefined;
+  }
+
+  getLatestRun(kind: ProbeRunKind): ProbeRunRecord | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM probe_runs WHERE kind = ? ORDER BY id DESC LIMIT 1")
+      .get(kind) as Record<string, unknown> | undefined;
+    return row ? mapProbeRunRow(row) : undefined;
+  }
+
+  listActiveRuns(kinds?: readonly ProbeRunKind[]): ProbeRunRecord[] {
+    if (kinds && kinds.length > 0) {
+      const rows = this.db
+        .prepare(`SELECT * FROM probe_runs WHERE status = 'running' AND kind IN (${kinds.map(() => "?").join(", ")}) ORDER BY id ASC`)
+        .all(...kinds) as Array<Record<string, unknown>>;
+      return rows.map(mapProbeRunRow);
+    }
+    const rows = this.db
+      .prepare("SELECT * FROM probe_runs WHERE status = 'running' ORDER BY id ASC")
+      .all() as Array<Record<string, unknown>>;
+    return rows.map(mapProbeRunRow);
+  }
+
+  startCall(input: StartAgentCallInput): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO agent_calls (run_ref, role, model, input_refs_json, started_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(input.runRef, input.role, input.model, JSON.stringify(input.inputRefs), nowIso());
+    return Number(res.lastInsertRowid);
+  }
+
+  finishCall(callId: number, outcome: { output?: string; error?: string }): void {
+    this.db
+      .prepare("UPDATE agent_calls SET output_text = ?, error = ?, ended_at = ? WHERE id = ?")
+      .run(outcome.output ?? null, outcome.error ?? null, nowIso(), callId);
+  }
+
+  countAgentCalls(runRef: string, role?: string): number {
+    if (role) {
+      const row = this.db
+        .prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ? AND role = ?")
+        .get(runRef, role) as { c: number };
+      return Number(row.c);
+    }
+    const row = this.db
+      .prepare("SELECT count(*) AS c FROM agent_calls WHERE run_ref = ?")
+      .get(runRef) as { c: number };
+    return Number(row.c);
   }
 }

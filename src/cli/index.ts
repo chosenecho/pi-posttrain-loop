@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { errorMessage } from "../shared/schema.js";
-import { EVAL_BUILD_PRESETS, EVAL_IMPORT_PRESETS, EVAL_RUN_PRESETS } from "../eval/presets.js";
 import { COT_BACKFILL_PRESETS, COT_EXPORT_PRESETS } from "../reasoning/presets.js";
 import { SYNTH_EXPORT_PRESETS, SYNTH_RUN_PRESETS } from "../synth/presets.js";
 import { runCotCli } from "./cot.js";
@@ -13,7 +12,7 @@ const ROOT_HELP = `pi-posttrain-loop 统一命令行入口（npm run dm -- <命�
 命令组：
   synth      问答与多轮对话合成（status | run | questions | judge | export | demo）
   cot        脱稿思考链（CoT）逆向补写与导出（status | backfill | review | export）
-  eval       独立评测库与对抗/陷阱盲测（init | status | mirror | import | build | calibrate | freeze | run | grade | evaluate | report | compare | inspect）
+  eval       独立评测库与盲测流水线（make | evaluate | report | compare | inspect | suites）
   demo       快捷入口：等价于 synth demo（30 秒离线演示，零 API Key）
   presets    列出全部内置预设名及参数说明
 
@@ -24,8 +23,8 @@ const ROOT_HELP = `pi-posttrain-loop 统一命令行入口（npm run dm -- <命�
   npm run dm -- synth run --preset train-standard --limit 20
   npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl
   npm run dm -- cot backfill --preset pilot --review-md output/cot-pilot.md
-  npm run dm -- eval build --preset adv-full
-  npm run dm -- eval evaluate --preset blind-gold --suite adv-main-v1 --candidate sft-v2 --out output/eval/sft-v2.md
+  npm run dm -- eval make --suite eval-v1
+  npm run dm -- eval evaluate --suite eval-v1 --candidate sft-v2 --out output/eval/sft-v2.md
 
 使用 npm run dm -- <命令组> --help 查看各域详细用法。
 `;
@@ -36,9 +35,6 @@ function formatPresetsSummary(): string {
     ["synth export --preset", SYNTH_EXPORT_PRESETS],
     ["cot backfill --preset", COT_BACKFILL_PRESETS],
     ["cot export --preset", COT_EXPORT_PRESETS],
-    ["eval import --preset", EVAL_IMPORT_PRESETS],
-    ["eval build --preset", EVAL_BUILD_PRESETS],
-    ["eval run / evaluate --preset", EVAL_RUN_PRESETS],
   ];
   const lines = ["内置预设清单（任何显式 CLI 参数均可覆盖预设字段）：", ""];
   for (const [header, presets] of sections) {

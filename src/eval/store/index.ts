@@ -1,74 +1,66 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { EvalProbeRepository } from "./probe-repo.js";
-import { EVAL_SCHEMA_SQL, migrateEvalSchema } from "./schema-sql.js";
-import { EvalSourceRepository } from "./source-repo.js";
-import { EvalSuiteRepository } from "./suite-eval-repo.js";
+import { nowIso } from "../../shared/utils.js";
+import { EvalProbeRepo } from "./probe-repo.js";
+import { ensureEvalSchemaV3 } from "./schema-sql.js";
+import { EvalSourceRepo } from "./source-repo.js";
+import { EvalSuiteAndRunRepo } from "./suite-eval-repo.js";
 import {
   EVAL_SCHEMA_VERSION,
-  nowIso,
-  type CalibrationTurnRecord,
+  type CreateProbeInput,
   type DifficultyLevel,
   type EvalHistoryMode,
   type EvalPredictionRecord,
   type EvalRunRecord,
   type EvalScoreRecord,
   type EvalStoreSummary,
-  type EvalSuiteKind,
-  type ExpectedBehavior,
-  type ProbeAttemptRecord,
-  type ProbeDialogueTurn,
+  type InsertSourceMaterialInput,
+  type ProbeCalibrationRecord,
   type ProbeRecord,
-  type ProbeReviewRecord,
+  type ProbeReviewEntry,
   type ProbeRunKind,
   type ProbeRunRecord,
-  type ProbeRunStatus,
   type ProbeStatus,
+  type ProbeTurnRecord,
   type ProbeType,
-  type Row,
+  type RunLifecycleStatus,
+  type SaveProbeTurnInput,
   type SourceMaterialRecord,
+  type StartAgentCallInput,
   type SuiteItemRecord,
+  type SuiteRubricEntry,
   type SuiteVersionRecord,
 } from "./types.js";
 
 export * from "./types.js";
 
-/**
- * Modular SQLite facade for `data/eval.sqlite`, backed by dedicated source, probe, and suite/eval repositories.
- * Production business modules use named methods exclusively; `db` is exposed only for low-level test inspection.
- */
 export class EvalStore {
-  /** @internal Low-level connection handle (do not write raw SQL from production business modules). */
   readonly db: DatabaseSync;
-  private txDepth = 0;
-  readonly sources: EvalSourceRepository;
-  readonly probes: EvalProbeRepository;
-  readonly suites: EvalSuiteRepository;
+  readonly path: string;
+  private readonly sources: EvalSourceRepo;
+  private readonly probesRepo: EvalProbeRepo;
+  private readonly suitesRepo: EvalSuiteAndRunRepo;
 
-  constructor(databasePath: string, options: { readOnly?: boolean } = {}) {
-    if (!options.readOnly && databasePath !== ":memory:") {
-      mkdirSync(dirname(databasePath), { recursive: true });
+  constructor(dbPath: string, options: { readOnly?: boolean } = {}) {
+    this.path = dbPath;
+    if (dbPath !== ":memory:" && !options.readOnly) {
+      mkdirSync(dirname(dbPath), { recursive: true });
     }
-    this.db = new DatabaseSync(databasePath, { readOnly: options.readOnly ?? false });
-    this.db.exec("PRAGMA foreign_keys = ON;");
-    this.db.exec("PRAGMA busy_timeout = 5000;");
-
-    const hasTable = (name: string) => this.hasTable(name);
-    const hasColumn = (table: string, column: string) => this.hasColumn(table, column);
-    const tx = <T>(fn: () => T) => this.transaction(fn);
-
-    if (!options.readOnly) {
-      if (databasePath !== ":memory:") this.db.exec("PRAGMA journal_mode = WAL;");
-      this.db.exec(EVAL_SCHEMA_SQL);
-      migrateEvalSchema(this.db, hasColumn, tx);
-      this.setMeta("schema_version", EVAL_SCHEMA_VERSION);
-      this.db.prepare("INSERT OR IGNORE INTO eval_meta (key, value) VALUES ('created_at', ?)").run(nowIso());
+    this.db = options.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
+    try {
+      if (!options.readOnly) {
+        this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      }
+      ensureEvalSchemaV3(this.db, Boolean(options.readOnly));
+    } catch (error) {
+      this.db.close();
+      throw error;
     }
 
-    this.sources = new EvalSourceRepository(this.db);
-    this.probes = new EvalProbeRepository(this.db, hasTable);
-    this.suites = new EvalSuiteRepository(this.db, tx, hasTable, hasColumn);
+    this.sources = new EvalSourceRepo(this.db);
+    this.probesRepo = new EvalProbeRepo(this.db);
+    this.suitesRepo = new EvalSuiteAndRunRepo(this.db, (fn) => this.transaction(fn));
   }
 
   close(): void {
@@ -76,296 +68,321 @@ export class EvalStore {
   }
 
   transaction<T>(fn: () => T): T {
-    const depth = this.txDepth++;
-    const savepoint = `eval_sp_${depth}`;
-    if (depth === 0) {
-      this.db.exec("BEGIN IMMEDIATE");
-    } else {
-      this.db.exec(`SAVEPOINT ${savepoint}`);
-    }
+    this.db.exec("BEGIN");
     try {
       const result = fn();
-      if (depth === 0) {
-        this.db.exec("COMMIT");
-      } else {
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      }
+      this.db.exec("COMMIT");
       return result;
     } catch (error) {
-      if (depth === 0) {
-        this.db.exec("ROLLBACK");
-      } else {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      }
+      this.db.exec("ROLLBACK");
       throw error;
-    } finally {
-      this.txDepth--;
     }
-  }
-
-  hasTable(name: string): boolean {
-    const row = this.db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) as Row | undefined;
-    return row !== undefined;
-  }
-
-  hasColumn(table: string, column: string): boolean {
-    if (!this.hasTable(table)) return false;
-    const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
-    return rows.some((r) => String(r.name) === column);
-  }
-
-  setMeta(key: string, value: string): void {
-    this.db.prepare("INSERT INTO eval_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
   }
 
   getMeta(key: string): string | undefined {
-    const row = this.db.prepare("SELECT value FROM eval_meta WHERE key = ?").get(key) as Row | undefined;
-    return row ? String(row.value) : undefined;
+    const row = this.db.prepare("SELECT value FROM eval_meta WHERE key = ?").get(key) as { value: string } | undefined;
+    return row?.value;
   }
 
-  getSummary(): EvalStoreSummary {
-    const src = this.sources.countSummary();
-    const probe = this.probes.getCountsSummary();
-    return {
-      schemaVersion: this.getMeta("schema_version"),
-      mainDbPath: this.getMeta("main_db_path"),
-      sourceMaterials: src.sourceMaterials,
-      unbuiltSourceMaterials: src.unbuiltSourceMaterials,
-      sourceVideoKeys: src.sourceVideoKeys,
-      probeRuns: probe.probeRuns,
-      probesByStatus: probe.probesByStatus,
-      acceptedByType: probe.acceptedByType,
-      acceptedByDifficulty: probe.acceptedByDifficulty,
-      suites: this.suites.listSuites(),
-      evalRuns: this.suites.listEvalRunSummaries(),
-      agentCalls: probe.agentCalls,
-    };
+  setMeta(key: string, value: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO eval_meta (key, value) VALUES (?, ?)").run(key, value);
   }
 
-  // ---------- source materials ----------
+  markInterruptedRuns(): number {
+    const now = nowIso();
+    const r1 = this.db
+      .prepare("UPDATE probe_runs SET status = 'interrupted', ended_at = ? WHERE status = 'running'")
+      .run(now);
+    const r2 = this.db
+      .prepare("UPDATE eval_runs SET status = 'interrupted', ended_at = ? WHERE status = 'running'")
+      .run(now);
+    return Number(r1.changes) + Number(r2.changes);
+  }
 
-  insertSourceMaterial(input: Parameters<EvalSourceRepository["insertSourceMaterial"]>[0]): { record: SourceMaterialRecord; created: boolean } {
+  // ---- Sources, runs & agent calls ----
+
+  insertSourceMaterial(input: InsertSourceMaterialInput): { created: boolean; record: SourceMaterialRecord } {
     return this.sources.insertSourceMaterial(input);
-  }
-
-  getSourceMaterialByVideoId(videoId: string): SourceMaterialRecord | undefined {
-    return this.sources.getSourceMaterialByVideoId(videoId);
   }
 
   getSourceMaterial(id: number): SourceMaterialRecord | undefined {
     return this.sources.getSourceMaterial(id);
   }
 
-  listSourceMaterials(): SourceMaterialRecord[] {
-    return this.sources.listSourceMaterials();
+  listSourceMaterials(filter: { videoKeys?: string[]; limit?: number } = {}): SourceMaterialRecord[] {
+    return this.sources.listSourceMaterials(filter);
   }
 
-  listUnbuiltSourceMaterials(probeTypes?: readonly ProbeType[]): SourceMaterialRecord[] {
-    return this.sources.listUnbuiltSourceMaterials(probeTypes);
-  }
-
-  listSourceMaterialsByVideoKeys(videoKeys: string[]): SourceMaterialRecord[] {
-    return this.sources.listSourceMaterialsByVideoKeys(videoKeys);
-  }
-
-  listExistingQuestionsForVideoKey(videoKey: string): string[] {
-    return this.sources.listExistingQuestionsForVideoKey(videoKey);
+  listUnbuiltSourceMaterials(filter: { videoKeys?: string[]; limit?: number } = {}): SourceMaterialRecord[] {
+    return this.sources.listUnbuiltSourceMaterials(filter);
   }
 
   listEvalVideoKeys(): Set<string> {
     return this.sources.listEvalVideoKeys();
   }
 
-  // ---------- probe runs, calls, specs, probes, turns, calibrations ----------
-
-  createRun(input: { kind: ProbeRunKind; config: Record<string, unknown>; prompts: Record<string, unknown>; skills: unknown[] }): number {
-    return this.probes.createRun(input);
+  createRun(input: {
+    kind: ProbeRunKind;
+    config: Record<string, unknown>;
+    prompts: Record<string, unknown>;
+    skills: unknown[];
+  }): number {
+    return this.sources.createRun(input);
   }
 
-  finishRun(runId: number, status: ProbeRunStatus, error?: string): void {
-    this.probes.finishRun(runId, status, error);
-  }
-
-  markInterruptedRuns(): number {
-    return this.probes.markInterruptedRuns();
-  }
-
-  latestRunId(kind = "probe_build"): number | undefined {
-    return this.probes.latestRunId(kind);
-  }
-
-  listActiveRuns(kinds?: readonly ProbeRunKind[]): Array<{ id: number; kind: string; startedAt: string }> {
-    return this.probes.listActiveRuns(kinds);
-  }
-
-  countAcceptedProbesByType(): Record<ProbeType, number> {
-    return this.probes.countAcceptedProbesByType();
+  finishRun(runId: number, status: Exclude<RunLifecycleStatus, "running">, error?: string): void {
+    this.sources.finishRun(runId, status, error);
   }
 
   getRun(runId: number): ProbeRunRecord | undefined {
-    return this.probes.getRun(runId);
+    return this.sources.getRun(runId);
   }
 
-  listReviews(probeId: number): ProbeReviewRecord[] {
-    return this.probes.listReviews(probeId);
+  getLatestRun(kind: ProbeRunKind): ProbeRunRecord | undefined {
+    return this.sources.getLatestRun(kind);
   }
 
-  listAttemptsForProbe(probeId: number): ProbeAttemptRecord[] {
-    return this.probes.listAttemptsForProbe(probeId);
+  listActiveRuns(kinds?: readonly ProbeRunKind[]): ProbeRunRecord[] {
+    return this.sources.listActiveRuns(kinds);
   }
 
-  startCall(input: { runRef: string; role: string; model: string; inputRefs: unknown }): number {
-    return this.probes.startCall(input);
+  startCall(input: StartAgentCallInput): number {
+    return this.sources.startCall(input);
   }
 
   finishCall(callId: number, outcome: { output?: string; error?: string }): void {
-    this.probes.finishCall(callId, outcome);
+    this.sources.finishCall(callId, outcome);
   }
 
   countAgentCalls(runRef: string, role?: string): number {
-    return this.probes.countAgentCalls(runRef, role);
+    return this.sources.countAgentCalls(runRef, role);
   }
 
-  createSpec(input: Parameters<EvalProbeRepository["createSpec"]>[0]): number {
-    return this.probes.createSpec(input);
+  // ---- Probes, turns & calibrations ----
+
+  createProbe(input: CreateProbeInput): number {
+    return this.probesRepo.createProbe(input);
   }
 
-  createProbe(input: Parameters<EvalProbeRepository["createProbe"]>[0]): number {
-    return this.probes.createProbe(input);
+  reviseProbe(
+    probeId: number,
+    update: {
+      probeType?: ProbeType;
+      persona?: string;
+      targetTurns?: number;
+      question: string;
+      anchor: string;
+      trap: string;
+      anchorVerified: boolean;
+    },
+  ): void {
+    this.probesRepo.reviseProbe(probeId, update);
   }
 
-  updateSpec(specId: number, input: Parameters<EvalProbeRepository["updateSpec"]>[1]): void {
-    this.probes.updateSpec(specId, input);
+  appendReview(probeId: number, review: Omit<ProbeReviewEntry, "createdAt">): void {
+    this.probesRepo.appendReview(probeId, review);
   }
 
-  reviseProbe(probeId: number, input: Parameters<EvalProbeRepository["reviseProbe"]>[1]): void {
-    this.probes.reviseProbe(probeId, input);
-  }
-
-  setProbeStatus(probeId: number, status: ProbeStatus, rejectReason?: string): void {
-    this.probes.setProbeStatus(probeId, status, rejectReason);
+  setProbeStatus(probeId: number, status: ProbeStatus, rejectReason?: string | null): void {
+    this.probesRepo.setProbeStatus(probeId, status, rejectReason);
   }
 
   setProbeDifficulty(probeId: number, difficulty: DifficultyLevel): void {
-    this.probes.setProbeDifficulty(probeId, difficulty);
+    this.probesRepo.setProbeDifficulty(probeId, difficulty);
   }
 
   getProbe(probeId: number): ProbeRecord | undefined {
-    return this.probes.getProbe(probeId);
+    return this.probesRepo.getProbe(probeId);
   }
 
-  listProbes(filter: Parameters<EvalProbeRepository["listProbes"]>[0] = {}): ProbeRecord[] {
-    return this.probes.listProbes(filter);
+  listProbes(
+    filter: {
+      runId?: number;
+      status?: ProbeStatus;
+      probeType?: ProbeType;
+      probeTypes?: readonly ProbeType[];
+      difficulty?: DifficultyLevel | "uncalibrated";
+      sourceMaterialId?: number;
+    } = {},
+  ): ProbeRecord[] {
+    return this.probesRepo.listProbes(filter);
   }
 
-  saveCalibration(input: Parameters<EvalProbeRepository["saveCalibration"]>[0]): void {
-    this.probes.saveCalibration(input);
+  listExistingQuestionsForSource(sourceMaterialId: number, excludeProbeId?: number): string[] {
+    return this.probesRepo.listExistingQuestionsForSource(sourceMaterialId, excludeProbeId);
   }
 
-  listCalibrationsForProbe(probeId: number, runId?: number): CalibrationTurnRecord[] {
-    return this.probes.listCalibrationsForProbe(probeId, runId);
+  countProbesByType(statuses?: readonly ProbeStatus[]): Record<string, number> {
+    return this.probesRepo.countProbesByType(statuses);
   }
 
-  listCompleteCalibrationsForProbe(probeId: number, expectedTurns: number, runId?: number): CalibrationTurnRecord[] {
-    return this.probes.listCompleteCalibrationsForProbe(probeId, expectedTurns, runId);
+  saveProbeTurn(input: SaveProbeTurnInput): number {
+    return this.probesRepo.saveProbeTurn(input);
   }
 
-  listCalibrationsForRun(runId: number): CalibrationTurnRecord[] {
-    return this.probes.listCalibrationsForRun(runId);
+  listProbeTurns(probeId: number): ProbeTurnRecord[] {
+    return this.probesRepo.listProbeTurns(probeId);
   }
 
-  addReview(input: Parameters<EvalProbeRepository["addReview"]>[0]): void {
-    this.probes.addReview(input);
+  saveCalibration(input: {
+    probeId: number;
+    turnNo: number;
+    bareModel: string;
+    graderModel: string;
+    bareAnswer: string;
+    behaviorOk: boolean;
+    score: number;
+    detail: Record<string, unknown>;
+    bareCallId?: number | null;
+    graderCallId?: number | null;
+  }): number {
+    return this.probesRepo.saveCalibration(input);
   }
 
-  createTurn(input: { probeId: number; turnNo: number; userContent: string; expectedBehavior: ExpectedBehavior; tactic?: string }): number {
-    return this.probes.createTurn(input);
+  listCalibrationsForProbe(
+    probeId: number,
+    filter?: { bareModel?: string; graderModel?: string },
+  ): ProbeCalibrationRecord[] {
+    return this.probesRepo.listCalibrationsForProbe(probeId, filter);
   }
 
-  finishTurn(turnId: number, status: "pass" | "dropped" | "exhausted" | "error", passedAttemptId?: number): void {
-    this.probes.finishTurn(turnId, status, passedAttemptId);
+  listCompleteCalibrationsForProbe(probeId: number, expectedTurns: number): ProbeCalibrationRecord[] {
+    return this.probesRepo.listCompleteCalibrationsForProbe(probeId, expectedTurns);
   }
 
-  addAttempt(input: Parameters<EvalProbeRepository["addAttempt"]>[0]): number {
-    return this.probes.addAttempt(input);
-  }
+  // ---- Suites, eval runs, predictions & scores ----
 
-  reviewAttempt(attemptId: number, input: Parameters<EvalProbeRepository["reviewAttempt"]>[1]): void {
-    this.probes.reviewAttempt(attemptId, input);
+  freezeSuite(input: {
+    name: string;
+    sha256: string;
+    manifest: Record<string, unknown>;
+    items: Array<{
+      itemKey: string;
+      videoKey: string;
+      probeType: ProbeType;
+      difficulty?: DifficultyLevel | null;
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+      rubrics: SuiteRubricEntry[];
+    }>;
+  }): { created: boolean; suite: SuiteVersionRecord } {
+    return this.suitesRepo.freezeSuite(input);
   }
-
-  saveRubric(input: Parameters<EvalProbeRepository["saveRubric"]>[0]): void {
-    this.probes.saveRubric(input);
-  }
-
-  getProbeDialogue(probeId: number): ProbeDialogueTurn[] {
-    return this.probes.getProbeDialogue(probeId);
-  }
-
-  // ---------- suites & candidate eval runs ----------
 
   getSuite(name: string): SuiteVersionRecord | undefined {
-    return this.suites.getSuite(name);
+    return this.suitesRepo.getSuite(name);
   }
 
-  getSuiteById(id: number): SuiteVersionRecord | undefined {
-    return this.suites.getSuiteById(id);
+  listSuites(): SuiteVersionRecord[] {
+    return this.suitesRepo.listSuites();
   }
 
-  listSuites(): Array<{ name: string; kind: string; itemCount: number; sha256: string; createdAt: string }> {
-    return this.suites.listSuites();
+  listSuiteItems(suiteId: number): SuiteItemRecord[] {
+    return this.suitesRepo.listSuiteItems(suiteId);
   }
 
-  freezeSuite(input: Parameters<EvalSuiteRepository["freezeSuite"]>[0]): { created: boolean; suite: SuiteVersionRecord } {
-    return this.suites.freezeSuite(input);
+  createEvalRun(input: {
+    suiteId: number;
+    candidate: string;
+    model: string;
+    historyMode: EvalHistoryMode;
+    systemPrompt?: string | null;
+    config?: Record<string, unknown>;
+  }): number {
+    return this.suitesRepo.createEvalRun(input);
   }
 
-  listSuiteItems(name: string): SuiteItemRecord[] {
-    return this.suites.listSuiteItems(name);
+  reopenEvalRun(evalRunId: number): void {
+    this.suitesRepo.reopenEvalRun(evalRunId);
   }
 
-  listSuiteItemsBySuiteId(suiteId: number): SuiteItemRecord[] {
-    return this.suites.listSuiteItemsBySuiteId(suiteId);
-  }
-
-  createEvalRun(input: Parameters<EvalSuiteRepository["createEvalRun"]>[0]): number {
-    return this.suites.createEvalRun(input);
-  }
-
-  reopenEvalRun(evalRunId: number, configPatch?: Record<string, unknown>): void {
-    this.suites.reopenEvalRun(evalRunId, configPatch);
-  }
-
-  finishEvalRun(evalRunId: number, status: ProbeRunStatus, error?: string): void {
-    this.suites.finishEvalRun(evalRunId, status, error);
+  finishEvalRun(evalRunId: number, status: Exclude<RunLifecycleStatus, "running">, error?: string): void {
+    this.suitesRepo.finishEvalRun(evalRunId, status, error);
   }
 
   getEvalRun(evalRunId: number): EvalRunRecord | undefined {
-    return this.suites.getEvalRun(evalRunId);
+    return this.suitesRepo.getEvalRun(evalRunId);
   }
 
-  listEvalRuns(filter: Parameters<EvalSuiteRepository["listEvalRuns"]>[0] = {}): EvalRunRecord[] {
-    return this.suites.listEvalRuns(filter);
+  getLatestEvalRun(filter?: { suiteName?: string; candidate?: string }): EvalRunRecord | undefined {
+    return this.suitesRepo.getLatestEvalRun(filter);
   }
 
-  latestEvalRunId(filter: { suiteName?: string; candidate?: string; historyMode?: EvalHistoryMode } = {}): number | undefined {
-    return this.suites.latestEvalRunId(filter);
+  listEvalRuns(filter?: {
+    suiteNames?: string[];
+    candidates?: string[];
+    runIds?: number[];
+    historyMode?: EvalHistoryMode;
+  }): EvalRunRecord[] {
+    return this.suitesRepo.listEvalRuns(filter);
   }
 
-  saveEvalPrediction(input: Parameters<EvalSuiteRepository["saveEvalPrediction"]>[0]): number {
-    return this.suites.saveEvalPrediction(input);
+  saveEvalPrediction(input: {
+    evalRunId: number;
+    suiteItemId: number;
+    turnNo: number;
+    input: Record<string, unknown>;
+    outputText?: string | null;
+    error?: string | null;
+    callId?: number | null;
+  }): number {
+    return this.suitesRepo.saveEvalPrediction(input);
   }
 
   listEvalPredictions(evalRunId: number): EvalPredictionRecord[] {
-    return this.suites.listEvalPredictions(evalRunId);
+    return this.suitesRepo.listEvalPredictions(evalRunId);
   }
 
-  saveEvalScore(input: Parameters<EvalSuiteRepository["saveEvalScore"]>[0]): void {
-    this.suites.saveEvalScore(input);
+  saveEvalScore(input: {
+    predictionId: number;
+    graderModel: string;
+    behaviorOk: boolean;
+    stance: 0 | 1 | 2;
+    keyPointCoverage: number;
+    forbiddenHits: number;
+    hallucinationHits: number;
+    failureSignalHits: number;
+    style: 0 | 1 | 2;
+    score: number;
+    detail: Record<string, unknown>;
+    callId?: number | null;
+  }): number {
+    return this.suitesRepo.saveEvalScore(input);
   }
 
   listEvalScores(evalRunId: number): EvalScoreRecord[] {
-    return this.suites.listEvalScores(evalRunId);
+    return this.suitesRepo.listEvalScores(evalRunId);
+  }
+
+  getSummary(): EvalStoreSummary {
+    const count = (sql: string): number => Number((this.db.prepare(sql).get() as { c: number }).c);
+    const groupCounts = (sql: string): Record<string, number> => {
+      const out: Record<string, number> = {};
+      for (const row of this.db.prepare(sql).all() as Array<{ k: string | null; c: number }>) {
+        out[row.k ?? "uncalibrated"] = Number(row.c);
+      }
+      return out;
+    };
+
+    return {
+      schemaVersion: this.getMeta("schema_version") ?? EVAL_SCHEMA_VERSION,
+      sourceMaterials: count("SELECT count(*) AS c FROM source_materials"),
+      sourceVideos: count("SELECT count(DISTINCT video_key) AS c FROM source_materials"),
+      probeRuns: groupCounts("SELECT kind || ':' || status AS k, count(*) AS c FROM probe_runs GROUP BY kind, status"),
+      probesByStatus: groupCounts("SELECT status AS k, count(*) AS c FROM probes GROUP BY status"),
+      probesByType: groupCounts("SELECT probe_type AS k, count(*) AS c FROM probes WHERE status = 'accepted' GROUP BY probe_type"),
+      probesByDifficulty: groupCounts("SELECT difficulty AS k, count(*) AS c FROM probes WHERE status = 'accepted' GROUP BY difficulty"),
+      probeTurns: count("SELECT count(*) AS c FROM probe_turns"),
+      probeCalibrations: count("SELECT count(*) AS c FROM probe_calibrations"),
+      suites: this.listSuites().map((s) => ({
+        name: s.name,
+        itemCount: s.itemCount,
+        sha256: s.sha256,
+        frozenAt: s.frozenAt,
+      })),
+      evalRuns: count("SELECT count(*) AS c FROM eval_runs"),
+      evalPredictions: count("SELECT count(*) AS c FROM eval_predictions"),
+      evalScores: count("SELECT count(*) AS c FROM eval_scores"),
+      agentCalls: count("SELECT count(*) AS c FROM agent_calls"),
+    };
   }
 }

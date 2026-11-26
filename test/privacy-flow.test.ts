@@ -20,7 +20,14 @@ const SECRET = "synthetic-privacy-flow-marker";
 const PRIVATE_MESSAGE = `${SECRET} Bearer fixture-token https://provider.example/v1?token=${SECRET}\nprivate material fragment`;
 const PASS = JSON.stringify({ decision: "pass", issues: [], feedback: "" });
 const SKILL: Skill = { status: "ready", body: "fixture skill", sha256: "fixture-sha" };
-const RUBRIC = { expectedBehavior: "answer", stance: "fixture stance", keyPoints: ["fixture point"], forbidden: [], mustNotHallucinate: [], failureSignals: [] };
+const RUBRIC = {
+  expectedBehavior: "answer" as const,
+  stance: "fixture stance",
+  keyPoints: ["fixture point"],
+  forbidden: [] as string[],
+  mustNotHallucinate: [] as string[],
+  failureSignals: [] as string[],
+};
 
 function sensitiveException(): Error {
   return Object.assign(new Error(PRIVATE_MESSAGE), { status: 503 });
@@ -47,11 +54,11 @@ function seedQuestion(store: DataMakerStore): void {
 
 function seedSuite(store: EvalStore): void {
   store.freezeSuite({
-    name: "privacy-fixture", kind: "in_distribution", sha256: "a".repeat(64), manifest: {},
+    name: "privacy-fixture", sha256: "a".repeat(64), manifest: {},
     items: [{
-      itemKey: "privacy:item:1", videoKey: "BV-privacy-fixture", probeType: null, expectedBehavior: "answer",
+      itemKey: "privacy:item:1", videoKey: "BV-privacy-fixture", probeType: "answer",
       messages: [{ role: "user", content: "fixture question?" }, { role: "assistant", content: "fixture reference answer" }],
-      rubrics: [{ turnNo: 1, rubric: RUBRIC }],
+      rubrics: [{ turnNo: 1, expectedBehavior: "answer", tactic: null, rubric: RUBRIC }],
     }],
   });
 }
@@ -102,7 +109,7 @@ test("question generation publishes only controlled errors and retains malformed
 });
 
 test("dialogue role failures hide exceptions across retries, progress and every ordinary error column", async (t) => {
-  for (const failedRole of ["answer", "judge", "followup", "rubric"] as const) {
+  for (const failedRole of ["answer", "judge", "followup"] as const) {
     await t.test(failedRole, async () => {
       const store = new DataMakerStore(":memory:");
       try {
@@ -110,7 +117,7 @@ test("dialogue role failures hide exceptions across retries, progress and every 
         const progress: string[] = [];
         let failingCalls = 0;
         const summary = await runDialogueBatch({
-          store, prompts: { answer: "answer", judge: "judge", followup: "followup", rubric: "rubric" },
+          store, prompts: { answer: "answer", judge: "judge", followup: "followup" },
           maxAttempts: 1, maxTurns: failedRole === "followup" ? 2 : 1,
           callMaxAttempts: 2, callRetryDelayMs: 0, config: {},
           runRole: async ({ role }) => {
@@ -120,16 +127,15 @@ test("dialogue role failures hide exceptions across retries, progress and every 
             }
             if (role === "answer") return "fixture answer";
             if (role === "judge") return PASS;
-            if (role === "followup") return '{"action":"stop"}';
-            return JSON.stringify(RUBRIC);
+            return '{"action":"stop"}';
           },
           onProgress: (message) => progress.push(message),
         });
         assert.equal(failingCalls, 2);
-        assert.equal(failedRole === "rubric" ? summary.rubricErrors : summary.errors, 1);
+        assert.equal(summary.errors, 1);
         assertPublic(progress);
         assert.ok(progress.some((message) => message.includes("第 1/2 次")));
-        assertErrorColumns(store.db, ["model_calls", "eval_model_calls", "attempts", "turns", "run_items", "runs"]);
+        assertErrorColumns(store.db, ["model_calls", "attempts", "turns", "run_items", "runs"]);
       } finally {
         store.close();
       }
@@ -137,15 +143,15 @@ test("dialogue role failures hide exceptions across retries, progress and every 
   }
 });
 
-test("malformed judge, followup and rubric outputs stay in trace instead of public errors", async (t) => {
-  for (const failedRole of ["judge", "followup", "rubric"] as const) {
+test("malformed judge and followup outputs stay in trace instead of public errors", async (t) => {
+  for (const failedRole of ["judge", "followup"] as const) {
     await t.test(failedRole, async () => {
       const store = new DataMakerStore(":memory:");
       try {
         seedQuestion(store);
         const progress: string[] = [];
         await runDialogueBatch({
-          store, prompts: { answer: "answer", judge: "judge", followup: "followup", rubric: "rubric" },
+          store, prompts: { answer: "answer", judge: "judge", followup: "followup" },
           maxAttempts: 1, maxTurns: failedRole === "followup" ? 2 : 1, config: {},
           callMaxAttempts: 2, callRetryDelayMs: 0,
           runRole: async ({ role }) => {
@@ -157,9 +163,8 @@ test("malformed judge, followup and rubric outputs stay in trace instead of publ
           onProgress: (message) => progress.push(message),
         });
         assertPublic(progress, "model_output_invalid");
-        assertErrorColumns(store.db, ["model_calls", "eval_model_calls", "attempts", "turns", "run_items"], "model_output_invalid");
-        const table = failedRole === "rubric" ? "eval_model_calls" : "model_calls";
-        const row = store.db.prepare(`SELECT output_text FROM ${table} WHERE role = ? AND status = 'error'`).get(failedRole);
+        assertErrorColumns(store.db, ["model_calls", "attempts", "turns", "run_items"], "model_output_invalid");
+        const row = store.db.prepare("SELECT output_text FROM model_calls WHERE role = ? AND status = 'error'").get(failedRole);
         assert.equal(row?.output_text, PRIVATE_MESSAGE);
       } finally {
         store.close();
@@ -235,13 +240,14 @@ test("evaluation grading publishes controlled transport and parsing failures", a
 function seedProbe(store: EvalStore): number {
   const { record: source } = store.insertSourceMaterial({ videoId: "BV-privacy", videoKey: "BV-privacy", partCount: 1, content: "fixture material", splitSnapshot: "test" });
   const runId = store.createRun({ kind: "probe_build", config: {}, prompts: {}, skills: [] });
-  const specId = store.createSpec({ runId, sourceMaterialId: source.id, slotIndex: 1, probeType: "wild_short", persona: "fixture", targetTurns: 1 });
-  const probeId = store.createProbe({ specId, question: "fixture question?", anchor: "fixture material", trap: "fixture trap", expectedBehavior: "answer", anchorVerified: true });
-  const turnId = store.createTurn({ probeId, turnNo: 1, userContent: "fixture question?", expectedBehavior: "answer" });
-  const attemptId = store.addAttempt({ turnId, attemptNo: 1, answer: "fixture reference answer", answerCallId: null });
-  store.reviewAttempt(attemptId, { decision: "pass", issues: [], feedback: "", verifyCallId: null });
-  store.finishTurn(turnId, "pass", attemptId);
-  store.saveRubric({ turnId, rubric: RUBRIC, callId: null });
+  const probeId = store.createProbe({
+    runId, sourceMaterialId: source.id, slotIndex: 1, probeType: "answer", persona: "fixture", targetTurns: 1,
+    question: "fixture question?", anchor: "fixture material", trap: "fixture trap", anchorVerified: true,
+  });
+  store.saveProbeTurn({
+    probeId, turnNo: 1, expectedBehavior: "answer", userContent: "fixture question?",
+    referenceAnswer: "fixture reference answer", rubric: RUBRIC, attempts: 1,
+  });
   store.setProbeStatus(probeId, "accepted");
   store.finishRun(runId, "completed");
   return probeId;
