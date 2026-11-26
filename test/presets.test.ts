@@ -4,11 +4,21 @@ import { renderInspectMarkdown, stratifiedSampleProbes } from "../src/eval/inspe
 import { EvalStore } from "../src/eval/store/index.js";
 import { resolveCotBackfillPreset, resolveCotExportPreset } from "../src/reasoning/presets.js";
 import { resolveSynthExportPreset, resolveSynthRunPreset } from "../src/synth/presets.js";
+import { DEFAULT_SYNTH_MAX_ATTEMPTS } from "../src/synth/workflows.js";
 
 test("all built-in synth and cot presets resolve cleanly and reject unknown names", () => {
+  assert.equal(DEFAULT_SYNTH_MAX_ATTEMPTS, 4);
   assert.equal(resolveSynthRunPreset("train-standard")?.profile, "standard");
   assert.equal(resolveSynthRunPreset("train-short")?.maxTurns, 2);
-  assert.equal(resolveSynthRunPreset("train-trap")?.maxQuestionsPerVideo, 3);
+  assert.equal(resolveSynthRunPreset("train-medium")?.profile, "medium");
+  assert.equal(resolveSynthRunPreset("train-medium")?.maxTurns, 2);
+  assert.equal(resolveSynthRunPreset("train-long")?.profile, "long");
+  assert.equal(resolveSynthRunPreset("train-long")?.maxTurns, 3);
+  assert.equal(resolveSynthRunPreset("train-xlong")?.profile, "xlong");
+  assert.equal(resolveSynthRunPreset("train-xlong")?.maxTurns, 3);
+  assert.equal(resolveSynthRunPreset("train-trap")?.maxQuestionsPerVideo, 2);
+  assert.equal(resolveSynthRunPreset("train-search")?.profile, "search");
+  assert.equal(resolveSynthRunPreset("train-search")?.maxQuestionsPerVideo, 2);
   assert.equal(resolveSynthRunPreset("dpo-pool")?.split, "dpo");
   assert.throws(() => resolveSynthRunPreset("test-freeze"), /未知 synth 预设/);
   assert.throws(() => resolveSynthRunPreset("bad-preset"), /未知 synth 预设/);

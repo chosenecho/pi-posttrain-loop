@@ -10,7 +10,7 @@ import { runSynthCli } from "./synth.js";
 const ROOT_HELP = `pi-posttrain-loop 统一命令行入口（npm run dm -- <命令组> <子命令> [选项]）
 
 命令组：
-  synth      问答与多轮对话合成（status | run | questions | judge | export | demo）
+  synth      问答与多轮对话合成（status | run | suite | questions | judge | export | demo）
   cot        脱稿思考链（CoT）逆向补写与导出（status | backfill | review | export）
   eval       独立评测库与盲测流水线（make | evaluate | report | compare | inspect | suites）
   demo       快捷入口：等价于 synth demo（30 秒离线演示，零 API Key）

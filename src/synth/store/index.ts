@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { validateMaxTurns } from "../../shared/schema.js";
-import type { DatasetSplit, Review, SplitAssignMethod } from "../../shared/types.js";
+import type { DatasetSplit, Review, SplitAssignMethod, ToolStep } from "../../shared/types.js";
 import { createSeededRng, extractVideoKey, normalizeText, nowIso, sha256Hex } from "../../shared/utils.js";
 import { CorpusRepository } from "./corpus-repo.js";
 import { ExportRepository } from "./export-repo.js";
@@ -191,8 +191,8 @@ export class DataMakerStore {
     return this.corpus.insertQuestion(input);
   }
 
-  listProcessedVideoRows(): Array<{ video_id: string; sha256: string }> {
-    return this.corpus.listProcessedVideoRows();
+  listProcessedVideoRows(profile?: string): Array<{ video_id: string; sha256: string }> {
+    return this.corpus.listProcessedVideoRows(profile);
   }
 
   listMaterialIndex(): Array<{ id: number; video_id: string; sha256: string }> {
@@ -277,6 +277,14 @@ export class DataMakerStore {
     this.runs.recordAttemptAnswer(attemptId, answer);
   }
 
+  recordAttemptToolSteps(attemptId: number, steps: ToolStep[], createdAt = nowIso()): void {
+    this.runs.recordAttemptToolSteps(attemptId, steps, createdAt);
+  }
+
+  queryAttemptToolStepsMap(attemptIds: number[]): Map<number, ToolStep[]> {
+    return this.runs.queryAttemptToolStepsMap(attemptIds);
+  }
+
   finishAttemptReview(attemptId: number, review: Review, finishedAt = nowIso()): void {
     this.runs.finishAttemptReview(attemptId, review, finishedAt);
   }
@@ -334,6 +342,7 @@ export class DataMakerStore {
     onlyUnjudged?: boolean;
     maxTurns?: number;
     split?: DatasetSplit;
+    generationProfile?: string;
   }): TargetQuestionRow[] {
     return this.runs.queryTargetQuestions(filter);
   }

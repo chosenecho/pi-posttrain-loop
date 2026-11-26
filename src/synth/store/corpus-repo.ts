@@ -150,7 +150,29 @@ export class CorpusRepository {
     return { record, inserted: true };
   }
 
-  listProcessedVideoRows(): Array<{ video_id: string; sha256: string }> {
+  listProcessedVideoRows(profile?: string): Array<{ video_id: string; sha256: string }> {
+    if (profile !== undefined) {
+      const normalized = profile.trim().toLowerCase();
+      return this.db.prepare(`
+        SELECT DISTINCT m.video_id, m.sha256
+        FROM materials m
+        WHERE EXISTS (
+          SELECT 1
+          FROM questions q
+          LEFT JOIN runs r ON r.id = q.generation_run_id
+          WHERE q.material_id = m.id
+            AND LOWER(COALESCE(json_extract(r.config_json, '$.profile'), 'standard')) = ?
+        ) OR EXISTS (
+          SELECT 1
+          FROM model_calls c
+          JOIN runs r ON r.id = c.run_id
+          WHERE c.material_id = m.id
+            AND c.role = 'question'
+            AND c.status = 'completed'
+            AND LOWER(COALESCE(json_extract(r.config_json, '$.profile'), 'standard')) = ?
+        )
+      `).all(normalized, normalized) as Array<{ video_id: string; sha256: string }>;
+    }
     return this.db.prepare(`
       SELECT DISTINCT m.video_id, m.sha256
       FROM materials m

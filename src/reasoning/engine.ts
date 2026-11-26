@@ -14,7 +14,7 @@ import {
 } from "../shared/retry.js";
 import { nonEmpty, parseReview, validateConcurrency } from "../shared/schema.js";
 import { readSkillFile } from "../shared/skill-loader.js";
-import type { Review, RoleRunner, Skill } from "../shared/types.js";
+import { ALL_SYNTH_PROFILES, type Review, type RoleRunner, type Skill } from "../shared/types.js";
 import { createSeededRng, shuffleInPlace } from "../shared/utils.js";
 import {
   computeBatchStats,
@@ -184,7 +184,7 @@ export function selectStratifiedTurns(
   if (limit >= candidates.length) return [...candidates];
 
   const rng = createSeededRng(seed);
-  const profileOrder: SourceProfile[] = ["standard", "short"];
+  const profileOrder: readonly SourceProfile[] = ALL_SYNTH_PROFILES;
   const tierOrder: ThinkTier[] = ["short", "medium", "long"];
   const turnNos = [...new Set(candidates.map((c) => c.turnNo))].sort((a, b) => a - b);
 
@@ -286,14 +286,14 @@ export interface ReasoningBackfillResult {
 }
 
 function validateMaxRewrites(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 5) {
-    throw new Error("maxRewrites 必须是 0–5 的整数");
+  if (!Number.isSafeInteger(value) || value < 0 || value > 10) {
+    throw new Error("maxRewrites 必须是 0–10 的整数");
   }
   return value;
 }
 
 export async function runReasoningBackfill(options: ReasoningBackfillOptions): Promise<ReasoningBackfillResult> {
-  const maxRewrites = validateMaxRewrites(options.maxRewrites ?? 3);
+  const maxRewrites = validateMaxRewrites(options.maxRewrites ?? 6);
   const concurrency = validateConcurrency(options.concurrency ?? 10);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
@@ -369,9 +369,19 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
       const totalAttempts = maxRewrites + 1;
       for (let attemptNo = 1; attemptNo <= totalAttempts; attemptNo++) {
         rewriteCount = attemptNo - 1;
+        const serializedToolSteps = turn.toolSteps && turn.toolSteps.length > 0
+          ? turn.toolSteps.map((s) => ({
+              stepNo: s.stepNo,
+              toolName: s.toolName,
+              arguments: s.arguments,
+              toolOutput: s.toolOutput,
+            }))
+          : undefined;
+
         const writerInput: Record<string, unknown> = {
           ...(turn.history.length > 0 ? { history: turn.history } : {}),
           question: turn.question,
+          ...(serializedToolSteps ? { toolSteps: serializedToolSteps } : {}),
           answer: turn.answer,
           ...(previousReasoning !== undefined && feedback !== undefined
             ? { previousReasoning, feedback }
@@ -427,6 +437,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
         const judgeInput: Record<string, unknown> = {
           ...(turn.history.length > 0 ? { history: turn.history } : {}),
           question: turn.question,
+          ...(serializedToolSteps ? { toolSteps: serializedToolSteps } : {}),
           answer: turn.answer,
           reasoning: candidateReasoning,
           referenceMetrics: {

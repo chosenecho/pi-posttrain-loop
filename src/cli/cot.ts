@@ -52,7 +52,7 @@ ${Object.values(COT_BACKFILL_PRESETS).map((p) => `  ${p.name.padEnd(10)} ${p.des
   --stratified              按档位 × 轮次分层抽样（搭配 --limit）
   --seed N                  随机种子（默认 42）
   --only-missing            跳过已有通过思考链的轮次（--preset pilot/full 默认开启）
-  --profile FILTER          筛选来源风格：all | standard | short
+  --profile FILTER          筛选来源风格：all | standard | short | medium | long | xlong | trap | search
   --tier LIST               筛选长度档位，逗号分隔：short,medium,long
   --split SPLIT             筛选分区：train | test | dpo
   --runs ID1,ID2            仅筛选指定 answer_judge run_id
@@ -60,7 +60,7 @@ ${Object.values(COT_BACKFILL_PRESETS).map((p) => `  ${p.name.padEnd(10)} ${p.des
   --min-turns N / --max-turns N   按对话轮数过滤
   --dedup POLICY            同题选版策略：latest | earliest | error
   --concurrency N           并发数（默认 10）
-  --max-rewrites N          每轮最大返工次数（默认 3）
+  --max-rewrites N          每轮最大返工次数（默认 6，允许 0–10）
   --no-llm-judge            关闭 LLM 盲审裁判（仅跑硬安全阀）
   --writer-thinking LEVEL   覆盖补写器 thinking level
   --judge-thinking LEVEL    覆盖裁判 thinking level
@@ -94,11 +94,13 @@ ${Object.values(COT_EXPORT_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descr
   --format FORMAT           导出格式：inline（默认）| reasoning_content
   --no-expand-turns         关闭按轮展开（默认按轮展开以兼容 ms-swift）
   --split SPLIT             筛选分区：train | test | dpo
-  --profile FILTER          筛选来源风格：all | standard | short
+  --profile FILTER          筛选来源风格：all | standard | short | medium | long | xlong | trap | search
   --tier LIST               筛选长度档位：short,medium,long
   --runs ID1,ID2 / --exclude-runs IDs / --min-turns N / --max-turns N / --dedup POLICY
   --shuffle / --seed N      打乱顺序与随机种子
   --system TEXT / --system-file PATH
+  --no-generalize-tools     关闭工具 Schema 随机泛化（固定为 web_search(query)）
+  --negative-tools-ratio F  按比例（0–1）为非搜索样本挂上通用 tools 声明但不调工具
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
 `;
 
@@ -313,6 +315,8 @@ export async function runCotCli(args: string[]): Promise<void> {
         seed: { type: "string" },
         system: { type: "string" },
         "system-file": { type: "string" },
+        "no-generalize-tools": { type: "boolean", default: false },
+        "negative-tools-ratio": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
       strict: true,
@@ -352,6 +356,8 @@ export async function runCotCli(args: string[]): Promise<void> {
       shuffle: values.shuffle || Boolean(preset?.shuffle),
       seed: parseIntOpt(values.seed, "--seed") ?? preset?.seed,
       systemPrompt,
+      generalizeTools: !values["no-generalize-tools"],
+      negativeToolsRatio: parseFloatOpt(values["negative-tools-ratio"], "--negative-tools-ratio"),
     });
     console.log(JSON.stringify({ ...(preset ? { preset: preset.name } : {}), ...report }, null, 2));
     return;

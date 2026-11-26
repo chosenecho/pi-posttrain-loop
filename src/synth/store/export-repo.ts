@@ -1,6 +1,12 @@
 import type { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateMaxTurns, validateSplit } from "../../shared/schema.js";
-import type { DatasetSplit, TrainingMessage, TrainingSampleLine } from "../../shared/types.js";
+import {
+  attachNegativeToolDeclaration,
+  buildToolDefinition,
+  buildToolStepMessages,
+  pickWebSearchToolVariant,
+} from "../../shared/tool-schema.js";
+import type { DatasetSplit, ToolStep, TrainingMessage, TrainingSampleLine } from "../../shared/types.js";
 import { createSeededRng, nowIso, sha256Hex, shuffleInPlace } from "../../shared/utils.js";
 import type { CorpusRepository } from "./corpus-repo.js";
 import type { RunRepository } from "./run-repo.js";
@@ -22,9 +28,43 @@ export class ExportRepository {
     private readonly runs: RunRepository,
   ) {}
 
+  private buildSampleLine(
+    turns: ResultTurnRow[],
+    toolStepsByAttempt: Map<number, ToolStep[]>,
+    options: {
+      systemPrompt?: string;
+      generalizeTools: boolean;
+      toolRng: () => number;
+    },
+  ): TrainingSampleLine {
+    const hasAnyTools = turns.some((t) => (toolStepsByAttempt.get(Number(t.attempt_id))?.length ?? 0) > 0);
+    const variant = hasAnyTools ? pickWebSearchToolVariant(options.toolRng, options.generalizeTools) : undefined;
+    const messages: TrainingMessage[] = [];
+    if (options.systemPrompt !== undefined) {
+      messages.push({ role: "system", content: options.systemPrompt });
+    }
+    for (const turn of turns) {
+      messages.push({ role: "user", content: turn.user_content });
+      const steps = toolStepsByAttempt.get(Number(turn.attempt_id));
+      if (steps && steps.length > 0 && variant) {
+        messages.push(...buildToolStepMessages(steps, variant, {
+          format: "plain",
+          callIdPrefix: `t${turn.turn_no}`,
+        }));
+      }
+      messages.push({ role: "assistant", content: turn.assistant_content });
+    }
+    return variant
+      ? { tools: [buildToolDefinition(variant)], messages }
+      : { messages };
+  }
+
   exportRunSamples(runId: number, options: ExportOptions = {}): TrainingSampleLine[] {
     const rows = this.runs.queryResultTurns(runId);
     const systemPrompt = options.systemPrompt !== undefined ? nonEmpty(options.systemPrompt, "systemPrompt") : undefined;
+    const generalizeTools = options.generalizeTools ?? true;
+    const toolRng = createSeededRng(options.seed ?? 42);
+    const toolStepsByAttempt = this.runs.queryAttemptToolStepsMap(rows.map((r) => Number(r.attempt_id)));
     const grouped = new Map<number, ResultTurnRow[]>();
     for (const row of rows) {
       const list = grouped.get(row.result_id);
@@ -33,15 +73,7 @@ export class ExportRepository {
     }
     const samples: TrainingSampleLine[] = [];
     for (const turns of grouped.values()) {
-      const messages: TrainingMessage[] = [];
-      if (systemPrompt !== undefined) {
-        messages.push({ role: "system", content: systemPrompt });
-      }
-      for (const turn of turns) {
-        messages.push({ role: "user", content: turn.user_content });
-        messages.push({ role: "assistant", content: turn.assistant_content });
-      }
-      samples.push({ messages });
+      samples.push(this.buildSampleLine(turns, toolStepsByAttempt, { systemPrompt, generalizeTools, toolRng }));
     }
     return samples;
   }
@@ -133,6 +165,7 @@ export class ExportRepository {
              q.material_id,
              r.turn_count,
              t.turn_no,
+             a.id AS attempt_id,
              COALESCE(t.user_content, q.question) AS user_content,
              a.answer AS assistant_content,
              a.attempt_no
@@ -154,6 +187,13 @@ export class ExportRepository {
     sql += " ORDER BY i.run_id, q.id, t.turn_no";
 
     const rows = this.db.prepare(sql).all(...params) as unknown as ResultTurnRow[];
+    const toolStepsByAttempt = this.runs.queryAttemptToolStepsMap(rows.map((r) => Number(r.attempt_id)));
+    const generalizeTools = options.generalizeTools ?? true;
+    const negativeToolsRatio = options.negativeToolsRatio ?? 0;
+    if (!Number.isFinite(negativeToolsRatio) || negativeToolsRatio < 0 || negativeToolsRatio > 1) {
+      throw new Error("negativeToolsRatio 必须是 [0, 1] 之间的小数");
+    }
+    const toolRng = createSeededRng((options.seed ?? 42) + 1009);
 
     const effectiveSplitFilter: DatasetSplit | undefined = targetSplit ?? (allFormal ? "train" : undefined);
 
@@ -171,13 +211,13 @@ export class ExportRepository {
     const byQuestion = new Map<number, MergedExportRecord[]>();
     for (const turns of groupedByResult.values()) {
       const first = turns[0];
-      const messages: TrainingMessage[] = [];
-      if (systemPrompt !== undefined) {
-        messages.push({ role: "system", content: systemPrompt });
-      }
-      for (const turn of turns) {
-        messages.push({ role: "user", content: turn.user_content });
-        messages.push({ role: "assistant", content: turn.assistant_content });
+      let sample = this.buildSampleLine(turns, toolStepsByAttempt, {
+        systemPrompt,
+        generalizeTools,
+        toolRng,
+      });
+      if (!sample.tools && negativeToolsRatio > 0 && toolRng() < negativeToolsRatio) {
+        sample = attachNegativeToolDeclaration(sample, toolRng, generalizeTools);
       }
       const record: MergedExportRecord = {
         resultId: Number(first.result_id),
@@ -185,7 +225,7 @@ export class ExportRepository {
         questionId: Number(first.question_id),
         materialId: Number(first.material_id),
         turnCount: Number(first.turn_count),
-        sample: { messages },
+        sample,
       };
       const list = byQuestion.get(record.questionId);
       if (list) list.push(record);

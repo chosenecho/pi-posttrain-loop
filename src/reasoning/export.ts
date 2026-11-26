@@ -1,5 +1,17 @@
 import { nonEmpty } from "../shared/schema.js";
-import type { DatasetSplit, DedupPolicy } from "../shared/types.js";
+import {
+  attachNegativeToolDeclaration,
+  buildToolDefinition,
+  buildToolStepMessages,
+  pickWebSearchToolVariant,
+} from "../shared/tool-schema.js";
+import {
+  ALL_SYNTH_PROFILES,
+  type DatasetSplit,
+  type DedupPolicy,
+  type ToolDefinition,
+  type TrainingMessage,
+} from "../shared/types.js";
 import { createSeededRng, sha256Hex, shuffleInPlace } from "../shared/utils.js";
 import {
   computeBatchStats,
@@ -20,13 +32,10 @@ import {
 
 export type ReasoningExportFormat = "reasoning_content" | "inline";
 
-export interface ReasoningTrainingMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
-  reasoning_content?: string;
-}
+export type ReasoningTrainingMessage = TrainingMessage;
 
 export interface ReasoningTrainingSampleLine {
+  tools?: ToolDefinition[];
   messages: ReasoningTrainingMessage[];
 }
 
@@ -65,6 +74,10 @@ export interface ReasoningExportOptions {
   shuffle?: boolean;
   seed?: number;
   valRatio?: number;
+  /** Randomize generic web_search tool name/parameters per sample (default true). */
+  generalizeTools?: boolean;
+  /** Ratio [0, 1] of non-search samples that also carry a generic `tools` declaration without calling tools (default 0). */
+  negativeToolsRatio?: number;
 }
 
 export interface ReasoningExportResult {
@@ -150,6 +163,12 @@ export function buildReasoningExportDataset(
   });
 
   const passedMap = store.getPassedReasoningMap(options.reasoningRunId);
+  const generalizeTools = options.generalizeTools ?? true;
+  const negativeToolsRatio = options.negativeToolsRatio ?? 0;
+  if (!Number.isFinite(negativeToolsRatio) || negativeToolsRatio < 0 || negativeToolsRatio > 1) {
+    throw new Error("negativeToolsRatio 必须是 [0, 1] 之间的小数");
+  }
+  const toolRng = createSeededRng((options.seed ?? 42) + 2027);
   const records: ReasoningExportRecord[] = [];
   let skippedMissingTurns = 0;
   let skippedDialogues = 0;
@@ -161,6 +180,8 @@ export function buildReasoningExportDataset(
         skippedMissingTurns++;
         continue;
       }
+      const hasTools = Boolean(turn.toolSteps && turn.toolSteps.length > 0);
+      const variant = hasTools ? pickWebSearchToolVariant(toolRng, generalizeTools) : undefined;
       const messages: ReasoningTrainingMessage[] = [];
       if (systemPrompt !== undefined) {
         messages.push({ role: "system", content: systemPrompt });
@@ -170,7 +191,20 @@ export function buildReasoningExportDataset(
         messages.push({ role: h.role, content: h.content });
       }
       messages.push({ role: "user", content: turn.question });
+      if (hasTools && variant && turn.toolSteps) {
+        messages.push(...buildToolStepMessages(turn.toolSteps, variant, {
+          format,
+          callIdPrefix: `t${turn.turnNo}`,
+        }));
+      }
       messages.push(formatAssistantWithReasoning(turn.answer, trace.reasoning, format));
+
+      let sample: ReasoningTrainingSampleLine = variant
+        ? { tools: [buildToolDefinition(variant)], messages }
+        : { messages };
+      if (!sample.tools && negativeToolsRatio > 0 && toolRng() < negativeToolsRatio) {
+        sample = attachNegativeToolDeclaration(sample, toolRng, generalizeTools);
+      }
 
       records.push({
         resultId: turn.resultId,
@@ -184,7 +218,7 @@ export function buildReasoningExportDataset(
         attemptId: turn.attemptId,
         reasoningRunId: trace.reasoningRunId,
         lengthTier: trace.lengthTier,
-        sample: { messages },
+        sample,
       });
     }
   } else {
@@ -203,6 +237,8 @@ export function buildReasoningExportDataset(
         skippedMissingTurns += missingCount;
         continue;
       }
+      const hasTools = dialogue.some((t) => Boolean(t.toolSteps && t.toolSteps.length > 0));
+      const variant = hasTools ? pickWebSearchToolVariant(toolRng, generalizeTools) : undefined;
       const messages: ReasoningTrainingMessage[] = [];
       if (systemPrompt !== undefined) {
         messages.push({ role: "system", content: systemPrompt });
@@ -211,7 +247,19 @@ export function buildReasoningExportDataset(
         const turn = dialogue[i];
         const trace = traces[i]!;
         messages.push({ role: "user", content: turn.question });
+        if (turn.toolSteps && turn.toolSteps.length > 0 && variant) {
+          messages.push(...buildToolStepMessages(turn.toolSteps, variant, {
+            format,
+            callIdPrefix: `t${turn.turnNo}`,
+          }));
+        }
         messages.push(formatAssistantWithReasoning(turn.answer, trace.reasoning, format));
+      }
+      let sample: ReasoningTrainingSampleLine = variant
+        ? { tools: [buildToolDefinition(variant)], messages }
+        : { messages };
+      if (!sample.tools && negativeToolsRatio > 0 && toolRng() < negativeToolsRatio) {
+        sample = attachNegativeToolDeclaration(sample, toolRng, generalizeTools);
       }
       const last = dialogue[dialogue.length - 1];
       const lastTrace = traces[traces.length - 1]!;
@@ -227,7 +275,7 @@ export function buildReasoningExportDataset(
         attemptId: last.attemptId,
         reasoningRunId: lastTrace.reasoningRunId,
         lengthTier: lastTrace.lengthTier,
-        sample: { messages },
+        sample,
       });
     }
   }
@@ -258,7 +306,9 @@ export function buildReasoningExportDataset(
 
   const sourceRunSet = new Set<number>();
   const reasoningRunSet = new Set<number>();
-  const profileDistribution: Record<SourceProfile, number> = { standard: 0, short: 0 };
+  const profileDistribution = Object.fromEntries(
+    ALL_SYNTH_PROFILES.map((p) => [p, 0]),
+  ) as Record<SourceProfile, number>;
   const turnNoDistribution: Record<number, number> = {};
   const tierDistribution: Record<ThinkTier, number> = { short: 0, medium: 0, long: 0 };
   const materialSet = new Set<number>();
@@ -408,6 +458,22 @@ export function formatReviewMarkdown(
 
     lines.push(`**提问（Turn ${item.trace.turn_no}）**：${item.question}`);
     lines.push("");
+    if (item.toolSteps && item.toolSteps.length > 0) {
+      lines.push("<details>");
+      lines.push(`<summary>检索工具调用轨迹（${item.toolSteps.length} 步）</summary>`);
+      lines.push("");
+      for (const step of item.toolSteps) {
+        lines.push(`- **Step ${step.stepNo}** \`${step.toolName}(${JSON.stringify(step.arguments)})\``);
+        if (step.preCallThought) {
+          lines.push(`  - 调用前思考：${step.preCallThought.replace(/\r?\n/g, " ")}`);
+        }
+        const preview = step.toolOutput.length > 300 ? `${step.toolOutput.slice(0, 300)}...` : step.toolOutput;
+        lines.push(`  - 返回摘要：${preview.replace(/\r?\n/g, " ")}`);
+      }
+      lines.push("");
+      lines.push("</details>");
+      lines.push("");
+    }
     lines.push("**补写 `<think>`**：");
     lines.push("");
     lines.push(asBlockquote(item.trace.reasoning ?? ""));

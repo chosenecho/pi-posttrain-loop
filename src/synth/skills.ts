@@ -28,10 +28,30 @@ export const SHORT_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "short/followup-str
 export const SHORT_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "short/answer-style/SKILL.md");
 export const SHORT_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "short/quality-judge/SKILL.md");
 
+export const MEDIUM_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "medium/question-design/SKILL.md");
+export const MEDIUM_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "medium/followup-strategy/SKILL.md");
+export const MEDIUM_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "medium/answer-style/SKILL.md");
+export const MEDIUM_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "medium/quality-judge/SKILL.md");
+
+export const LONG_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "long/question-design/SKILL.md");
+export const LONG_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "long/followup-strategy/SKILL.md");
+export const LONG_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "long/answer-style/SKILL.md");
+export const LONG_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "long/quality-judge/SKILL.md");
+
+export const XLONG_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "xlong/question-design/SKILL.md");
+export const XLONG_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "xlong/followup-strategy/SKILL.md");
+export const XLONG_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "xlong/answer-style/SKILL.md");
+export const XLONG_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "xlong/quality-judge/SKILL.md");
+
 export const TRAP_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "trap/question-design/SKILL.md");
 export const TRAP_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "trap/followup-strategy/SKILL.md");
 export const TRAP_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "trap/answer-style/SKILL.md");
 export const TRAP_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "trap/quality-judge/SKILL.md");
+
+export const SEARCH_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "search/question-design/SKILL.md");
+export const SEARCH_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "search/followup-strategy/SKILL.md");
+export const SEARCH_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "search/answer-style/SKILL.md");
+export const SEARCH_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "search/quality-judge/SKILL.md");
 
 interface ProfileSkillPaths {
   questionSkill: string;
@@ -53,11 +73,35 @@ const PROFILE_SKILL_PATHS: Record<SynthProfile, ProfileSkillPaths> = {
     answerStyle: SHORT_ANSWER_STYLE,
     qualityJudge: SHORT_QUALITY_JUDGE,
   },
+  medium: {
+    questionSkill: MEDIUM_QUESTION_SKILL,
+    followupSkill: MEDIUM_FOLLOWUP_SKILL,
+    answerStyle: MEDIUM_ANSWER_STYLE,
+    qualityJudge: MEDIUM_QUALITY_JUDGE,
+  },
+  long: {
+    questionSkill: LONG_QUESTION_SKILL,
+    followupSkill: LONG_FOLLOWUP_SKILL,
+    answerStyle: LONG_ANSWER_STYLE,
+    qualityJudge: LONG_QUALITY_JUDGE,
+  },
+  xlong: {
+    questionSkill: XLONG_QUESTION_SKILL,
+    followupSkill: XLONG_FOLLOWUP_SKILL,
+    answerStyle: XLONG_ANSWER_STYLE,
+    qualityJudge: XLONG_QUALITY_JUDGE,
+  },
   trap: {
     questionSkill: TRAP_QUESTION_SKILL,
     followupSkill: TRAP_FOLLOWUP_SKILL,
     answerStyle: TRAP_ANSWER_STYLE,
     qualityJudge: TRAP_QUALITY_JUDGE,
+  },
+  search: {
+    questionSkill: SEARCH_QUESTION_SKILL,
+    followupSkill: SEARCH_FOLLOWUP_SKILL,
+    answerStyle: SEARCH_ANSWER_STYLE,
+    qualityJudge: SEARCH_QUALITY_JUDGE,
   },
 };
 
@@ -159,7 +203,16 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
   let questionSystemPrompt = options.includeQuestionGenerator
     ? await readQuestionGeneratorPrompt(DEFAULT_PROMPTS_DIR)
     : undefined;
-  let answerSystemPrompt = nonEmpty(await readFile(join(promptDir, "answer.md"), "utf8"), "回答系统提示词");
+  let answerPromptFile = join(promptDir, "answer.md");
+  if (profile === "search" && !noSkill) {
+    try {
+      await readFile(join(promptDir, "answer-search.md"), "utf8");
+      answerPromptFile = join(promptDir, "answer-search.md");
+    } catch {
+      answerPromptFile = join(promptDir, "answer.md");
+    }
+  }
+  let answerSystemPrompt = nonEmpty(await readFile(answerPromptFile, "utf8"), "回答系统提示词");
   let judgeSystemPrompt = nonEmpty(await readFile(join(promptDir, "judge.md"), "utf8"), "质检系统提示词");
   let followupSystemPrompt = maxTurns > 1
     ? nonEmpty(await readFile(join(promptDir, "followup.md"), "utf8"), "多轮追问系统提示词")

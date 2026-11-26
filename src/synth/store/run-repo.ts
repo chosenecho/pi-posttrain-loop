@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateMaxAttempts, validateMaxTurns, validateSplit } from "../../shared/schema.js";
-import type { DatasetSplit, Review } from "../../shared/types.js";
+import type { DatasetSplit, Review, ToolStep } from "../../shared/types.js";
 import { nowIso } from "../../shared/utils.js";
 import type { CorpusRepository } from "./corpus-repo.js";
 import {
@@ -277,12 +277,14 @@ export class RunRepository {
     onlyUnjudged?: boolean;
     maxTurns?: number;
     split?: DatasetSplit;
+    generationProfile?: string;
   }): TargetQuestionRow[] {
     const targetSplit = filter.split !== undefined ? validateSplit(filter.split) : undefined;
     let sql = `
       SELECT q.id, q.material_id, m.video_id, m.content, q.question
       FROM questions q
       JOIN materials m ON m.id = q.material_id
+      LEFT JOIN runs gr ON gr.id = q.generation_run_id
     `;
     const clauses: string[] = [];
     const params: Array<string | number> = [];
@@ -294,6 +296,10 @@ export class RunRepository {
     if (filter.questionIds !== undefined && filter.questionIds.length > 0) {
       clauses.push(`q.id IN (${filter.questionIds.map(() => "?").join(", ")})`);
       params.push(...filter.questionIds);
+    }
+    if (filter.generationProfile !== undefined) {
+      clauses.push("LOWER(COALESCE(json_extract(gr.config_json, '$.profile'), 'standard')) = ?");
+      params.push(filter.generationProfile.trim().toLowerCase());
     }
     if (filter.onlyUnjudged) {
       clauses.push(`NOT EXISTS (
@@ -345,6 +351,7 @@ export class RunRepository {
              q.material_id,
              r.turn_count,
              t.turn_no,
+             a.id AS attempt_id,
              COALESCE(t.user_content, q.question) AS user_content,
              a.answer AS assistant_content,
              a.attempt_no
@@ -356,6 +363,71 @@ export class RunRepository {
       WHERE i.run_id = ?
       ORDER BY q.id, t.turn_no
     `).all(runId) as unknown as ResultTurnRow[];
+  }
+
+  recordAttemptToolSteps(attemptId: number, steps: ToolStep[], createdAt = nowIso()): void {
+    if (steps.length === 0) return;
+    this.transaction(() => {
+      const insert = this.db.prepare(`
+        INSERT INTO attempt_tool_steps (
+          attempt_id, step_no, tool_name, arguments_json, tool_output, pre_call_thought, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i]!;
+        const stepNo = Number.isInteger(step.stepNo) && step.stepNo >= 1 ? step.stepNo : i + 1;
+        insert.run(
+          attemptId,
+          stepNo,
+          nonEmpty(step.toolName, "toolName"),
+          assertObjectJson(step.arguments, "toolStep.arguments"),
+          step.toolOutput,
+          step.preCallThought && step.preCallThought.trim() ? step.preCallThought.trim() : null,
+          createdAt,
+        );
+      }
+    });
+  }
+
+  queryAttemptToolStepsMap(attemptIds: number[]): Map<number, ToolStep[]> {
+    const map = new Map<number, ToolStep[]>();
+    if (attemptIds.length === 0 || !this.hasTable("attempt_tool_steps")) return map;
+    const uniqueIds = [...new Set(attemptIds)];
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db.prepare(`
+      SELECT attempt_id, step_no, tool_name, arguments_json, tool_output, pre_call_thought
+      FROM attempt_tool_steps
+      WHERE attempt_id IN (${placeholders})
+      ORDER BY attempt_id, step_no
+    `).all(...uniqueIds) as Array<{
+      attempt_id: number;
+      step_no: number;
+      tool_name: string;
+      arguments_json: string;
+      tool_output: string;
+      pre_call_thought: string | null;
+    }>;
+
+    for (const row of rows) {
+      const attemptId = Number(row.attempt_id);
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(row.arguments_json) as Record<string, unknown>;
+      } catch {
+        args = {};
+      }
+      const step: ToolStep = {
+        stepNo: Number(row.step_no),
+        toolName: row.tool_name,
+        arguments: args,
+        toolOutput: row.tool_output,
+        ...(row.pre_call_thought ? { preCallThought: row.pre_call_thought } : {}),
+      };
+      const list = map.get(attemptId);
+      if (list) list.push(step);
+      else map.set(attemptId, [step]);
+    }
+    return map;
   }
 
   queryOutcomeCounts(runId: number): Record<string, number> {

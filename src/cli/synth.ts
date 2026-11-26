@@ -6,7 +6,7 @@ import {
   parsePositiveInt,
   readSystemPromptOption,
 } from "../shared/cli-helpers.js";
-import { nonEmpty, validateSplit } from "../shared/schema.js";
+import { nonEmpty, parseOptionalSynthProfile, validateSplit } from "../shared/schema.js";
 import type { DatasetSplit, DedupPolicy, SynthProfile } from "../shared/types.js";
 import type { VideoSortMode } from "../synth/corpus.js";
 import { runDemo } from "../synth/demo.js";
@@ -22,23 +22,29 @@ import {
   runSynthExportWorkflow,
   runSynthJudgeWorkflow,
   runSynthQuestionsWorkflow,
+  runSynthSuiteWorkflow,
 } from "../synth/workflows.js";
 
 const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <子命令>）
 
 子命令：
-  status     查看语料进度、分区统计与待质检问题数
-  run        一体化批量生产（出题 -> 多轮问答质检 -> 可选导出）
-  questions  仅执行批量或单文件出题入库
+  status     查看语料进度、各 profile 覆盖数、分区统计与待质检问题数
+  suite      对同一批视频依次跑完 6 套长度/类型 Skill（short / medium / long / xlong / trap / search）
+  run        单套 profile 批量生产（出题 -> 多轮问答质检 -> 可选导出）
+  questions  仅执行批量或单文件出题入库（支持按 --profile 独立去重）
   judge      仅对题库执行多轮回答与质检（支持增量续跑）
   export     合并导出 JSONL / 切分验证集
   demo       运行 30 秒离线确定性演示（无需 API Key）
 
 常用示例：
   npm run dm -- synth status
-  npm run dm -- synth run --preset train-standard --limit 20
-  npm run dm -- synth run --preset train-short --limit 30
-  npm run dm -- synth run --preset train-trap --limit 30
+  npm run dm -- synth suite --limit 15 --concurrency 10
+  npm run dm -- synth run --preset train-short --limit 20
+  npm run dm -- synth run --preset train-medium --limit 20
+  npm run dm -- synth run --preset train-long --limit 20
+  npm run dm -- synth run --preset train-xlong --limit 20
+  npm run dm -- synth run --preset train-trap --limit 20
+  npm run dm -- synth run --preset train-search --limit 20
   npm run dm -- synth run --preset dpo-pool --limit 15
   npm run dm -- synth judge --only-unjudged --max-turns 3 --concurrency 10
   npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl --manifest output/manifest.json
@@ -48,6 +54,28 @@ const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <
 注意：test 分区仅供 eval 流水线使用（npm run dm -- eval make），synth 只生产 train / dpo。
 `;
 
+const SUITE_HELP = `npm run dm -- synth suite [选项]
+
+对每个未处理视频依次跑完 6 套独立 Skill（short / medium / long / xlong / trap / search），
+由各套 Skill 自主控制出题数量、回答篇幅、追问复杂度与检索增强：
+  目标参考占比：short ~5% | medium ~20% | long ~25% | xlong ~30% | trap ~10% | search ~10%
+
+常用选项：
+  --limit N                 每个 profile 最多抽取未处理视频数量（默认 10）
+  --profiles LIST           仅跑指定子集，逗号分隔（默认 short,medium,long,xlong,trap,search）
+  --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
+  --sort MODE               视频排序：core-first（默认）| id（与 --shuffle 互斥）
+  --shuffle                 随机打乱待出题视频顺序
+  --max-attempts N          每轮返工最大尝试次数（默认 4，含初稿）
+  --concurrency N           并发数（默认 10）
+  --include-unjudged        同时把库中同 profile 的历史未质检问题并入质检
+  --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
+  --db PATH                 主库路径（默认 data/data-maker.sqlite）
+  --eval-db PATH            独立评测库路径（默认同目录 eval.sqlite）
+  --call-attempts N         单次模型调用最大尝试次数（默认 3）
+  --retry-delay-ms N        重试间隔毫秒数（默认 1500）
+`;
+
 const RUN_HELP = `npm run dm -- synth run [选项]
 
 内置预设（--preset，显式参数可覆盖任意字段）：
@@ -55,16 +83,16 @@ ${Object.values(SYNTH_RUN_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descri
 
 常用选项：
   --preset NAME             内置预设名（推荐）
-  --limit N                 本次抽取未出题视频数量上限
+  --limit N                 本次抽取该 profile 未出题视频数量上限
   --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
-  --profile PROFILE         风格预设：standard（默认）| short | trap
+  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
   --sort MODE               视频排序：id | core-first（与 --shuffle 互斥）
   --shuffle                 随机打乱待出题视频顺序
-  --max-questions N         单视频最多生成问题数
-  --max-turns N             多轮对话轮数 1-3（standard 默认 3，short/trap 默认 2）
-  --max-attempts N          每轮返工最大尝试次数（默认 3）
+  --max-questions N         单视频最多生成问题数（安全上限覆盖）
+  --max-turns N             多轮对话轮数（short/medium/trap 默认 2，long/xlong/standard 默认 3）
+  --max-attempts N          每轮返工最大尝试次数（默认 4，含初稿）
   --concurrency N           并发数（默认 10）
-  --include-unjudged        同时把库中该分区历史未质检问题并入本批质检
+  --include-unjudged        同时把库中该分区同 profile 历史未质检问题并入本批质检
   --export PATH             跑完自动导出本批 JSONL
   --system TEXT / --system-file PATH   导出时注入 system 提示词
   --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
@@ -83,10 +111,11 @@ const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
   --input FILE              单视频文稿文件路径（与 --input-dir 互斥）
   --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
   --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
-  --limit N                 本次最多处理未出题视频数
+  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
+  --limit N                 本次最多处理该 profile 未出题视频数
   --sort MODE               视频排序：id（默认）| core-first
   --shuffle                 随机抽取待出题视频
-  --max-questions N         单视频最多生成问题数
+  --max-questions N         单视频最多生成问题数（安全上限覆盖）
   --video-id ID             仅 --input 单文件时覆盖 video_id
   --force                   忽略已出题记录强制重新出题
   --concurrency N           并发数（默认 10）
@@ -101,12 +130,12 @@ const JUDGE_HELP = `npm run dm -- synth judge [选项]
 
 选项：
   --split SPLIT             按数据集分区过滤：train | dpo（test 仅供 eval 流水线）
-  --profile PROFILE         风格预设：standard（默认）| short | trap
+  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
   --video-id ID             仅处理指定 video_id 的问题
   --question-ids ID1,ID2    仅处理指定问题 ID 列表
   --only-unjudged           仅增量处理未通过且未完成的题（别名 --resume-unjudged）
-  --max-turns N             对话轮数 1-3（standard 默认 3，short/trap 默认 2）
-  --max-attempts N          每轮最大返工次数（默认 3）
+  --max-turns N             对话轮数（short/medium/trap 默认 2，long/xlong/standard 默认 3）
+  --max-attempts N          每轮最大返工尝试次数（默认 4，含初稿）
   --concurrency N           并发数（默认 10）
   --export PATH             跑完自动导出本批 JSONL
   --system TEXT / --system-file PATH   导出时注入 system 提示词
@@ -138,17 +167,27 @@ ${Object.values(SYNTH_EXPORT_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.des
   --shuffle / --seed N      打乱样本顺序与固定随机种子
   --timestamp               为输出文件名自动附加时间戳
   --system TEXT / --system-file PATH   每条样本统一注入 system 消息
+  --no-generalize-tools     关闭工具 Schema 随机泛化（固定为 web_search(query)）
+  --negative-tools-ratio F  按比例（0–1）为非搜索样本挂上通用 tools 声明但不调工具
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
   --eval-db PATH            独立评测库路径（防泄漏校验）
 `;
 
-function parseSynthProfile(raw: string | undefined): SynthProfile | undefined {
+function parseProfileList(raw: string | undefined): SynthProfile[] | undefined {
   if (raw === undefined) return undefined;
-  const profile = raw.trim() as SynthProfile;
-  if (profile !== "standard" && profile !== "short" && profile !== "trap") {
-    throw new Error(`--profile 必须为 standard、short 或 trap（收到：${raw}）`);
+  const items = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (items.length === 0) {
+    throw new Error("--profiles 不能为空");
   }
-  return profile;
+  const result: SynthProfile[] = [];
+  for (const item of items) {
+    const profile = parseOptionalSynthProfile(item)!;
+    if (!result.includes(profile)) result.push(profile);
+  }
+  return result;
 }
 
 function parseSortMode(raw: string | undefined): VideoSortMode | undefined {
@@ -185,6 +224,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         db: { type: "string" },
         "input-dir": { type: "string" },
         split: { type: "string" },
+        profile: { type: "string" },
         "max-turns": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
@@ -192,16 +232,66 @@ export async function runSynthCli(args: string[]): Promise<void> {
       allowPositionals: false,
     });
     if (values.help) {
-      console.log("用法：npm run dm -- synth status [--db PATH] [--input-dir DIR] [--split train|test|dpo] [--max-turns N]");
+      console.log("用法：npm run dm -- synth status [--db PATH] [--input-dir DIR] [--split train|test|dpo] [--profile PROFILE] [--max-turns N]");
       return;
     }
     const report = await getSynthStatus({
       dbPath: values.db,
       inputDir: values["input-dir"],
       split: values.split !== undefined ? validateSplit(values.split, "--split") : undefined,
+      profile: parseOptionalSynthProfile(values.profile),
       maxTurns: parsePositiveInt(values["max-turns"], "--max-turns"),
     });
     console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  if (sub === "suite") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        db: { type: "string" },
+        "eval-db": { type: "string" },
+        "input-dir": { type: "string" },
+        split: { type: "string" },
+        profiles: { type: "string" },
+        limit: { type: "string" },
+        sort: { type: "string" },
+        shuffle: { type: "boolean", default: false },
+        "max-attempts": { type: "string" },
+        concurrency: { type: "string" },
+        "call-attempts": { type: "string" },
+        "retry-delay-ms": { type: "string" },
+        "include-unjudged": { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      console.log(SUITE_HELP);
+      return;
+    }
+    const summary = await runSynthSuiteWorkflow({
+      dbPath: values.db,
+      evalDbPath: values["eval-db"],
+      inputDir: values["input-dir"],
+      split: values.split !== undefined ? validateSplit(values.split, "--split") : undefined,
+      profiles: parseProfileList(values.profiles),
+      limit: parsePositiveInt(values.limit, "--limit"),
+      sort: parseSortMode(values.sort),
+      shuffle: values.shuffle,
+      maxAttempts: parsePositiveInt(values["max-attempts"], "--max-attempts"),
+      concurrency: parsePositiveInt(values.concurrency, "--concurrency"),
+      callMaxAttempts: parsePositiveInt(values["call-attempts"], "--call-attempts"),
+      callRetryDelayMs: parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms"),
+      includeUnjudged: values["include-unjudged"],
+      onProgress: (msg) => console.error(msg),
+    });
+    console.log(JSON.stringify(summary, null, 2));
+    if (Number(summary.errors ?? 0) > 0 || summary.integrityOk === false) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -248,7 +338,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
     const split: DatasetSplit = values.split !== undefined
       ? validateSplit(values.split, "--split")
       : (preset?.split ?? "train");
-    const profile: SynthProfile = parseSynthProfile(values.profile) ?? preset?.profile ?? "standard";
+    const profile: SynthProfile = parseOptionalSynthProfile(values.profile) ?? preset?.profile ?? "standard";
     const sort: VideoSortMode | undefined = parseSortMode(values.sort) ?? (values.shuffle ? undefined : preset?.sort);
     const shuffle = values.shuffle || (values.sort === undefined && Boolean(preset?.shuffle));
     const maxTurns = parsePositiveInt(values["max-turns"], "--max-turns") ?? preset?.maxTurns;
@@ -301,6 +391,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         input: { type: "string" },
         "input-dir": { type: "string" },
         split: { type: "string" },
+        profile: { type: "string" },
         limit: { type: "string" },
         sort: { type: "string" },
         shuffle: { type: "boolean", default: false },
@@ -326,6 +417,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
       input: values.input,
       inputDir: values["input-dir"],
       split: values.split !== undefined ? validateSplit(values.split, "--split") : undefined,
+      profile: parseOptionalSynthProfile(values.profile),
       limit: parsePositiveInt(values.limit, "--limit"),
       sort: parseSortMode(values.sort),
       shuffle: values.shuffle,
@@ -386,7 +478,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
     const summary = await runSynthJudgeWorkflow({
       dbPath: values.db,
       split: values.split !== undefined ? validateSplit(values.split, "--split") : undefined,
-      profile: parseSynthProfile(values.profile),
+      profile: parseOptionalSynthProfile(values.profile),
       videoId: values["video-id"],
       questionIds: parseIdList(values["question-ids"], "--question-ids"),
       onlyUnjudged: values["only-unjudged"] || values["resume-unjudged"],
@@ -437,6 +529,8 @@ export async function runSynthCli(args: string[]): Promise<void> {
         timestamp: { type: "boolean", default: false },
         system: { type: "string" },
         "system-file": { type: "string" },
+        "no-generalize-tools": { type: "boolean", default: false },
+        "negative-tools-ratio": { type: "string" },
         help: { type: "boolean", short: "h", default: false },
       },
       strict: true,
@@ -479,6 +573,8 @@ export async function runSynthCli(args: string[]): Promise<void> {
       manifestPath: values.manifest,
       timestamp: values.timestamp || Boolean(preset?.timestamp),
       systemPrompt,
+      generalizeTools: !values["no-generalize-tools"],
+      negativeToolsRatio: parseFloatOpt(values["negative-tools-ratio"], "--negative-tools-ratio"),
     });
     console.log(JSON.stringify({ ...(preset ? { preset: preset.name } : {}), ...report }, null, 2));
     return;

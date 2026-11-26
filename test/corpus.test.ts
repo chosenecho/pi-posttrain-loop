@@ -12,11 +12,13 @@ import {
   loadVideoChunks,
   loadVideoUnit,
   mergeVideoParts,
+  queryProcessedVideoIndex,
   rankVideosCoreFirst,
   scanCorpusVideos,
   selectVideos,
   summarizeCorpusStatus,
 } from "../src/synth/corpus.js";
+import { runCorpusQuestionGeneration } from "../src/synth/corpus-questions.js";
 import { DataMakerStore } from "../src/synth/store/index.js";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -423,4 +425,83 @@ test("loadVideoChunks keeps normal multi-P merged and splits oversized multi-P s
   // extractVideoKey normalizes both range and single-part chunk IDs back to BV_LONG_SERIES
   assert.equal(extractVideoKey(splitChunks[0].videoId), "BV_LONG_SERIES");
   assert.equal(extractVideoKey(splitChunks[1].videoId), "BV_LONG_SERIES");
+});
+
+test("per-profile dedup allows running the same video across short, medium, long, xlong, trap independently", async (t) => {
+  const dir = await tempDir(t);
+  const videoDir = join(dir, "by_bv", "BV_MULTI_PROFILE");
+  await mkdir(videoDir, { recursive: true });
+  await writeFile(join(videoDir, "P001.md"), "这是一段用于测试多套 Skill 独立去重的视频正文。".repeat(40));
+
+  const units = await scanCorpusVideos(dir);
+  assert.equal(units.length, 1);
+
+  const store = new DataMakerStore(join(dir, "multi-profile.sqlite"));
+  try {
+    const observedMaxQuestions: Record<string, number> = {};
+    const makeRunner = (profile: string, questionText: string) =>
+      (tools: Array<{ execute: (id: string, input: unknown) => Promise<unknown> }>) =>
+        async (req: { input: Record<string, unknown> }) => {
+          observedMaxQuestions[profile] = Number(req.input.max_questions);
+          await tools[0]!.execute("call-1", {
+            video_id: req.input.video_id,
+            questions: [questionText],
+          });
+          return "saved";
+        };
+
+    const shortRes = await runCorpusQuestionGeneration({
+      store,
+      config: { baseUrl: "http://127.0.0.1/v1", apiKey: "k", modelId: "fixture", maxTokens: 256, contextWindow: 8192, timeoutMs: 5000 },
+      systemPrompt: "short-q",
+      skills: [],
+      candidates: units,
+      concurrency: 1,
+      split: "train",
+      profile: "short",
+      createRunner: makeRunner("short", "这事靠谱吗？"),
+    });
+    assert.equal(shortRes.processedVideos, 1);
+    assert.equal(shortRes.savedQuestions, 1);
+    assert.equal(observedMaxQuestions.short, 8);
+
+    // Same video is marked processed for "short" but NOT for "medium"
+    assert.equal(queryProcessedVideoIndex(store, "short").processedVideoKeys.has("BV_MULTI_PROFILE"), true);
+    assert.equal(queryProcessedVideoIndex(store, "medium").processedVideoKeys.has("BV_MULTI_PROFILE"), false);
+
+    // Running "medium" on the exact same video must NOT be skipped by sha256 or video_key
+    const mediumRes = await runCorpusQuestionGeneration({
+      store,
+      config: { baseUrl: "http://127.0.0.1/v1", apiKey: "k", modelId: "fixture", maxTokens: 256, contextWindow: 8192, timeoutMs: 5000 },
+      systemPrompt: "medium-q",
+      skills: [],
+      candidates: units,
+      concurrency: 1,
+      split: "train",
+      profile: "medium",
+      createRunner: makeRunner("medium", "这种现象背后的运作机制到底是什么？"),
+    });
+    assert.equal(mediumRes.processedVideos, 1);
+    assert.equal(mediumRes.skippedBySha256, 0);
+    assert.equal(mediumRes.savedQuestions, 1);
+    assert.equal(observedMaxQuestions.medium, 8);
+    assert.equal(queryProcessedVideoIndex(store, "medium").processedVideoKeys.has("BV_MULTI_PROFILE"), true);
+
+    // Re-running "short" without --force skips by sha256 under the same profile
+    const shortAgain = await runCorpusQuestionGeneration({
+      store,
+      config: { baseUrl: "http://127.0.0.1/v1", apiKey: "k", modelId: "fixture", maxTokens: 256, contextWindow: 8192, timeoutMs: 5000 },
+      systemPrompt: "short-q",
+      skills: [],
+      candidates: units,
+      concurrency: 1,
+      split: "train",
+      profile: "short",
+      createRunner: makeRunner("short-2", "不应被执行"),
+    });
+    assert.equal(shortAgain.processedVideos, 0);
+    assert.equal(shortAgain.skippedBySha256, 1);
+  } finally {
+    store.close();
+  }
 });

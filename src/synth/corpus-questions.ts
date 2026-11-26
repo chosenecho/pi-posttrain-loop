@@ -9,7 +9,7 @@ import {
   validateCallRetryDelayMs,
 } from "../shared/retry.js";
 import { validateConcurrency, validateSplit } from "../shared/schema.js";
-import type { DatasetSplit, RoleRunner } from "../shared/types.js";
+import { TRAIN_SUITE_PROFILES, type DatasetSplit, type RoleRunner } from "../shared/types.js";
 import {
   computeQuestionQuota,
   loadVideoChunks,
@@ -62,7 +62,7 @@ export async function runCorpusQuestionGeneration(
   const targetSplit = options.split !== undefined ? validateSplit(options.split) : undefined;
   const force = Boolean(options.force);
   const sanitizedModel = sanitizePiConfig(config);
-  const { processedSha256s } = queryProcessedVideoIndex(store);
+  const { processedSha256s } = queryProcessedVideoIndex(store, options.profile);
 
   for (const unit of candidates) {
     ensureVideoSplit(store, unit.videoId, targetSplit ? { preferredSplit: targetSplit } : {});
@@ -106,11 +106,17 @@ export async function runCorpusQuestionGeneration(
     }
     seenBatchSha256.add(loaded.sha256);
 
-    const maxQuestions = computeQuestionQuota(
-      loaded.content.length,
-      loaded.partCount,
-      options.maxQuestionsPerVideo,
-    );
+    const isSkillDrivenProfile = options.profile !== undefined
+      && (TRAIN_SUITE_PROFILES as readonly string[]).includes(options.profile.trim().toLowerCase());
+    // For the 5-profile Skill-driven suite, question count is controlled by each profile's
+    // question-design Skill; code only enforces a runaway safety ceiling (or explicit --max-questions).
+    const maxQuestions = isSkillDrivenProfile
+      ? (options.maxQuestionsPerVideo ?? 8)
+      : computeQuestionQuota(
+          loaded.content.length,
+          loaded.partCount,
+          options.maxQuestionsPerVideo,
+        );
 
     const material = store.upsertMaterial({
       videoId: loaded.videoId,

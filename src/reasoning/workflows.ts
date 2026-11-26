@@ -104,6 +104,8 @@ export async function writeReasoningExportFiles(
     systemPrompt?: string;
     shuffle?: boolean;
     seed?: number;
+    generalizeTools?: boolean;
+    negativeToolsRatio?: number;
   },
 ): Promise<Record<string, unknown>> {
   const format: ReasoningExportFormat = input.format ?? "inline";
@@ -123,6 +125,8 @@ export async function writeReasoningExportFiles(
     shuffle: Boolean(input.shuffle),
     seed: input.seed,
     valRatio: input.valRatio,
+    generalizeTools: input.generalizeTools,
+    negativeToolsRatio: input.negativeToolsRatio,
   });
 
   const trainJsonl = formatReasoningJsonl(exportResult.train.map((r) => r.sample));
@@ -183,6 +187,8 @@ export interface ReasoningExportWorkflowOptions extends ReasoningQueryFilterOpti
   systemPrompt?: string;
   shuffle?: boolean;
   seed?: number;
+  generalizeTools?: boolean;
+  negativeToolsRatio?: number;
 }
 
 export async function runReasoningExportWorkflow(
@@ -213,6 +219,8 @@ export async function runReasoningExportWorkflow(
         systemPrompt: options.systemPrompt,
         shuffle: options.shuffle,
         seed: options.seed,
+        generalizeTools: options.generalizeTools,
+        negativeToolsRatio: options.negativeToolsRatio,
       });
     }
     return report;
@@ -248,6 +256,8 @@ export interface ReasoningBackfillWorkflowOptions extends ReasoningQueryFilterOp
   expandTurns?: boolean;
   systemPrompt?: string;
   shuffle?: boolean;
+  generalizeTools?: boolean;
+  negativeToolsRatio?: number;
   env?: NodeJS.ProcessEnv;
   onProgress?: (line: string) => void;
 }
@@ -269,7 +279,7 @@ export async function runReasoningBackfillWorkflow(
     maxVerbatimRun: options.maxVerbatimRun ?? DEFAULT_REASONING_CHECK_CONFIG.maxVerbatimRun,
   };
   const concurrency = validateConcurrency(options.concurrency ?? 10);
-  const maxRewrites = options.maxRewrites ?? 3;
+  const maxRewrites = options.maxRewrites ?? 6;
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
   const writerSkillPath = resolve(options.writerSkillPath ?? DEFAULT_REASONING_WRITER_SKILL);
@@ -382,6 +392,8 @@ export async function runReasoningBackfillWorkflow(
         systemPrompt: options.systemPrompt,
         shuffle: options.shuffle,
         seed: options.seed,
+        generalizeTools: options.generalizeTools,
+        negativeToolsRatio: options.negativeToolsRatio,
       });
     }
 

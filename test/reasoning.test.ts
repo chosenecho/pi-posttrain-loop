@@ -259,7 +259,7 @@ test("deterministic safety checks only block engineering faults and leave tone/l
   assert.equal(longerThanAnswerRes.passed, true, `Thinking longer than short answer should be allowed, got: ${longerThanAnswerRes.issues.join("; ")}`);
 
   // Runaway length fuse (> maxChars) MUST block
-  const runaway = "一二三四五六七八九十".repeat(90); // 900 chars > 800
+  const runaway = "一二三四五六七八九十".repeat(160); // 1600 chars > 1500
   const runawayRes = runRuleChecks(runaway, longAnswer, "long");
   assert.equal(runawayRes.passed, false);
   assert.ok(runawayRes.issues.some((issue) => issue.includes("安全上限")));
@@ -686,10 +686,15 @@ test("reasoning-cli --help, --status, and --export-only work offline without API
 });
 
 test("ReasoningStore supports standard + short profiles together and filter parsers validate input", async (t) => {
-  assert.equal(DEFAULT_REASONING_CHECK_CONFIG.maxChars, 800);
+  assert.equal(DEFAULT_REASONING_CHECK_CONFIG.maxChars, 1500);
   assert.equal(parseProfileFilter(undefined), "all");
   assert.equal(parseProfileFilter("standard"), "standard");
   assert.equal(parseProfileFilter("short"), "short");
+  assert.equal(parseProfileFilter("medium"), "medium");
+  assert.equal(parseProfileFilter("long"), "long");
+  assert.equal(parseProfileFilter("xlong"), "xlong");
+  assert.equal(parseProfileFilter("trap"), "trap");
+  assert.equal(parseProfileFilter("search"), "search");
   assert.throws(() => parseProfileFilter("unknown"));
 
   assert.equal(parseTierFilter(undefined), undefined);
@@ -773,6 +778,11 @@ test("ReasoningStore supports standard + short profiles together and filter pars
     assert.deepEqual(status.byProfile, {
       standard: { results: 2, turns: 3, missingTurns: 3 },
       short: { results: 1, turns: 1, missingTurns: 1 },
+      medium: { results: 0, turns: 0, missingTurns: 0 },
+      long: { results: 0, turns: 0, missingTurns: 0 },
+      xlong: { results: 0, turns: 0, missingTurns: 0 },
+      trap: { results: 0, turns: 0, missingTurns: 0 },
+      search: { results: 0, turns: 0, missingTurns: 0 },
     });
 
     // Stratified selection across standard + short includes both profiles
@@ -796,7 +806,15 @@ test("ReasoningStore supports standard + short profiles together and filter pars
     }
     rStore.finishReasoningRun(runId, "completed");
     const exported = buildReasoningExportDataset(rStore, { allFormal: true, profile: "all" });
-    assert.deepEqual(exported.profileDistribution, { standard: 3, short: 1 });
+    assert.deepEqual(exported.profileDistribution, {
+      standard: 3,
+      short: 1,
+      medium: 0,
+      long: 0,
+      xlong: 0,
+      trap: 0,
+      search: 0,
+    });
   } finally {
     rStore.close();
   }

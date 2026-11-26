@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateSplit } from "../shared/schema.js";
-import type { DatasetSplit, DedupPolicy } from "../shared/types.js";
+import { ALL_SYNTH_PROFILES, type DatasetSplit, type DedupPolicy, type ToolStep } from "../shared/types.js";
 import { extractVideoKey, nowIso } from "../shared/utils.js";
 import {
   countContentChars,
@@ -70,6 +70,7 @@ export interface CandidateTurn {
   answerCharCount: number;
   lengthTier: ThinkTier;
   history: HistoryTurnMessage[];
+  toolSteps?: ToolStep[];
 }
 
 export interface CandidateTurnQueryOptions {
@@ -98,6 +99,7 @@ export interface TraceWithContext {
   question: string;
   answer: string;
   history: HistoryTurnMessage[];
+  toolSteps?: ToolStep[];
 }
 
 export interface ProfileStatusCount {
@@ -363,6 +365,49 @@ export class ReasoningStore {
     return row ? Number(row.id) : undefined;
   }
 
+  private queryAttemptToolStepsMap(attemptIds: number[]): Map<number, ToolStep[]> {
+    const map = new Map<number, ToolStep[]>();
+    if (attemptIds.length === 0 || !this.hasTable("attempt_tool_steps")) return map;
+    const uniqueIds = [...new Set(attemptIds)];
+    const placeholders = uniqueIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT attempt_id, step_no, tool_name, arguments_json, tool_output, pre_call_thought
+         FROM attempt_tool_steps
+         WHERE attempt_id IN (${placeholders})
+         ORDER BY attempt_id, step_no`,
+      )
+      .all(...uniqueIds) as Array<{
+      attempt_id: number;
+      step_no: number;
+      tool_name: string;
+      arguments_json: string;
+      tool_output: string;
+      pre_call_thought: string | null;
+    }>;
+
+    for (const row of rows) {
+      const attemptId = Number(row.attempt_id);
+      let args: Record<string, unknown> = {};
+      try {
+        args = JSON.parse(row.arguments_json) as Record<string, unknown>;
+      } catch {
+        args = {};
+      }
+      const step: ToolStep = {
+        stepNo: Number(row.step_no),
+        toolName: row.tool_name,
+        arguments: args,
+        toolOutput: row.tool_output,
+        ...(row.pre_call_thought ? { preCallThought: row.pre_call_thought } : {}),
+      };
+      const list = map.get(attemptId);
+      if (list) list.push(step);
+      else map.set(attemptId, [step]);
+    }
+    return map;
+  }
+
   /** Returns a map from attempt_id -> passed reasoning string for a specific reasoning run (or latest passed across all runs). */
   getPassedReasoningMap(reasoningRunId?: number): Map<number, { reasoning: string; reasoningRunId: number; traceId: number; lengthTier: ThinkTier }> {
     const map = new Map<number, { reasoning: string; reasoningRunId: number; traceId: number; lengthTier: ThinkTier }>();
@@ -560,6 +605,8 @@ export class ReasoningStore {
 
     const passedMap = options.onlyMissing ? this.getPassedReasoningMap(options.missingAgainstRunId) : undefined;
     const tierFilter = options.tiers && options.tiers.length > 0 ? new Set<ThinkTier>(options.tiers) : undefined;
+    const allAttemptIds = selectedDialogues.flatMap((turns) => turns.map((row) => Number(row.attempt_id)));
+    const toolStepsMap = this.queryAttemptToolStepsMap(allAttemptIds);
     const candidates: CandidateTurn[] = [];
 
     for (const turns of selectedDialogues) {
@@ -569,6 +616,7 @@ export class ReasoningStore {
         const attemptId = Number(row.attempt_id);
         const answerCharCount = countContentChars(row.assistant_content);
         const lengthTier = inferThinkTier(answerCharCount);
+        const toolSteps = toolStepsMap.get(attemptId);
         if ((!passedMap || !passedMap.has(attemptId)) && (!tierFilter || tierFilter.has(lengthTier))) {
           candidates.push({
             resultId: Number(row.result_id),
@@ -586,6 +634,7 @@ export class ReasoningStore {
             answerCharCount,
             lengthTier,
             history: history.map((m) => ({ ...m })),
+            ...(toolSteps && toolSteps.length > 0 ? { toolSteps } : {}),
           });
         }
         history.push({ role: "user", content: row.user_content });
@@ -645,6 +694,7 @@ export class ReasoningStore {
       if (list) list.push(row);
       else turnsByResult.set(rid, [row]);
     }
+    const toolStepsMap = this.queryAttemptToolStepsMap(traces.map((t) => Number(t.attempt_id)));
 
     const output: TraceWithContext[] = [];
     for (const trace of traces) {
@@ -661,6 +711,7 @@ export class ReasoningStore {
         }
       }
       if (!currentRow) continue;
+      const toolSteps = toolStepsMap.get(Number(trace.attempt_id));
       output.push({
         trace,
         sourceRunId: Number(currentRow.run_id),
@@ -673,6 +724,7 @@ export class ReasoningStore {
         question: currentRow.user_content,
         answer: currentRow.assistant_content,
         history,
+        ...(toolSteps && toolSteps.length > 0 ? { toolSteps } : {}),
       });
     }
 
@@ -684,14 +736,12 @@ export class ReasoningStore {
     const passedMap = this.getPassedReasoningMap();
     const byTier: Record<ThinkTier, number> = { short: 0, medium: 0, long: 0 };
     const byTurnNo: Record<number, number> = {};
-    const byProfile: Record<SourceProfile, ProfileStatusCount> = {
-      standard: { results: 0, turns: 0, missingTurns: 0 },
-      short: { results: 0, turns: 0, missingTurns: 0 },
-    };
-    const profileResultIds: Record<SourceProfile, Set<number>> = {
-      standard: new Set<number>(),
-      short: new Set<number>(),
-    };
+    const byProfile = Object.fromEntries(
+      ALL_SYNTH_PROFILES.map((p) => [p, { results: 0, turns: 0, missingTurns: 0 }]),
+    ) as Record<SourceProfile, ProfileStatusCount>;
+    const profileResultIds = Object.fromEntries(
+      ALL_SYNTH_PROFILES.map((p) => [p, new Set<number>()]),
+    ) as Record<SourceProfile, Set<number>>;
     const resultIds = new Set<number>();
     let missingTurns = 0;
 
@@ -706,8 +756,9 @@ export class ReasoningStore {
         byProfile[c.sourceProfile].missingTurns++;
       }
     }
-    byProfile.standard.results = profileResultIds.standard.size;
-    byProfile.short.results = profileResultIds.short.size;
+    for (const p of ALL_SYNTH_PROFILES) {
+      byProfile[p].results = profileResultIds[p].size;
+    }
 
     const runs = this.listReasoningRuns();
     const reasoningRuns = runs.map((run) => {

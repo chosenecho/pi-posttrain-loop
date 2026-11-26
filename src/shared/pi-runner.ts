@@ -1,10 +1,11 @@
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels, createProvider, type Model } from "@earendil-works/pi-ai";
 import * as completions from "@earendil-works/pi-ai/api/openai-completions";
-import type { DialogueRole, RoleRunner } from "./types.js";
+import type { DialogueRole, RoleRunner, SearchAnswerResult, SearchAnswerRunner, ToolStep } from "./types.js";
 import { nonEmpty } from "./schema.js";
 import { PublicError, toPublicError } from "./public-error.js";
 import { normalizeApiBaseUrl, resolveApiEndpoint } from "./api-config.js";
+import { createWebSearchAgentTool, type CreateWebSearchToolOptions, type WebSearchRunner } from "./web-search.js";
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high" | "max";
 
@@ -174,6 +175,135 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
       const text = last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
       if (!text.trim()) throw new PublicError("model_empty_output", { httpStatus });
       return text;
+    } catch (error) {
+      if (error instanceof PublicError) throw error;
+      throw new PublicError(timeout.aborted ? "model_timeout" : "model_request_failed", {
+        httpStatus: httpStatus ?? toPublicError(error).httpStatus,
+      });
+    }
+  };
+}
+
+export interface PiSearchRunnerOptions {
+  /** Max web_search calls per answer attempt (default 3). */
+  maxSearchCalls?: number;
+  /** Result count per web_search call (default 5). */
+  searchCount?: number;
+  searchContextSize?: CreateWebSearchToolOptions["searchContextSize"];
+}
+
+/**
+ * Multi-step Pi runner for `search` profile answers: mounts `web_search` backed by
+ * `WebSearchRunner`, lets the model search and consume tool outputs, and captures
+ * every tool step (plus any pre-call thinking block) alongside the final text answer.
+ */
+export function createPiSearchRunner(
+  config: PiConfig,
+  webSearchRunner: WebSearchRunner,
+  options: PiSearchRunnerOptions = {},
+): SearchAnswerRunner {
+  const model: Model<"openai-completions"> = {
+    id: config.modelId,
+    name: config.modelId,
+    provider: "pi-posttrain-loop",
+    api: "openai-completions",
+    baseUrl: config.baseUrl,
+    input: ["text"],
+    reasoning: true,
+    thinkingLevelMap: { max: "max" },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    compat: {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
+      maxTokensField: "max_tokens",
+    },
+  };
+  const models = createModels();
+  models.setProvider(createProvider({
+    id: "pi-posttrain-loop",
+    baseUrl: config.baseUrl,
+    auth: { apiKey: {
+      name: "LLM_API_KEY",
+      resolve: async () => ({ auth: { apiKey: config.apiKey }, source: "LLM_API_KEY" }),
+    } },
+    models: [model],
+    api: completions,
+  }));
+
+  const maxSearchCalls = Math.max(1, Math.floor(options.maxSearchCalls ?? 3));
+
+  return async ({ role, systemPrompt, input }): Promise<SearchAnswerResult> => {
+    let httpStatus: number | undefined;
+    const timeout = AbortSignal.timeout(config.timeoutMs);
+    const thinkingLevel = config.roleThinkingLevels?.[role as DialogueRole] ?? config.thinkingLevel ?? "high";
+    const capturedSteps: ToolStep[] = [];
+    let toolRounds = 0;
+
+    const searchTool = createWebSearchAgentTool(webSearchRunner, {
+      maxCalls: maxSearchCalls,
+      count: options.searchCount,
+      searchContextSize: options.searchContextSize,
+      onStep: (step) => {
+        capturedSteps.push(step);
+      },
+    });
+
+    const agent = new Agent({
+      initialState: { systemPrompt, model, tools: [searchTool], thinkingLevel },
+      finishTurn: (turn) => {
+        if (turn.toolResults.length === 0) return { action: "end" };
+        toolRounds++;
+        // Extract any thinking emitted right before this tool-call batch
+        const thinkingText = turn.message.content
+          .filter((part): part is { type: "thinking"; thinking: string } => part.type === "thinking" && "thinking" in part)
+          .map((part) => part.thinking.trim())
+          .filter(Boolean)
+          .join("\n");
+        if (thinkingText) {
+          const batchStart = Math.max(0, capturedSteps.length - turn.toolResults.length);
+          for (let i = batchStart; i < capturedSteps.length; i++) {
+            if (!capturedSteps[i]!.preCallThought) {
+              capturedSteps[i]!.preCallThought = thinkingText;
+            }
+          }
+        }
+        if (toolRounds > maxSearchCalls + 1) {
+          return { action: "end" };
+        }
+        return undefined;
+      },
+      streamFn: (selectedModel, context, streamOptions) => models.streamSimple(selectedModel, context, {
+        ...streamOptions,
+        signal: streamOptions?.signal ? AbortSignal.any([streamOptions.signal, timeout]) : timeout,
+        maxTokens: config.maxTokens,
+        timeoutMs: config.timeoutMs,
+        maxRetries: 0,
+        fetch: async (request, init) => {
+          const response = await globalThis.fetch(request, { ...init, redirect: "manual" });
+          httpStatus = response.status;
+          return response;
+        },
+      }),
+    });
+
+    try {
+      await agent.prompt(JSON.stringify(input));
+      const last = agent.state.messages.findLast((message) => message.role === "assistant");
+      if (!last || last.role !== "assistant") {
+        throw new PublicError("model_missing_message", { httpStatus });
+      }
+      if (last.stopReason !== "stop") {
+        throw new PublicError(timeout.aborted ? "model_timeout" : "model_incomplete", { httpStatus, stopReason: last.stopReason });
+      }
+      const text = last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+      if (!text.trim()) throw new PublicError("model_empty_output", { httpStatus });
+      return {
+        answer: text,
+        toolSteps: capturedSteps,
+      };
     } catch (error) {
       if (error instanceof PublicError) throw error;
       throw new PublicError(timeout.aborted ? "model_timeout" : "model_request_failed", {

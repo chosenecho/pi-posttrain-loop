@@ -1,18 +1,23 @@
+import { ALL_SYNTH_PROFILES, type SynthProfile } from "../shared/types.js";
+
 export type ThinkTier = "short" | "medium" | "long";
-export type SourceProfile = "standard" | "short";
+export type SourceProfile = SynthProfile;
 export type ProfileFilter = "all" | SourceProfile;
 
 export function normalizeSourceProfile(raw: string | null | undefined): SourceProfile {
   const normalized = (raw ?? "standard").trim().toLowerCase();
-  return normalized === "short" ? "short" : "standard";
+  if ((ALL_SYNTH_PROFILES as readonly string[]).includes(normalized)) {
+    return normalized as SourceProfile;
+  }
+  return "standard";
 }
 
 export function parseProfileFilter(raw: string | undefined, label = "--profile"): ProfileFilter {
   const normalized = (raw ?? "all").trim().toLowerCase();
-  if (normalized === "all" || normalized === "standard" || normalized === "short") {
-    return normalized;
+  if (normalized === "all" || (ALL_SYNTH_PROFILES as readonly string[]).includes(normalized)) {
+    return normalized as ProfileFilter;
   }
-  throw new Error(`${label} 仅支持 all、standard 或 short，当前值：${raw}`);
+  throw new Error(`${label} 仅支持 all、${ALL_SYNTH_PROFILES.join("、")}，当前值：${raw}`);
 }
 
 export function parseTierFilter(raw: string | undefined, label = "--tier"): ThinkTier[] | undefined {
@@ -45,7 +50,7 @@ export interface ReasoningCheckConfig {
 }
 
 export const DEFAULT_REASONING_CHECK_CONFIG: ReasoningCheckConfig = {
-  maxChars: 800,
+  maxChars: 1500,
   maxVerbatimRun: 36,
 };
 

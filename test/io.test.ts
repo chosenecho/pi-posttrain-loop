@@ -4,20 +4,14 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
+  getProfileSkillPaths,
   readAnswerStyle,
   readFollowupSkill,
   readMaterials,
   readQuestionSkill,
   readRubric,
-  SHORT_ANSWER_STYLE,
-  SHORT_FOLLOWUP_SKILL,
-  SHORT_QUALITY_JUDGE,
-  SHORT_QUESTION_SKILL,
-  TRAP_ANSWER_STYLE,
-  TRAP_FOLLOWUP_SKILL,
-  TRAP_QUALITY_JUDGE,
-  TRAP_QUESTION_SKILL,
 } from "../src/synth/skills.js";
+import { TRAIN_SUITE_PROFILES } from "../src/shared/types.js";
 
 async function workspace(t: TestContext): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "data-maker-io-"));
@@ -75,28 +69,18 @@ test("ready Skill requires actual rule text instead of leftover TODO or placehol
   assert.equal((await readRubric(path)).status, "ready");
 });
 
-test("short profile train skills all load cleanly with status ready", async () => {
-  const [q, a, f, j] = await Promise.all([
-    readQuestionSkill(SHORT_QUESTION_SKILL),
-    readAnswerStyle(SHORT_ANSWER_STYLE),
-    readFollowupSkill(SHORT_FOLLOWUP_SKILL),
-    readRubric(SHORT_QUALITY_JUDGE),
-  ]);
-  for (const skill of [q, a, f, j]) {
-    assert.equal(skill.status, "ready");
-    assert.ok(skill.body.length > 100);
-  }
-});
-
-test("trap profile train skills all load cleanly with status ready", async () => {
-  const [q, a, f, j] = await Promise.all([
-    readQuestionSkill(TRAP_QUESTION_SKILL),
-    readAnswerStyle(TRAP_ANSWER_STYLE),
-    readFollowupSkill(TRAP_FOLLOWUP_SKILL),
-    readRubric(TRAP_QUALITY_JUDGE),
-  ]);
-  for (const skill of [q, a, f, j]) {
-    assert.equal(skill.status, "ready");
-    assert.ok(skill.body.length > 100);
+test("all 6 train suite profile skills (short, medium, long, xlong, trap, search) load cleanly with status ready", async () => {
+  for (const profile of TRAIN_SUITE_PROFILES) {
+    const paths = getProfileSkillPaths(profile);
+    const [q, a, f, j] = await Promise.all([
+      readQuestionSkill(paths.questionSkill),
+      readAnswerStyle(paths.answerStyle),
+      readFollowupSkill(paths.followupSkill),
+      readRubric(paths.qualityJudge),
+    ]);
+    for (const skill of [q, a, f, j]) {
+      assert.equal(skill.status, "ready", `${profile} skill should be ready`);
+      assert.ok(skill.body.length > 100, `${profile} skill body should be non-trivial`);
+    }
   }
 });

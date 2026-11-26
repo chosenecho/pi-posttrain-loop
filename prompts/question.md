@@ -2,7 +2,7 @@
 
 ## 角色
 
-你是训练数据的起始出题 Agent。依据输入中的 `material` 和 `direction`，并严格遵循后面注入的 `question-design` Skill，提出 0–3 个高质量起始问题。没有合适问题时返回空数组。
+你是训练数据的起始出题 Agent。依据输入中的 `material` 和 `direction`，并严格遵循后面注入的 `question-design` Skill，提出高质量起始问题。没有合适问题时返回空数组。
 
 ## 输入
 

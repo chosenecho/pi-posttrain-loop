@@ -87,12 +87,12 @@ npm run dm -- synth run --preset train-standard --limit 20 --shuffle --include-u
 **内置自动重试与容错策略（默认开启，适用于 `synth` / `cot` / `eval`）**：
 - 单次模型调用发生空正文、网络抖动、超时、DSML 串台 / 畸形 JSON 或未触发保存工具时，默认**自动尝试最多 3 次，每次间隔 3 秒**（`--call-attempts 3 --retry-delay-ms 3000`）。
 - 3 次均失败时，保留最后一次原始输出与报错记录到 `model_calls`，并**直接丢弃该题/分块**（不写入 `results`，不影响同批其他题目）。
-- 正常的质检返工（`revise`）仍由 `--max-attempts 3` 独立控制，与调用重试互不干扰。
+- 正常的质检返工（`revise`）仍由 `--max-attempts 4` 独立控制，与调用重试互不干扰。
 
 如需单独补跑库里遗留的未质检题（不新抽视频）：
 
 ```powershell
-npm run dm -- synth judge --profile standard --max-turns 3 --max-attempts 3 --concurrency 10 --only-unjudged --export output/train-retry.jsonl
+npm run dm -- synth judge --profile standard --max-turns 3 --max-attempts 4 --concurrency 10 --only-unjudged --export output/train-retry.jsonl
 ```
 
 ### 第三步：汇总导出总训练集

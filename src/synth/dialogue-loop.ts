@@ -14,7 +14,7 @@ import {
   validateMaxAttempts,
   validateMaxTurns,
 } from "../shared/schema.js";
-import type { DatasetSplit, RoleRunner, TrainingMessage } from "../shared/types.js";
+import type { DatasetSplit, RoleRunner, SearchAnswerResult, SearchAnswerRunner, ToolStep, TrainingMessage } from "../shared/types.js";
 import type { DataMakerStore, TargetQuestionRow } from "./store/index.js";
 
 export type LoadedQuestion = TargetQuestionRow;
@@ -28,6 +28,8 @@ export interface DialoguePrompts {
 export interface RunDialogueBatchOptions {
   store: DataMakerStore;
   runRole: RoleRunner;
+  /** Optional multi-step tool-enabled answer runner used by `search` profile. */
+  runSearchAnswer?: SearchAnswerRunner;
   prompts: DialoguePrompts;
   maxAttempts: number;
   maxTurns: number;
@@ -64,6 +66,7 @@ export function loadTargetQuestions(
     onlyUnjudged?: boolean;
     maxTurns?: number;
     split?: DatasetSplit;
+    generationProfile?: string;
   },
 ): LoadedQuestion[] {
   return store.queryTargetQuestions(filter);
@@ -234,23 +237,76 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
 
         const attemptTag = `[q${item.id}:t${turnNo}/${maxTurns}:a${attemptNo}]`;
         let answerText: string;
+        let attemptToolSteps: ToolStep[] = [];
         try {
-          const answerCall = await invokeTracked({
-            role: "answer",
-            materialId: item.materialId,
-            systemPrompt: answerPrompt,
-            turnId,
-            attemptId,
-            inputRefs: answerInputRefs,
-            wireInput: answerWireInput,
-            parse: (raw) => nonEmpty(raw, "回答"),
-            progressPrefix: attemptTag,
-          });
-          answerText = answerCall.parsed;
-          store.transaction(() => {
-            store.finishModelCall(answerCall.callId, answerCall.output);
-            store.recordAttemptAnswer(attemptId, answerText);
-          });
+          if (options.runSearchAnswer) {
+            const callId = store.startModelCall({
+              runId,
+              role: "answer",
+              turnId,
+              attemptId,
+              inputRefs: answerInputRefs,
+            });
+            let lastRawOutput: string | undefined;
+            try {
+              const searchRes: SearchAnswerResult = await runWithRetry({
+                maxAttempts: callMaxAttempts,
+                delayMs: callRetryDelayMs,
+                run: async () => {
+                  lastRawOutput = undefined;
+                  const result = await warmupGate.run(`${item.materialId}:answer`, warmupEnabled, () =>
+                    options.runSearchAnswer!({
+                      role: "answer",
+                      systemPrompt: answerPrompt,
+                      input: answerWireInput,
+                    }),
+                  );
+                  lastRawOutput = result.answer;
+                  return {
+                    answer: nonEmpty(result.answer, "回答"),
+                    toolSteps: result.toolSteps,
+                  };
+                },
+                onRetry: (attempt, max, error) => {
+                  const delayText = callRetryDelayMs % 1000 === 0
+                    ? `${callRetryDelayMs / 1000}s`
+                    : `${callRetryDelayMs}ms`;
+                  options.onProgress?.(
+                    `${attemptTag} answer(search) 调用失败（第 ${attempt}/${max} 次），${delayText} 后重试：${publicErrorMessage(error)}`,
+                  );
+                },
+              });
+              answerText = searchRes.answer;
+              attemptToolSteps = searchRes.toolSteps;
+              store.transaction(() => {
+                store.finishModelCall(callId, answerText);
+                store.recordAttemptAnswer(attemptId, answerText);
+                store.recordAttemptToolSteps(attemptId, attemptToolSteps);
+              });
+            } catch (error) {
+              const publicMsg = publicErrorMessage(error);
+              const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${publicMsg}` : publicMsg;
+              store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
+              throw toPublicError(error);
+            }
+          } else {
+            const answerCall = await invokeTracked({
+              role: "answer",
+              materialId: item.materialId,
+              systemPrompt: answerPrompt,
+              turnId,
+              attemptId,
+              inputRefs: answerInputRefs,
+              wireInput: answerWireInput,
+              parse: (raw) => nonEmpty(raw, "回答"),
+              progressPrefix: attemptTag,
+            });
+            answerText = answerCall.parsed;
+            store.transaction(() => {
+              store.finishModelCall(answerCall.callId, answerCall.output);
+              store.recordAttemptAnswer(attemptId, answerText);
+            });
+          }
         } catch (error) {
           const msg = publicErrorMessage(error);
           store.transaction(() => {
@@ -270,11 +326,22 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             ? { question: { question_id: item.id, field: "question" } }
             : { history: [...historyRefs], user: { turn_id: turnId, field: "user_content" } }),
           answer: { attempt_id: attemptId, field: "answer" },
+          ...(attemptToolSteps.length > 0 ? { toolSteps: { attempt_id: attemptId, count: attemptToolSteps.length } } : {}),
         };
         const judgeWireInput: Record<string, unknown> = {
           material: item.materialContent,
           ...(historyMessages.length > 0 ? { history: [...historyMessages] } : {}),
           question: currentUserContent,
+          ...(attemptToolSteps.length > 0
+            ? {
+                toolSteps: attemptToolSteps.map((s) => ({
+                  stepNo: s.stepNo,
+                  toolName: s.toolName,
+                  arguments: s.arguments,
+                  toolOutput: s.toolOutput,
+                })),
+              }
+            : {}),
           answer: answerText,
         };
 

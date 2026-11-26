@@ -321,11 +321,14 @@ export async function resolveSingleVideoInput(
   };
 }
 
-export function queryProcessedVideoIndex(store: DataMakerStore): {
+export function queryProcessedVideoIndex(
+  store: DataMakerStore,
+  profile?: string,
+): {
   processedVideoKeys: Set<string>;
   processedSha256s: Set<string>;
 } {
-  const rows = store.listProcessedVideoRows();
+  const rows = store.listProcessedVideoRows(profile);
   const processedVideoKeys = new Set<string>();
   const processedSha256s = new Set<string>();
   for (const row of rows) {
@@ -335,8 +338,12 @@ export function queryProcessedVideoIndex(store: DataMakerStore): {
   return { processedVideoKeys, processedSha256s };
 }
 
-export function summarizeCorpusStatus(units: VideoUnit[], store: DataMakerStore): CorpusStatus {
-  const { processedVideoKeys } = queryProcessedVideoIndex(store);
+export function summarizeCorpusStatus(
+  units: VideoUnit[],
+  store: DataMakerStore,
+  profile?: string,
+): CorpusStatus {
+  const { processedVideoKeys } = queryProcessedVideoIndex(store, profile);
   let totalPartFiles = 0;
   let multiPartVideos = 0;
   const unprocessed: VideoUnit[] = [];

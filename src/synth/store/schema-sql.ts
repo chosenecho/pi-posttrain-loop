@@ -56,6 +56,7 @@ export interface ResultTurnRow {
   material_id: number;
   turn_count: number;
   turn_no: number;
+  attempt_id: number;
   user_content: string;
   assistant_content: string;
   attempt_no: number;
@@ -63,6 +64,9 @@ export interface ResultTurnRow {
 
 export interface ExportOptions {
   systemPrompt?: string;
+  generalizeTools?: boolean;
+  negativeToolsRatio?: number;
+  seed?: number;
 }
 
 export interface MergedExportOptions extends ExportOptions {
@@ -279,6 +283,20 @@ CREATE TABLE IF NOT EXISTS results (
   turn_count INTEGER NOT NULL CHECK(turn_count >= 1),
   created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0)
 );
+
+CREATE TABLE IF NOT EXISTS attempt_tool_steps (
+  id INTEGER PRIMARY KEY,
+  attempt_id INTEGER NOT NULL REFERENCES attempts(id),
+  step_no INTEGER NOT NULL CHECK(step_no >= 1),
+  tool_name TEXT NOT NULL CHECK(length(trim(tool_name)) > 0),
+  arguments_json TEXT NOT NULL CHECK(json_valid(arguments_json) AND json_type(arguments_json) = 'object'),
+  tool_output TEXT NOT NULL,
+  pre_call_thought TEXT,
+  created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
+  UNIQUE(attempt_id, step_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_attempt_tool_steps_attempt_id ON attempt_tool_steps(attempt_id);
 
 CREATE INDEX IF NOT EXISTS idx_questions_material_id ON questions(material_id);
 CREATE INDEX IF NOT EXISTS idx_run_items_question_id ON run_items(question_id);

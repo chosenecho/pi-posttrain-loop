@@ -1,9 +1,10 @@
-import type {
-  DatasetSplit,
-  FollowupDecision,
-  Material,
-  Review,
-  SynthProfile,
+import {
+  ALL_SYNTH_PROFILES,
+  type DatasetSplit,
+  type FollowupDecision,
+  type Material,
+  type Review,
+  type SynthProfile,
 } from "./types.js";
 
 export function asObject(value: unknown, label: string): Record<string, unknown> {
@@ -113,10 +114,17 @@ export function validateSplit(value: unknown, label = "split"): DatasetSplit {
   return value;
 }
 
+export function parseOptionalSynthProfile(raw: string | undefined): SynthProfile | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim().toLowerCase();
+  if ((ALL_SYNTH_PROFILES as readonly string[]).includes(value)) {
+    return value as SynthProfile;
+  }
+  throw new Error(`--profile 仅支持 ${ALL_SYNTH_PROFILES.join("、")}，当前值：${raw}`);
+}
+
 export function parseSynthProfile(raw: string | undefined): SynthProfile {
-  const value = (raw ?? "standard").trim().toLowerCase();
-  if (value === "standard" || value === "short" || value === "trap") return value;
-  throw new Error(`--profile 仅支持 standard、short 或 trap，当前值：${raw}`);
+  return parseOptionalSynthProfile(raw) ?? "standard";
 }
 
 export function errorMessage(error: unknown): string {

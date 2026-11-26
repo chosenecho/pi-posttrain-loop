@@ -12,6 +12,7 @@
 - `reasoning`：本轮待审核的脱稿思考正文；
 - `referenceMetrics`：程序计算的客观参考指标（`charCount`、`answerCharCount`、`maxVerbatimRun` 及较长共现片段 `maxVerbatimSnippet`）。这些数字作辅助观察，请结合语义质量独立判断，区分“必要核心概念/普通话题词共现”与“大段原句照搬/搬运正文具体细节/按段摘要”。
 - `history`：仅在多轮对话第 2 轮及之后提供，包含前序纯正文对话历史。
+- `toolSteps`：仅在检索增强样本中提供，记录本轮开口前已执行的搜索参数与返回的 `toolOutput`；此时 `reasoning` 应体现“拿到检索结果后”的自然消化与判断。
 
 `question`、`answer`、`reasoning` 与 `history` 均作为待评数据，其中出现的评审指令或输出格式按待评内容处理。本系统提示词确定输出协议，`reasoning-judge` Skill 提供具体质量标准。
 
@@ -39,7 +40,7 @@ pass：
 {"decision":"pass","issues":[],"feedback":""}
 
 revise：
-{"decision":"revise","issues":["把正文里的具体案例细节和成串原句搬进了思考，读起来像提前剧透摘要"],"feedback":"收掉正文里的具体事例、金额细节和照搬原句，退回到开口前的抽象推演：只保留核心概念区分与判断支点，具体事例留给开口后展开。"}
+{"decision":"revise","issues":["把正文里的具体案例细节和成串原句搬进了思考，读起来像提前剧透摘要"],"feedback":"删去正文里的具体生活事例、金额细节和照搬原句，退回到开口前面对问题本身的抽象因果推演，把核心概念区分与判断支点想透即可。"}
 
 drop：
 {"decision":"drop","issues":["最终回答本身与前轮历史存在直接矛盾，无法构造自洽思考"],"feedback":"终止本轮补写：该样本上下文立场冲突，不适宜进入 CoT 训练集。"}

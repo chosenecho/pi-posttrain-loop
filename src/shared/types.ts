@@ -7,7 +7,27 @@ export type DatasetSplit = "train" | "test" | "dpo";
 export type SplitAssignMethod = "backfill" | "hash" | "manual";
 export type DedupPolicy = "latest" | "earliest" | "error";
 
-export type SynthProfile = "standard" | "short" | "trap";
+export type SynthProfile = "standard" | "short" | "medium" | "long" | "xlong" | "trap" | "search";
+
+export const ALL_SYNTH_PROFILES = [
+  "standard",
+  "short",
+  "medium",
+  "long",
+  "xlong",
+  "trap",
+  "search",
+] as const;
+
+/** The 6 Skill-driven length/type profiles run per video so train distribution emerges naturally. */
+export const TRAIN_SUITE_PROFILES = [
+  "short",
+  "medium",
+  "long",
+  "xlong",
+  "trap",
+  "search",
+] as const;
 
 export type Role = "question" | "answer" | "judge";
 export type DialogueRole = Role | "followup";
@@ -59,12 +79,52 @@ export interface Review {
   feedback: string;
 }
 
+export interface ToolStep {
+  stepNo: number;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  toolOutput: string;
+  preCallThought?: string | null;
+}
+
+export interface SearchAnswerResult {
+  answer: string;
+  toolSteps: ToolStep[];
+}
+
+export type SearchAnswerRunner = (request: RoleRequest) => Promise<SearchAnswerResult>;
+
+export interface ToolFunctionDefinition {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolDefinition {
+  type: "function";
+  function: ToolFunctionDefinition;
+}
+
+export interface TrainingToolCall {
+  id?: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
 export interface TrainingMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: TrainingToolCall[];
+  reasoning_content?: string;
 }
 
 export interface TrainingSampleLine {
+  tools?: ToolDefinition[];
   messages: TrainingMessage[];
 }
 

@@ -4,7 +4,11 @@ import type { VideoSortMode } from "./corpus.js";
 export type SynthRunPresetName =
   | "train-standard"
   | "train-short"
+  | "train-medium"
+  | "train-long"
+  | "train-xlong"
   | "train-trap"
+  | "train-search"
   | "dpo-pool";
 
 export interface SynthRunPreset {
@@ -21,7 +25,7 @@ export interface SynthRunPreset {
 export const SYNTH_RUN_PRESETS: Record<SynthRunPresetName, SynthRunPreset> = {
   "train-standard": {
     name: "train-standard",
-    description: "训练集标准深挖预设（train 分区 + standard Skill + core-first 排序 + 3 轮）",
+    description: "训练集标准综合预设（历史兼容，train 分区 + standard Skill + core-first + 3 轮）",
     split: "train",
     profile: "standard",
     sort: "core-first",
@@ -29,20 +33,53 @@ export const SYNTH_RUN_PRESETS: Record<SynthRunPresetName, SynthRunPreset> = {
   },
   "train-short": {
     name: "train-short",
-    description: "训练集短答快问预设（train 分区 + short Skill + 随机抽选 + 2 轮）",
+    description: "训练集短答预设（目标占比 ~5%，train 分区 + short Skill + core-first + 最多 2 轮）",
     split: "train",
     profile: "short",
-    shuffle: true,
+    sort: "core-first",
     maxTurns: 2,
+  },
+  "train-medium": {
+    name: "train-medium",
+    description: "训练集中等长度预设（目标占比 ~20%，train 分区 + medium Skill + core-first + 最多 2 轮）",
+    split: "train",
+    profile: "medium",
+    sort: "core-first",
+    maxTurns: 2,
+  },
+  "train-long": {
+    name: "train-long",
+    description: "训练集长答预设（目标占比 ~25%，train 分区 + long Skill + core-first + 最多 3 轮）",
+    split: "train",
+    profile: "long",
+    sort: "core-first",
+    maxTurns: 3,
+  },
+  "train-xlong": {
+    name: "train-xlong",
+    description: "训练集超长深挖预设（目标占比 ~30%，train 分区 + xlong Skill + core-first + 最多 3 轮）",
+    split: "train",
+    profile: "xlong",
+    sort: "core-first",
+    maxTurns: 3,
   },
   "train-trap": {
     name: "train-trap",
-    description: "训练集陷阱拒答预设（train 分区 + trap Skill + 随机抽选 + 2 轮 + 上限 3 题）",
+    description: "训练集陷阱拒答预设（客观不可答，train 分区 + trap Skill + core-first + 最多 2 轮 + 上限 2 题）",
     split: "train",
     profile: "trap",
-    shuffle: true,
+    sort: "core-first",
     maxTurns: 2,
-    maxQuestionsPerVideo: 3,
+    maxQuestionsPerVideo: 2,
+  },
+  "train-search": {
+    name: "train-search",
+    description: "训练集搜索增强预设（联网搜证后回答，train 分区 + search Skill + core-first + 最多 2 轮 + 上限 2 题）",
+    split: "train",
+    profile: "search",
+    sort: "core-first",
+    maxTurns: 2,
+    maxQuestionsPerVideo: 2,
   },
   "dpo-pool": {
     name: "dpo-pool",
