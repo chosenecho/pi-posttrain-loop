@@ -1,12 +1,14 @@
 import type {
   DatasetSplit,
   DedupPolicy,
+  QuestionMode,
+  QuestionTaskSpec,
   SplitAssignMethod,
   TrainingMessage,
   TrainingSampleLine,
 } from "../../shared/types.js";
 
-export type { DedupPolicy, TrainingMessage, TrainingSampleLine };
+export type { DedupPolicy, QuestionMode, QuestionTaskSpec, TrainingMessage, TrainingSampleLine };
 
 export type RunKind = "question_generation" | "answer_judge";
 export type RunStatus = "running" | "completed" | "interrupted" | "error";
@@ -30,6 +32,8 @@ export interface QuestionRecord {
   material_id: number;
   question: string;
   generation_run_id: number | null;
+  question_mode?: QuestionMode;
+  task_spec_json?: string | null;
   created_at: string;
 }
 
@@ -52,7 +56,9 @@ export interface RunRecord {
 export interface ResultTurnRow {
   result_id: number;
   run_id: number;
+  run_profile?: string | null;
   question_id: number;
+  question_mode?: QuestionMode | null;
   material_id: number;
   turn_count: number;
   turn_no: number;
@@ -66,6 +72,7 @@ export interface ExportOptions {
   systemPrompt?: string;
   generalizeTools?: boolean;
   negativeToolsRatio?: number;
+  alwaysDeclareSearch?: boolean;
   seed?: number;
 }
 
@@ -146,6 +153,8 @@ export interface TargetQuestionRow {
   videoId: string;
   materialContent: string;
   question: string;
+  questionMode?: QuestionMode;
+  taskSpec?: QuestionTaskSpec | null;
 }
 
 export function formatSamplesJsonl(samples: TrainingSampleLine[]): string {
@@ -199,6 +208,8 @@ CREATE TABLE IF NOT EXISTS questions (
   material_id INTEGER NOT NULL REFERENCES materials(id),
   question TEXT NOT NULL CHECK(length(trim(question)) > 0),
   generation_run_id INTEGER REFERENCES runs(id),
+  question_mode TEXT NOT NULL DEFAULT 'direct' CHECK(question_mode IN ('direct', 'todo_plan', 'clarify_question')),
+  task_spec_json TEXT CHECK(task_spec_json IS NULL OR (json_valid(task_spec_json) AND json_type(task_spec_json) = 'object')),
   created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0),
   UNIQUE(material_id, question)
 );

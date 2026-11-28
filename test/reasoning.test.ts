@@ -783,6 +783,8 @@ test("ReasoningStore supports standard + short profiles together and filter pars
       xlong: { results: 0, turns: 0, missingTurns: 0 },
       trap: { results: 0, turns: 0, missingTurns: 0 },
       search: { results: 0, turns: 0, missingTurns: 0 },
+      todo: { results: 0, turns: 0, missingTurns: 0 },
+      clarify: { results: 0, turns: 0, missingTurns: 0 },
     });
 
     // Stratified selection across standard + short includes both profiles
@@ -814,6 +816,8 @@ test("ReasoningStore supports standard + short profiles together and filter pars
       xlong: 0,
       trap: 0,
       search: 0,
+      todo: 0,
+      clarify: 0,
     });
   } finally {
     rStore.close();

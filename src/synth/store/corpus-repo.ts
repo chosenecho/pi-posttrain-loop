@@ -1,8 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateSplit } from "../../shared/schema.js";
-import type { DatasetSplit, SplitAssignMethod } from "../../shared/types.js";
+import type { DatasetSplit, QuestionMode, QuestionTaskSpec, SplitAssignMethod } from "../../shared/types.js";
 import { extractVideoKey, normalizeText, nowIso, sha256Hex } from "../../shared/utils.js";
-import type { MaterialRecord, QuestionRecord, VideoSplitRecord } from "./schema-sql.js";
+import { assertObjectJson, type MaterialRecord, type QuestionRecord, type VideoSplitRecord } from "./schema-sql.js";
 
 export class CorpusRepository {
   constructor(
@@ -108,14 +108,23 @@ export class CorpusRepository {
     materialId: number;
     question: string;
     generationRunId?: number | null;
+    questionMode?: QuestionMode;
+    taskSpec?: QuestionTaskSpec | null;
     createdAt?: string;
   }): { record: QuestionRecord; inserted: boolean } {
     const question = nonEmpty(input.question, "question");
     const createdAt = input.createdAt ?? nowIso();
     const generationRunId = input.generationRunId ?? null;
+    const questionMode: QuestionMode = input.questionMode ?? "direct";
+    if (questionMode !== "direct" && questionMode !== "todo_plan" && questionMode !== "clarify_question") {
+      throw new Error(`无效的 questionMode：${String(questionMode)}`);
+    }
+    const taskSpecJson = input.taskSpec !== undefined && input.taskSpec !== null
+      ? assertObjectJson(input.taskSpec, "taskSpec")
+      : null;
 
     const existing = this.db.prepare(`
-      SELECT id, material_id, question, generation_run_id, created_at
+      SELECT id, material_id, question, generation_run_id, question_mode, task_spec_json, created_at
       FROM questions
       WHERE material_id = ? AND question = ?
     `).get(input.materialId, question) as unknown as QuestionRecord | undefined;
@@ -131,20 +140,20 @@ export class CorpusRepository {
     if (input.id !== undefined) {
       if (!Number.isSafeInteger(input.id) || input.id < 1) throw new Error("问题 ID 必须是正整数");
       this.db.prepare(`
-        INSERT INTO questions (id, material_id, question, generation_run_id, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(input.id, input.materialId, question, generationRunId, createdAt);
+        INSERT INTO questions (id, material_id, question, generation_run_id, question_mode, task_spec_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(input.id, input.materialId, question, generationRunId, questionMode, taskSpecJson, createdAt);
       insertedId = input.id;
     } else {
       const info = this.db.prepare(`
-        INSERT INTO questions (material_id, question, generation_run_id, created_at)
-        VALUES (?, ?, ?, ?)
-      `).run(input.materialId, question, generationRunId, createdAt);
+        INSERT INTO questions (material_id, question, generation_run_id, question_mode, task_spec_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(input.materialId, question, generationRunId, questionMode, taskSpecJson, createdAt);
       insertedId = Number(info.lastInsertRowid);
     }
 
     const record = this.db.prepare(`
-      SELECT id, material_id, question, generation_run_id, created_at
+      SELECT id, material_id, question, generation_run_id, question_mode, task_spec_json, created_at
       FROM questions WHERE id = ?
     `).get(insertedId) as unknown as QuestionRecord;
     return { record, inserted: true };

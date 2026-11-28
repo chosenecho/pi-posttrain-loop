@@ -2,7 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateMaxTurns, validateSplit } from "../../shared/schema.js";
 import {
   attachNegativeToolDeclaration,
-  buildToolDefinition,
+  buildSampleToolDefinitions,
   buildToolStepMessages,
   pickWebSearchToolVariant,
 } from "../../shared/tool-schema.js";
@@ -34,11 +34,26 @@ export class ExportRepository {
     options: {
       systemPrompt?: string;
       generalizeTools: boolean;
+      alwaysDeclareSearch?: boolean;
       toolRng: () => number;
     },
   ): TrainingSampleLine {
-    const hasAnyTools = turns.some((t) => (toolStepsByAttempt.get(Number(t.attempt_id))?.length ?? 0) > 0);
-    const variant = hasAnyTools ? pickWebSearchToolVariant(options.toolRng, options.generalizeTools) : undefined;
+    const allSteps: ToolStep[] = [];
+    for (const t of turns) {
+      const steps = toolStepsByAttempt.get(Number(t.attempt_id));
+      if (steps && steps.length > 0) allSteps.push(...steps);
+    }
+    const firstTurn = turns[0];
+    const runProfile = firstTurn?.run_profile ?? undefined;
+    const questionMode = firstTurn?.question_mode ?? undefined;
+    const needsToolDefs = allSteps.length > 0
+      || Boolean(options.alwaysDeclareSearch)
+      || runProfile === "search"
+      || runProfile === "todo"
+      || runProfile === "clarify"
+      || questionMode === "todo_plan"
+      || questionMode === "clarify_question";
+    const variant = needsToolDefs ? pickWebSearchToolVariant(options.toolRng, options.generalizeTools) : undefined;
     const messages: TrainingMessage[] = [];
     if (options.systemPrompt !== undefined) {
       messages.push({ role: "system", content: options.systemPrompt });
@@ -54,8 +69,17 @@ export class ExportRepository {
       }
       messages.push({ role: "assistant", content: turn.assistant_content });
     }
-    return variant
-      ? { tools: [buildToolDefinition(variant)], messages }
+    const toolDefs = needsToolDefs
+      ? buildSampleToolDefinitions({
+          steps: allSteps,
+          searchVariant: variant,
+          profile: runProfile,
+          questionMode,
+          alwaysIncludeSearch: options.alwaysDeclareSearch,
+        })
+      : [];
+    return toolDefs.length > 0
+      ? { tools: toolDefs, messages }
       : { messages };
   }
 
@@ -161,7 +185,9 @@ export class ExportRepository {
     let sql = `
       SELECT r.id AS result_id,
              i.run_id,
+             json_extract(ru.config_json, '$.profile') AS run_profile,
              q.id AS question_id,
+             q.question_mode,
              q.material_id,
              r.turn_count,
              t.turn_no,
@@ -171,6 +197,7 @@ export class ExportRepository {
              a.attempt_no
       FROM results r
       JOIN run_items i ON i.id = r.run_item_id
+      JOIN runs ru ON ru.id = i.run_id
       JOIN questions q ON q.id = i.question_id
       JOIN turns t ON t.run_item_id = i.id
       JOIN attempts a ON a.id = t.passed_attempt_id

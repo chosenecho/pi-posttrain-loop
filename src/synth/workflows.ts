@@ -159,6 +159,8 @@ export interface SynthBatchWorkflowOptions {
   exportPath?: string;
   exportSystemPrompt?: string;
   evalDbPath?: string;
+  /** Default true (unless noSkill is true): mounts `web_search` on Answer Agent across all profiles. */
+  enableSearch?: boolean;
   config?: PiConfig;
   runRole?: RoleRunner;
   runSearchAnswer?: SearchAnswerRunner;
@@ -178,7 +180,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
   const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
   const limit = options.limit ?? 10;
   const maxQuestionsPerVideo = options.maxQuestionsPerVideo
-    ?? (profile === "trap" || profile === "search" ? 2 : undefined);
+    ?? (profile === "trap" || profile === "search" || profile === "todo" || profile === "clarify" ? 2 : undefined);
   const defaultMaxTurns = defaultMaxTurnsForProfile(profile);
   const maxTurns = validateMaxTurns(options.maxTurns ?? defaultMaxTurns);
   const maxAttempts = validateMaxAttempts(options.maxAttempts ?? DEFAULT_SYNTH_MAX_ATTEMPTS);
@@ -201,9 +203,26 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
   const config = options.config ?? readPiConfig();
   const sanitizedModel = sanitizePiConfig(config);
   const runRole = options.runRole ?? createPiRunner(config);
+  const isToolProfile = profile === "search" || profile === "todo" || profile === "clarify";
+  const shouldEnableSearch = options.enableSearch ?? (profile !== "standard" && !options.noSkill && !options.runRole);
+  const shouldUseToolRunner = Boolean(
+    options.runSearchAnswer
+    || isToolProfile
+    || shouldEnableSearch,
+  );
   const runSearchAnswer = options.runSearchAnswer
-    ?? (profile === "search"
-      ? createPiSearchRunner(config, options.webSearchRunner ?? createMagpieWebSearchRunner())
+    ?? (shouldUseToolRunner && !options.runRole
+      ? createPiSearchRunner(
+          config,
+          shouldEnableSearch || profile === "search"
+            ? (options.webSearchRunner ?? createMagpieWebSearchRunner())
+            : undefined,
+          {
+            profile,
+            enableSearch: shouldEnableSearch || profile === "search",
+            simulatorRunner: runRole,
+          },
+        )
       : undefined);
   const log = options.onProgress;
 
@@ -370,6 +389,7 @@ export interface SynthSuiteWorkflowOptions {
   concurrency?: number;
   includeUnjudged?: boolean;
   evalDbPath?: string;
+  enableSearch?: boolean;
   config?: PiConfig;
   runRole?: RoleRunner;
   runSearchAnswer?: SearchAnswerRunner;
@@ -414,9 +434,10 @@ export async function runSynthSuiteWorkflow(
       concurrency: options.concurrency,
       includeUnjudged: options.includeUnjudged,
       evalDbPath: options.evalDbPath,
+      enableSearch: options.enableSearch,
       config: options.config,
       runRole: options.runRole,
-      runSearchAnswer: profile === "search" ? options.runSearchAnswer : undefined,
+      runSearchAnswer: options.runSearchAnswer,
       webSearchRunner: options.webSearchRunner,
       onProgress: options.onProgress,
     });
@@ -595,6 +616,8 @@ export interface SynthJudgeWorkflowOptions {
   skillOverrides?: SynthSkillOverrides;
   exportPath?: string;
   exportSystemPrompt?: string;
+  /** Default true when using default Skill-driven profiles (false when custom prompts/skills or noSkill are used). */
+  enableSearch?: boolean;
   config?: PiConfig;
   runRole?: RoleRunner;
   runSearchAnswer?: SearchAnswerRunner;
@@ -625,9 +648,32 @@ export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions):
   const config = options.config ?? readPiConfig();
   const sanitizedModel = sanitizePiConfig(config);
   const runRole = options.runRole ?? createPiRunner(config);
+  const hasCustomPromptOverrides = Boolean(
+    options.noSkill
+    || options.promptsDir
+    || options.skillOverrides?.answerStyle
+    || options.skillOverrides?.qualityJudge,
+  );
+  const isToolProfile = profile === "search" || profile === "todo" || profile === "clarify";
+  const shouldEnableSearch = options.enableSearch ?? (profile !== "standard" && !hasCustomPromptOverrides && !options.runRole);
+  const shouldUseToolRunner = Boolean(
+    options.runSearchAnswer
+    || isToolProfile
+    || shouldEnableSearch,
+  );
   const runSearchAnswer = options.runSearchAnswer
-    ?? (profile === "search"
-      ? createPiSearchRunner(config, options.webSearchRunner ?? createMagpieWebSearchRunner())
+    ?? (shouldUseToolRunner && !options.runRole
+      ? createPiSearchRunner(
+          config,
+          shouldEnableSearch || profile === "search"
+            ? (options.webSearchRunner ?? createMagpieWebSearchRunner())
+            : undefined,
+          {
+            profile,
+            enableSearch: shouldEnableSearch || profile === "search",
+            simulatorRunner: runRole,
+          },
+        )
       : undefined);
 
   const store = new DataMakerStore(dbPath);

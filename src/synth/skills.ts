@@ -53,6 +53,16 @@ export const SEARCH_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "search/followup-s
 export const SEARCH_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "search/answer-style/SKILL.md");
 export const SEARCH_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "search/quality-judge/SKILL.md");
 
+export const TODO_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "todo/question-design/SKILL.md");
+export const TODO_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "todo/followup-strategy/SKILL.md");
+export const TODO_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "todo/answer-style/SKILL.md");
+export const TODO_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "todo/quality-judge/SKILL.md");
+
+export const CLARIFY_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "clarify/question-design/SKILL.md");
+export const CLARIFY_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "clarify/followup-strategy/SKILL.md");
+export const CLARIFY_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "clarify/answer-style/SKILL.md");
+export const CLARIFY_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "clarify/quality-judge/SKILL.md");
+
 interface ProfileSkillPaths {
   questionSkill: string;
   followupSkill: string;
@@ -102,6 +112,18 @@ const PROFILE_SKILL_PATHS: Record<SynthProfile, ProfileSkillPaths> = {
     followupSkill: SEARCH_FOLLOWUP_SKILL,
     answerStyle: SEARCH_ANSWER_STYLE,
     qualityJudge: SEARCH_QUALITY_JUDGE,
+  },
+  todo: {
+    questionSkill: TODO_QUESTION_SKILL,
+    followupSkill: TODO_FOLLOWUP_SKILL,
+    answerStyle: TODO_ANSWER_STYLE,
+    qualityJudge: TODO_QUALITY_JUDGE,
+  },
+  clarify: {
+    questionSkill: CLARIFY_QUESTION_SKILL,
+    followupSkill: CLARIFY_FOLLOWUP_SKILL,
+    answerStyle: CLARIFY_ANSWER_STYLE,
+    qualityJudge: CLARIFY_QUALITY_JUDGE,
   },
 };
 
@@ -204,10 +226,11 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
     ? await readQuestionGeneratorPrompt(DEFAULT_PROMPTS_DIR)
     : undefined;
   let answerPromptFile = join(promptDir, "answer.md");
-  if (profile === "search" && !noSkill) {
+  if ((profile === "search" || profile === "todo" || profile === "clarify") && !noSkill) {
+    const dedicatedFile = join(promptDir, `answer-${profile}.md`);
     try {
-      await readFile(join(promptDir, "answer-search.md"), "utf8");
-      answerPromptFile = join(promptDir, "answer-search.md");
+      await readFile(dedicatedFile, "utf8");
+      answerPromptFile = dedicatedFile;
     } catch {
       answerPromptFile = join(promptDir, "answer.md");
     }

@@ -9,12 +9,23 @@ import { ReasoningStore } from "../src/reasoning/store.js";
 import { parseOptionalSynthProfile } from "../src/shared/schema.js";
 import {
   attachNegativeToolDeclaration,
+  buildSampleToolDefinitions,
   buildToolDefinition,
   buildToolStepMessages,
   CANONICAL_WEB_SEARCH_VARIANT,
   GENERALIZED_WEB_SEARCH_VARIANTS,
+  PI_QUESTION_TOOL_DEFINITION,
+  PI_QUESTIONNAIRE_TOOL_DEFINITION,
+  PI_TODO_TOOL_DEFINITION,
   pickWebSearchToolVariant,
 } from "../src/shared/tool-schema.js";
+import {
+  createQuestionAgentTool,
+  createQuestionnaireAgentTool,
+  createTodoAgentTool,
+  selectBestOptionDeterministically,
+} from "../src/shared/pi-tools.js";
+import { createUnifiedSaveQuestionsTool } from "../src/synth/question-store.js";
 import { TRAIN_SUITE_PROFILES, type RoleRunner, type SearchAnswerRunner, type ToolStep, type TrainingSampleLine } from "../src/shared/types.js";
 import { createSeededRng } from "../src/shared/utils.js";
 import { createWebSearchAgentTool, normalizeSearchCacheKey, parseMagpieWebSearchOutput } from "../src/shared/web-search.js";
@@ -276,5 +287,265 @@ test("end-to-end search dialogue loop, SQLite tool steps, CoT backfill, and gene
     assert.match(md, /检索工具调用轨迹/);
   } finally {
     rStore.close();
+  }
+});
+
+test("Pi todo, question, and questionnaire tools match Pi v1.7.0 schemas and record deterministic sandbox steps", async () => {
+  // 1. Verify exact Pi v1.7.0 tool schema shapes
+  assert.equal(PI_TODO_TOOL_DEFINITION.function.name, "todo");
+  assert.deepEqual(PI_TODO_TOOL_DEFINITION.function.parameters.required, ["action"]);
+  assert.equal(PI_QUESTION_TOOL_DEFINITION.function.name, "question");
+  assert.deepEqual(PI_QUESTION_TOOL_DEFINITION.function.parameters.required, ["question", "options"]);
+  assert.equal(PI_QUESTIONNAIRE_TOOL_DEFINITION.function.name, "questionnaire");
+  assert.deepEqual(PI_QUESTIONNAIRE_TOOL_DEFINITION.function.parameters.required, ["questions"]);
+
+  // 2. Todo sandbox lifecycle: list -> add -> add -> toggle -> list -> clear
+  const todoSteps: ToolStep[] = [];
+  const todoTool = createTodoAgentTool({ onStep: (s) => todoSteps.push(s) });
+
+  const emptyList = await todoTool.execute("t0", { action: "list" });
+  assert.equal((emptyList.content[0] as { text: string }).text, "No todos");
+
+  const add1 = await todoTool.execute("t1", { action: "add", text: "拆穿表层伪命题" });
+  assert.equal((add1.content[0] as { text: string }).text, "Added #1 [ ] 拆穿表层伪命题");
+
+  const add2 = await todoTool.execute("t2", { action: "add", text: "算清脱产考证的现金流风险" });
+  assert.equal((add2.content[0] as { text: string }).text, "Added #2 [ ] 算清脱产考证的现金流风险");
+
+  const tog1 = await todoTool.execute("t3", { action: "toggle", id: 1 });
+  assert.equal((tog1.content[0] as { text: string }).text, "Completed #1 [x] 拆穿表层伪命题");
+
+  const listAfter = await todoTool.execute("t4", { action: "list" });
+  assert.equal((listAfter.content[0] as { text: string }).text, "#1 [x] 拆穿表层伪命题\n#2 [ ] 算清脱产考证的现金流风险");
+
+  const clr = await todoTool.execute("t5", { action: "clear" });
+  assert.equal((clr.content[0] as { text: string }).text, "Cleared 2 todos");
+  assert.equal(todoSteps.length, 6);
+
+  // 3. Question & Questionnaire user simulator matching hidden_user_persona
+  const persona = "二线城市私企外包程序员，31岁，手头存款只够撑半年开支，准备考的证书不是行业硬门槛";
+  const qSteps: ToolStep[] = [];
+  const questionTool = createQuestionAgentTool({
+    context: { hiddenUserPersona: persona },
+    onStep: (s) => qSteps.push(s),
+  });
+  const qRes = await questionTool.execute("q1", {
+    question: "你目前的岗位性质和现金流安全垫大概是什么情况？",
+    options: [
+      { label: "体制内或大厂稳态岗，存款充裕能兜底两年以上" },
+      { label: "私企外包或高波动岗位，存款仅够半年左右开支" },
+      { label: "刚毕业应届生，父母全额资助备考" },
+    ],
+  });
+  assert.equal((qRes.content[0] as { text: string }).text, "User selected: 私企外包或高波动岗位，存款仅够半年左右开支");
+  assert.equal(qSteps.length, 1);
+  assert.equal(qSteps[0]?.toolName, "question");
+
+  const qnSteps: ToolStep[] = [];
+  const questionnaireTool = createQuestionnaireAgentTool({
+    context: { hiddenUserPersona: persona },
+    onStep: (s) => qnSteps.push(s),
+  });
+  const qnRes = await questionnaireTool.execute("qn1", {
+    questions: [
+      {
+        id: "job_stability",
+        label: "岗位性质",
+        prompt: "你目前所在的岗位属于哪类？",
+        options: [
+          { value: "stable", label: "体制内或国企在编" },
+          { value: "outsource", label: "私企外包程序员" },
+        ],
+      },
+      {
+        id: "cert_type",
+        label: "证书门槛",
+        prompt: "你打算考的这个证书在行业里是什么地位？",
+        options: [
+          { value: "mandatory", label: "法定的准入硬门槛证书" },
+          { value: "optional", label: "非行业硬门槛的普通锦上添花证书" },
+        ],
+      },
+    ],
+  });
+  const qnText = (qnRes.content[0] as { text: string }).text;
+  assert.match(qnText, /job_stability: 2\. 私企外包程序员/);
+  assert.match(qnText, /cert_type: 2\. 非行业硬门槛的普通锦上添花证书/);
+  assert.equal(qnSteps.length, 1);
+  assert.equal(selectBestOptionDeterministically([{ label: "A" }, { label: "B" }], "").index, 1);
+});
+
+test("todo and clarify profiles load ready bundles, persist task_spec_json, and export exact Pi tool schemas alongside generalized web_search", async (t) => {
+  for (const profile of ["todo", "clarify"] as const) {
+    assert.equal(parseOptionalSynthProfile(profile), profile);
+    assert.ok(TRAIN_SUITE_PROFILES.includes(profile));
+    const bundle = await resolveSynthBundle({
+      profile,
+      maxTurns: 2,
+      includeQuestionGenerator: true,
+    });
+    assert.equal(bundle.rubricReady, true);
+    assert.equal(bundle.questionSkills[0]?.status, "ready");
+    assert.equal(bundle.dialogueSkills.every((s) => s.status === "ready"), true);
+  }
+
+  const dir = await tempDir(t);
+  const dbPath = join(dir, "todo-clarify.sqlite");
+  const store = new DataMakerStore(dbPath);
+  const seenJudgeInputs: Array<Record<string, unknown>> = [];
+
+  try {
+    const mat = store.upsertMaterial({
+      videoId: "BV_TODO_CLARIFY",
+      content: "原文框架：第一，先剥离表层情绪；第二，算清现金流硬约束；第三，按岗位稳态还是高波动外包采取截然相反的策略。",
+    });
+    const qRunTodo = store.createRun({
+      kind: "question_generation",
+      maxAttempts: 1,
+      maxTurns: 1,
+      config: { profile: "todo" },
+      prompts: { question: "q" },
+      skills: [],
+      exportPolicy: { training_enabled: false },
+    });
+    const saveTodoTool = createUnifiedSaveQuestionsTool(store, mat.id, "BV_TODO_CLARIFY", qRunTodo, () => {}, {
+      profile: "todo",
+    });
+    await saveTodoTool.execute("save-todo", {
+      video_id: "BV_TODO_CLARIFY",
+      questions: [
+        {
+          question: "我现在同时面临行业下行、房贷压力和转行焦虑，该怎么一步步理清出路？",
+          expected_phases: ["剥离表层焦虑", "核算刚性现金流", "制定保底过渡策略"],
+        },
+      ],
+    });
+
+    const qRunClarify = store.createRun({
+      kind: "question_generation",
+      maxAttempts: 1,
+      maxTurns: 1,
+      config: { profile: "clarify" },
+      prompts: { question: "q" },
+      skills: [],
+      exportPolicy: { training_enabled: false },
+    });
+    const saveClarifyTool = createUnifiedSaveQuestionsTool(store, mat.id, "BV_TODO_CLARIFY", qRunClarify, () => {}, {
+      profile: "clarify",
+    });
+    await saveClarifyTool.execute("save-clarify", {
+      video_id: "BV_TODO_CLARIFY",
+      questions: [
+        {
+          question: "我手头攒了一点钱，现在该脱产去考个证还是先苟在原岗位？",
+          missing_slots: ["岗位性质", "现金流安全垫"],
+          hidden_user_persona: "二线私企外包，存款仅够半年",
+        },
+      ],
+    });
+
+    const loaded = store.queryTargetQuestions({ videoId: "BV_TODO_CLARIFY" });
+    assert.equal(loaded.length, 2);
+    const todoQ = loaded.find((q) => q.questionMode === "todo_plan")!;
+    const clarifyQ = loaded.find((q) => q.questionMode === "clarify_question")!;
+    assert.deepEqual(todoQ.taskSpec?.expected_phases, ["剥离表层焦虑", "核算刚性现金流", "制定保底过渡策略"]);
+    assert.equal(clarifyQ.taskSpec?.hidden_user_persona, "二线私企外包，存款仅够半年");
+
+    // Run dialogue batch for todo and clarify questions
+    await runDialogueBatch({
+      store,
+      questionIds: [todoQ.id],
+      prompts: { answer: "todo answer", judge: "todo judge" },
+      maxAttempts: 2,
+      maxTurns: 1,
+      config: { profile: "todo", mode: "test" },
+      exportPolicy: { format: "messages_jsonl", split: "train", training_enabled: true },
+      runSearchAnswer: async (req) => {
+        // Internal _taskSpec is passed to runner so simulator can read it
+        assert.equal(req.input._questionMode, "todo_plan");
+        return {
+          answer: "先把焦虑放一边，算清你的房贷刚性支出，再边苟住基本盘边低成本试错。",
+          toolSteps: [
+            { stepNo: 1, toolName: "todo", arguments: { action: "add", text: "剥离表层焦虑" }, toolOutput: "Added #1 [ ] 剥离表层焦虑" },
+            { stepNo: 2, toolName: "todo", arguments: { action: "add", text: "核算现金流与过渡策略" }, toolOutput: "Added #2 [ ] 核算现金流与过渡策略" },
+            { stepNo: 3, toolName: "todo", arguments: { action: "toggle", id: 1 }, toolOutput: "Completed #1 [x] 剥离表层焦虑" },
+            { stepNo: 4, toolName: "todo", arguments: { action: "toggle", id: 2 }, toolOutput: "Completed #2 [x] 核算现金流与过渡策略" },
+          ],
+        };
+      },
+      runRole: async (req) => {
+        if (req.role === "judge") {
+          seenJudgeInputs.push(req.input);
+          return JSON.stringify({ decision: "pass", issues: [], feedback: "" });
+        }
+        throw new Error(`unexpected role: ${req.role}`);
+      },
+    });
+
+    await runDialogueBatch({
+      store,
+      questionIds: [clarifyQ.id],
+      prompts: { answer: "clarify answer", judge: "clarify judge" },
+      maxAttempts: 2,
+      maxTurns: 1,
+      config: { profile: "clarify", mode: "test" },
+      exportPolicy: { format: "messages_jsonl", split: "train", training_enabled: true },
+      runSearchAnswer: async (req) => {
+        assert.equal(req.input._questionMode, "clarify_question");
+        return {
+          answer: "既然你干的是私企外包、存款也就够撑半年，千万别这时候脱产考非硬门槛的证，先保住现金流。",
+          toolSteps: [
+            {
+              stepNo: 1,
+              toolName: "question",
+              arguments: {
+                question: "你现在的岗位稳定性和存款安全垫是什么情况？",
+                options: [
+                  { label: "体制内稳态岗，存款充裕" },
+                  { label: "私企外包，存款仅够半年" },
+                ],
+              },
+              toolOutput: "User selected: 私企外包，存款仅够半年",
+            },
+          ],
+        };
+      },
+      runRole: async (req) => {
+        if (req.role === "judge") {
+          seenJudgeInputs.push(req.input);
+          return JSON.stringify({ decision: "pass", issues: [], feedback: "" });
+        }
+        throw new Error(`unexpected role: ${req.role}`);
+      },
+    });
+
+    assert.equal(seenJudgeInputs.length, 2);
+    assert.ok(seenJudgeInputs[0]?.taskSpec);
+    assert.ok(seenJudgeInputs[1]?.taskSpec);
+
+    const exported = store.exportMergedDataset({
+      allFormal: true,
+      seed: 42,
+      generalizeTools: true,
+    });
+    assert.equal(exported.train.length, 2);
+    const todoSample = exported.train.find((r) => r.questionId === todoQ.id)!.sample;
+    const clarifySample = exported.train.find((r) => r.questionId === clarifyQ.id)!.sample;
+
+    // Todo sample carries both generalized search tool and Pi `todo` tool definition
+    assert.equal(todoSample.tools?.some((t) => t.function.name === "todo"), true);
+    assert.equal(todoSample.tools?.length, 2);
+    assert.equal(todoSample.messages.filter((m) => m.role === "tool" && m.name === "todo").length, 4);
+
+    // Clarify sample carries generalized search tool + Pi `question` + `questionnaire` definitions
+    assert.equal(clarifySample.tools?.some((t) => t.function.name === "question"), true);
+    assert.equal(clarifySample.tools?.some((t) => t.function.name === "questionnaire"), true);
+    assert.equal(clarifySample.messages.some((m) => m.role === "tool" && m.name === "question"), true);
+    assert.equal(
+      buildSampleToolDefinitions({ steps: [], searchVariant: CANONICAL_WEB_SEARCH_VARIANT, alwaysIncludeSearch: true }).length,
+      1,
+    );
+  } finally {
+    store.close();
   }
 });

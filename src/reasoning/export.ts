@@ -1,7 +1,7 @@
 import { nonEmpty } from "../shared/schema.js";
 import {
   attachNegativeToolDeclaration,
-  buildToolDefinition,
+  buildSampleToolDefinitions,
   buildToolStepMessages,
   pickWebSearchToolVariant,
 } from "../shared/tool-schema.js";
@@ -199,8 +199,15 @@ export function buildReasoningExportDataset(
       }
       messages.push(formatAssistantWithReasoning(turn.answer, trace.reasoning, format));
 
-      let sample: ReasoningTrainingSampleLine = variant
-        ? { tools: [buildToolDefinition(variant)], messages }
+      let sample: ReasoningTrainingSampleLine = variant && turn.toolSteps
+        ? {
+            tools: buildSampleToolDefinitions({
+              steps: turn.toolSteps,
+              searchVariant: variant,
+              profile: turn.sourceProfile,
+            }),
+            messages,
+          }
         : { messages };
       if (!sample.tools && negativeToolsRatio > 0 && toolRng() < negativeToolsRatio) {
         sample = attachNegativeToolDeclaration(sample, toolRng, generalizeTools);
@@ -255,8 +262,16 @@ export function buildReasoningExportDataset(
         }
         messages.push(formatAssistantWithReasoning(turn.answer, trace.reasoning, format));
       }
-      let sample: ReasoningTrainingSampleLine = variant
-        ? { tools: [buildToolDefinition(variant)], messages }
+      const allDialogueSteps = dialogue.flatMap((t) => t.toolSteps ?? []);
+      let sample: ReasoningTrainingSampleLine = variant && allDialogueSteps.length > 0
+        ? {
+            tools: buildSampleToolDefinitions({
+              steps: allDialogueSteps,
+              searchVariant: variant,
+              profile: dialogue[0]?.sourceProfile,
+            }),
+            messages,
+          }
         : { messages };
       if (!sample.tools && negativeToolsRatio > 0 && toolRng() < negativeToolsRatio) {
         sample = attachNegativeToolDeclaration(sample, toolRng, generalizeTools);

@@ -1,11 +1,26 @@
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels, createProvider, type Model } from "@earendil-works/pi-ai";
 import * as completions from "@earendil-works/pi-ai/api/openai-completions";
-import type { DialogueRole, RoleRunner, SearchAnswerResult, SearchAnswerRunner, ToolStep } from "./types.js";
+import type {
+  DialogueRole,
+  QuestionMode,
+  QuestionTaskSpec,
+  RoleRequest,
+  RoleRunner,
+  SearchAnswerResult,
+  SearchAnswerRunner,
+  SynthProfile,
+  ToolStep,
+} from "./types.js";
 import { nonEmpty } from "./schema.js";
 import { PublicError, toPublicError } from "./public-error.js";
 import { normalizeApiBaseUrl, resolveApiEndpoint } from "./api-config.js";
 import { createWebSearchAgentTool, type CreateWebSearchToolOptions, type WebSearchRunner } from "./web-search.js";
+import {
+  createQuestionAgentTool,
+  createQuestionnaireAgentTool,
+  createTodoAgentTool,
+} from "./pi-tools.js";
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high" | "max";
 
@@ -190,16 +205,31 @@ export interface PiSearchRunnerOptions {
   /** Result count per web_search call (default 5). */
   searchCount?: number;
   searchContextSize?: CreateWebSearchToolOptions["searchContextSize"];
+  /** Target synth profile (auto-mounts `todo` on `todo` profile and `question`/`questionnaire` on `clarify` profile). */
+  profile?: SynthProfile;
+  /** Enable `web_search` tool on this runner (default true when webSearchRunner is provided). */
+  enableSearch?: boolean;
+  /** Max todo calls per answer attempt (default 12). */
+  maxTodoCalls?: number;
+  /** Max question/questionnaire calls per answer attempt (default 1). */
+  maxClarifyCalls?: number;
+  /** Optional LLM runner used by `question`/`questionnaire` user simulator. */
+  simulatorRunner?: RoleRunner;
+  /** Optional custom tool factory per request. */
+  extraToolsFactory?: (ctx: {
+    request: RoleRequest;
+    recordStep: (step: Omit<ToolStep, "stepNo">) => void;
+  }) => AgentTool[];
 }
 
 /**
- * Multi-step Pi runner for `search` profile answers: mounts `web_search` backed by
- * `WebSearchRunner`, lets the model search and consume tool outputs, and captures
- * every tool step (plus any pre-call thinking block) alongside the final text answer.
+ * Multi-step Pi runner for tool-enabled answers (`web_search`, `todo`, `question`, `questionnaire`):
+ * mounts the configured Pi tools for each attempt, lets the model invoke tools and consume tool outputs,
+ * and captures every tool step (with sequential `stepNo` and pre-call thinking) alongside the final text answer.
  */
 export function createPiSearchRunner(
   config: PiConfig,
-  webSearchRunner: WebSearchRunner,
+  webSearchRunner?: WebSearchRunner,
   options: PiSearchRunnerOptions = {},
 ): SearchAnswerRunner {
   const model: Model<"openai-completions"> = {
@@ -234,25 +264,87 @@ export function createPiSearchRunner(
   }));
 
   const maxSearchCalls = Math.max(1, Math.floor(options.maxSearchCalls ?? 3));
+  const maxTodoCalls = Math.max(1, Math.floor(options.maxTodoCalls ?? 12));
+  const maxClarifyCalls = Math.max(1, Math.floor(options.maxClarifyCalls ?? 1));
 
-  return async ({ role, systemPrompt, input }): Promise<SearchAnswerResult> => {
+  return async (request): Promise<SearchAnswerResult> => {
+    const { role, systemPrompt, input } = request;
     let httpStatus: number | undefined;
     const timeout = AbortSignal.timeout(config.timeoutMs);
     const thinkingLevel = config.roleThinkingLevels?.[role as DialogueRole] ?? config.thinkingLevel ?? "high";
     const capturedSteps: ToolStep[] = [];
     let toolRounds = 0;
 
-    const searchTool = createWebSearchAgentTool(webSearchRunner, {
-      maxCalls: maxSearchCalls,
-      count: options.searchCount,
-      searchContextSize: options.searchContextSize,
-      onStep: (step) => {
-        capturedSteps.push(step);
-      },
-    });
+    const recordStep = (step: Omit<ToolStep, "stepNo">): void => {
+      capturedSteps.push({
+        ...step,
+        stepNo: capturedSteps.length + 1,
+      });
+    };
+
+    // Strip internal simulator metadata (`_questionMode`, `_taskSpec`) before sending wire input to Answer Agent
+    const {
+      _questionMode: rawQuestionMode,
+      _taskSpec: rawTaskSpec,
+      ...cleanWireInput
+    } = input;
+    const questionMode = (typeof rawQuestionMode === "string" ? rawQuestionMode : undefined) as QuestionMode | undefined;
+    const taskSpec = (rawTaskSpec && typeof rawTaskSpec === "object" ? rawTaskSpec : undefined) as QuestionTaskSpec | undefined;
+
+    const tools: AgentTool[] = [];
+    const enableSearch = options.enableSearch ?? Boolean(webSearchRunner);
+    if (enableSearch && webSearchRunner) {
+      tools.push(
+        createWebSearchAgentTool(webSearchRunner, {
+          maxCalls: maxSearchCalls,
+          count: options.searchCount,
+          searchContextSize: options.searchContextSize,
+          onStep: (step) => recordStep(step),
+        }),
+      );
+    }
+
+    const mountTodo = options.profile === "todo" || questionMode === "todo_plan";
+    if (mountTodo) {
+      tools.push(
+        createTodoAgentTool({
+          maxCalls: maxTodoCalls,
+          onStep: (step) => recordStep(step),
+        }),
+      );
+    }
+
+    const mountClarify = options.profile === "clarify" || questionMode === "clarify_question";
+    if (mountClarify) {
+      const simContext = {
+        question: typeof cleanWireInput.question === "string" ? cleanWireInput.question : undefined,
+        material: typeof cleanWireInput.material === "string" ? cleanWireInput.material : undefined,
+        hiddenUserPersona: taskSpec?.hidden_user_persona,
+        missingSlots: taskSpec?.missing_slots,
+        runRole: options.simulatorRunner,
+      };
+      tools.push(
+        createQuestionAgentTool({
+          maxCalls: maxClarifyCalls,
+          context: simContext,
+          onStep: (step) => recordStep(step),
+        }),
+        createQuestionnaireAgentTool({
+          maxCalls: maxClarifyCalls,
+          context: simContext,
+          onStep: (step) => recordStep(step),
+        }),
+      );
+    }
+
+    if (options.extraToolsFactory) {
+      tools.push(...options.extraToolsFactory({ request, recordStep }));
+    }
+
+    const maxToolRounds = (mountTodo ? maxTodoCalls : 0) + (mountClarify ? maxClarifyCalls : 0) + maxSearchCalls + 2;
 
     const agent = new Agent({
-      initialState: { systemPrompt, model, tools: [searchTool], thinkingLevel },
+      initialState: { systemPrompt, model, tools, thinkingLevel },
       finishTurn: (turn) => {
         if (turn.toolResults.length === 0) return { action: "end" };
         toolRounds++;
@@ -270,7 +362,7 @@ export function createPiSearchRunner(
             }
           }
         }
-        if (toolRounds > maxSearchCalls + 1) {
+        if (toolRounds > maxToolRounds) {
           return { action: "end" };
         }
         return undefined;
@@ -281,8 +373,8 @@ export function createPiSearchRunner(
         maxTokens: config.maxTokens,
         timeoutMs: config.timeoutMs,
         maxRetries: 0,
-        fetch: async (request, init) => {
-          const response = await globalThis.fetch(request, { ...init, redirect: "manual" });
+        fetch: async (req, init) => {
+          const response = await globalThis.fetch(req, { ...init, redirect: "manual" });
           httpStatus = response.status;
           return response;
         },
@@ -290,7 +382,7 @@ export function createPiSearchRunner(
     });
 
     try {
-      await agent.prompt(JSON.stringify(input));
+      await agent.prompt(JSON.stringify(cleanWireInput));
       const last = agent.state.messages.findLast((message) => message.role === "assistant");
       if (!last || last.role !== "assistant") {
         throw new PublicError("model_missing_message", { httpStatus });

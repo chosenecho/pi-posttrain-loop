@@ -153,7 +153,7 @@ export async function runCorpusQuestionGeneration(
             (savedReceipt) => {
               receipt = savedReceipt;
             },
-            { maxQuestions },
+            { maxQuestions, profile: options.profile },
           );
           const runner = options.createRunner
             ? options.createRunner([tool])

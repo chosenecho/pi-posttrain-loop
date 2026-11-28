@@ -7,7 +7,16 @@ export type DatasetSplit = "train" | "test" | "dpo";
 export type SplitAssignMethod = "backfill" | "hash" | "manual";
 export type DedupPolicy = "latest" | "earliest" | "error";
 
-export type SynthProfile = "standard" | "short" | "medium" | "long" | "xlong" | "trap" | "search";
+export type SynthProfile =
+  | "standard"
+  | "short"
+  | "medium"
+  | "long"
+  | "xlong"
+  | "trap"
+  | "search"
+  | "todo"
+  | "clarify";
 
 export const ALL_SYNTH_PROFILES = [
   "standard",
@@ -17,9 +26,11 @@ export const ALL_SYNTH_PROFILES = [
   "xlong",
   "trap",
   "search",
+  "todo",
+  "clarify",
 ] as const;
 
-/** The 6 Skill-driven length/type profiles run per video so train distribution emerges naturally. */
+/** The Skill-driven length/type profiles run per video so train distribution emerges naturally. */
 export const TRAIN_SUITE_PROFILES = [
   "short",
   "medium",
@@ -27,7 +38,22 @@ export const TRAIN_SUITE_PROFILES = [
   "xlong",
   "trap",
   "search",
+  "todo",
+  "clarify",
 ] as const;
+
+export type QuestionMode = "direct" | "todo_plan" | "clarify_question";
+
+export interface QuestionTaskSpec {
+  difficulty?: "easy" | "medium" | "hard";
+  profile?: SynthProfile;
+  /** Expected logical sub-phases for `todo_plan` questions (visible only to Judge). */
+  expected_phases?: string[];
+  /** Missing slots intentionally stripped from `clarify_question` questions (visible to Judge & User Simulator). */
+  missing_slots?: string[];
+  /** Hidden true user background/constraints for `clarify_question` questions (visible to Judge & User Simulator, hidden from Answer Agent). */
+  hidden_user_persona?: string;
+}
 
 export type Role = "question" | "answer" | "judge";
 export type DialogueRole = Role | "followup";

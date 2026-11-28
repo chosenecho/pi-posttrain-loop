@@ -15,6 +15,7 @@ import {
   resolveSynthRunPreset,
   SYNTH_EXPORT_PRESETS,
   SYNTH_RUN_PRESETS,
+  SYNTH_TIER_PROFILES,
 } from "../synth/presets.js";
 import {
   getSynthStatus,
@@ -177,13 +178,20 @@ function parseProfileList(raw: string | undefined): SynthProfile[] | undefined {
   if (raw === undefined) return undefined;
   const items = raw
     .split(",")
-    .map((s) => s.trim())
+    .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
   if (items.length === 0) {
     throw new Error("--profiles 不能为空");
   }
   const result: SynthProfile[] = [];
   for (const item of items) {
+    if (item in SYNTH_TIER_PROFILES) {
+      const expanded = SYNTH_TIER_PROFILES[item as keyof typeof SYNTH_TIER_PROFILES];
+      for (const p of expanded) {
+        if (!result.includes(p)) result.push(p);
+      }
+      continue;
+    }
     const profile = parseOptionalSynthProfile(item)!;
     if (!result.includes(profile)) result.push(profile);
   }
@@ -263,6 +271,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         "call-attempts": { type: "string" },
         "retry-delay-ms": { type: "string" },
         "include-unjudged": { type: "boolean", default: false },
+        "no-search": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
       strict: true,
@@ -286,6 +295,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
       callMaxAttempts: parsePositiveInt(values["call-attempts"], "--call-attempts"),
       callRetryDelayMs: parseIntOpt(values["retry-delay-ms"], "--retry-delay-ms"),
       includeUnjudged: values["include-unjudged"],
+      ...(values["no-search"] ? { enableSearch: false } : {}),
       onProgress: (msg) => console.error(msg),
     });
     console.log(JSON.stringify(summary, null, 2));
@@ -324,6 +334,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         export: { type: "string" },
         system: { type: "string" },
         "system-file": { type: "string" },
+        "no-search": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
       strict: true,
@@ -374,6 +385,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
       },
       exportPath: values.export,
       exportSystemPrompt,
+      ...(values["no-search"] ? { enableSearch: false } : {}),
       onProgress: (msg) => console.error(msg),
     });
     console.log(JSON.stringify({ ...(preset ? { preset: preset.name } : {}), ...summary }, null, 2));
@@ -462,6 +474,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
         export: { type: "string" },
         system: { type: "string" },
         "system-file": { type: "string" },
+        "no-search": { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
       strict: true,
@@ -496,6 +509,7 @@ export async function runSynthCli(args: string[]): Promise<void> {
       },
       exportPath: values.export,
       exportSystemPrompt,
+      ...(values["no-search"] ? { enableSearch: false } : {}),
       onProgress: (msg) => console.error(msg),
     });
     console.log(JSON.stringify(summary, null, 2));

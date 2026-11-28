@@ -93,6 +93,7 @@ export class DataMakerStore {
       }
       this.db.exec(SCHEMA_SQL);
       this.db.exec(LEGACY_DROP_SQL);
+      this.ensureQuestionsColumns();
     }
 
     const hasTable = (name: string) => this.hasTable(name);
@@ -153,6 +154,22 @@ export class DataMakerStore {
     return row !== undefined;
   }
 
+  private ensureQuestionsColumns(): void {
+    if (!this.hasTable("questions")) return;
+    const cols = this.db.prepare("PRAGMA table_info(questions)").all() as Array<{ name: string }>;
+    const names = new Set(cols.map((c) => c.name));
+    if (!names.has("question_mode")) {
+      this.db.exec(
+        "ALTER TABLE questions ADD COLUMN question_mode TEXT NOT NULL DEFAULT 'direct' CHECK(question_mode IN ('direct', 'todo_plan', 'clarify_question'))",
+      );
+    }
+    if (!names.has("task_spec_json")) {
+      this.db.exec(
+        "ALTER TABLE questions ADD COLUMN task_spec_json TEXT CHECK(task_spec_json IS NULL OR (json_valid(task_spec_json) AND json_type(task_spec_json) = 'object'))",
+      );
+    }
+  }
+
   // --- Corpus / Splits / Questions ---
 
   getVideoSplit(videoIdOrKey: string): VideoSplitRecord | undefined {
@@ -186,6 +203,8 @@ export class DataMakerStore {
     materialId: number;
     question: string;
     generationRunId?: number | null;
+    questionMode?: import("./schema-sql.js").QuestionMode;
+    taskSpec?: import("./schema-sql.js").QuestionTaskSpec | null;
     createdAt?: string;
   }): { record: QuestionRecord; inserted: boolean } {
     return this.corpus.insertQuestion(input);

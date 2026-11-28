@@ -1,4 +1,6 @@
 import type {
+  QuestionMode,
+  SynthProfile,
   ToolDefinition,
   ToolStep,
   TrainingMessage,
@@ -51,6 +53,116 @@ export const GENERALIZED_WEB_SEARCH_VARIANTS: readonly WebSearchToolVariant[] = 
   },
 ];
 
+/**
+ * Exact 1:1 Pi v1.7.0 `todo` extension tool schema (`packages/coding-agent/examples/extensions/todo.ts`).
+ */
+export const PI_TODO_TOOL_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "todo",
+    description: "Manage a todo list. Actions: list, add (text), toggle (id), clear",
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list", "add", "toggle", "clear"],
+        },
+        text: {
+          type: "string",
+          description: "Todo text (for add)",
+        },
+        id: {
+          type: "number",
+          description: "Todo ID (for toggle)",
+        },
+      },
+      required: ["action"],
+    },
+  },
+};
+
+/**
+ * Exact 1:1 Pi v1.7.0 `question` extension tool schema (`packages/coding-agent/examples/extensions/question.ts`).
+ */
+export const PI_QUESTION_TOOL_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "question",
+    description: "Ask the user a question and let them pick from options. Use when you need user input to proceed.",
+    parameters: {
+      type: "object",
+      properties: {
+        question: {
+          type: "string",
+          description: "The question to ask the user",
+        },
+        options: {
+          type: "array",
+          description: "Options for the user to choose from",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string", description: "Display label for the option" },
+              description: { type: "string", description: "Optional description shown below label" },
+            },
+            required: ["label"],
+          },
+        },
+      },
+      required: ["question", "options"],
+    },
+  },
+};
+
+/**
+ * Exact 1:1 Pi v1.7.0 `questionnaire` extension tool schema (`packages/coding-agent/examples/extensions/questionnaire.ts`).
+ */
+export const PI_QUESTIONNAIRE_TOOL_DEFINITION: ToolDefinition = {
+  type: "function",
+  function: {
+    name: "questionnaire",
+    description:
+      "Ask the user one or more questions. Use for clarifying requirements, getting preferences, or confirming decisions. For single questions, shows a simple option list. For multiple questions, shows a tab-based interface.",
+    parameters: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          description: "Questions to ask the user",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string", description: "Unique identifier for this question" },
+              label: {
+                type: "string",
+                description: "Short contextual label for tab bar, e.g. 'Scope', 'Priority' (defaults to Q1, Q2)",
+              },
+              prompt: { type: "string", description: "The full question text to display" },
+              options: {
+                type: "array",
+                description: "Available options to choose from",
+                items: {
+                  type: "object",
+                  properties: {
+                    value: { type: "string", description: "The value returned when selected" },
+                    label: { type: "string", description: "Display label for the option" },
+                    description: { type: "string", description: "Optional description shown below label" },
+                  },
+                  required: ["value", "label"],
+                },
+              },
+              allowOther: { type: "boolean", description: "Allow 'Type something' option (default: true)" },
+            },
+            required: ["id", "prompt", "options"],
+          },
+        },
+      },
+      required: ["questions"],
+    },
+  },
+};
+
 export function buildToolDefinition(variant: WebSearchToolVariant): ToolDefinition {
   return {
     type: "function",
@@ -90,12 +202,85 @@ export function extractSearchQuery(args: Record<string, unknown>): string {
   return JSON.stringify(args);
 }
 
+const SEARCH_TOOL_NAMES = new Set<string>([
+  "web_search",
+  ...GENERALIZED_WEB_SEARCH_VARIANTS.map((v) => v.name),
+]);
+
+export function isWebSearchToolName(toolName: string): boolean {
+  return SEARCH_TOOL_NAMES.has(toolName);
+}
+
 export function remapToolArguments(
   step: ToolStep,
   variant: WebSearchToolVariant,
 ): Record<string, unknown> {
+  if (!isWebSearchToolName(step.toolName)) {
+    return step.arguments;
+  }
   const query = extractSearchQuery(step.arguments);
   return { [variant.queryParam]: query };
+}
+
+export function resolveExportToolName(
+  step: ToolStep,
+  variant: WebSearchToolVariant,
+): string {
+  return isWebSearchToolName(step.toolName) ? variant.name : step.toolName;
+}
+
+/**
+ * Resolves the top-level `tools` declaration array for an exported sample based on
+ * the steps actually invoked and/or the sample's profile/questionMode.
+ */
+export function buildSampleToolDefinitions(options: {
+  steps: readonly ToolStep[];
+  searchVariant?: WebSearchToolVariant;
+  profile?: SynthProfile | string | null;
+  questionMode?: QuestionMode | string | null;
+  alwaysIncludeSearch?: boolean;
+}): ToolDefinition[] {
+  const usedToolNames = new Set(options.steps.map((s) => s.toolName));
+  const usedSearch = options.steps.some((s) => isWebSearchToolName(s.toolName));
+  const includeSearch = Boolean(
+    usedSearch
+    || options.alwaysIncludeSearch
+    || options.profile === "search"
+    || options.profile === "todo"
+    || options.profile === "clarify"
+    || options.questionMode === "todo_plan"
+    || options.questionMode === "clarify_question",
+  );
+  const includeTodo = Boolean(
+    usedToolNames.has("todo")
+    || options.profile === "todo"
+    || options.questionMode === "todo_plan",
+  );
+  const includeQuestion = Boolean(
+    usedToolNames.has("question")
+    || options.profile === "clarify"
+    || options.questionMode === "clarify_question",
+  );
+  const includeQuestionnaire = Boolean(
+    usedToolNames.has("questionnaire")
+    || options.profile === "clarify"
+    || options.questionMode === "clarify_question",
+  );
+
+  const defs: ToolDefinition[] = [];
+  if (includeSearch && options.searchVariant) {
+    defs.push(buildToolDefinition(options.searchVariant));
+  }
+  if (includeTodo) {
+    defs.push(PI_TODO_TOOL_DEFINITION);
+  }
+  if (includeQuestion) {
+    defs.push(PI_QUESTION_TOOL_DEFINITION);
+  }
+  if (includeQuestionnaire) {
+    defs.push(PI_QUESTIONNAIRE_TOOL_DEFINITION);
+  }
+  return defs;
 }
 
 export function formatToolCallThinking(
@@ -127,6 +312,7 @@ export function buildToolStepMessages(
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i]!;
+    const toolName = resolveExportToolName(step, variant);
     const mappedArgs = remapToolArguments(step, variant);
     const callId = `${prefix}_${step.stepNo}`;
     const overrideThought = Array.isArray(options.preCallThoughts)
@@ -148,7 +334,7 @@ export function buildToolStepMessages(
           id: callId,
           type: "function",
           function: {
-            name: variant.name,
+            name: toolName,
             arguments: JSON.stringify(mappedArgs),
           },
         },
@@ -156,7 +342,7 @@ export function buildToolStepMessages(
     });
     messages.push({
       role: "tool",
-      name: variant.name,
+      name: toolName,
       tool_call_id: callId,
       content: step.toolOutput,
     });

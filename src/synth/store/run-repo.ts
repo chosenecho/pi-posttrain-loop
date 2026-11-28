@@ -281,7 +281,7 @@ export class RunRepository {
   }): TargetQuestionRow[] {
     const targetSplit = filter.split !== undefined ? validateSplit(filter.split) : undefined;
     let sql = `
-      SELECT q.id, q.material_id, m.video_id, m.content, q.question
+      SELECT q.id, q.material_id, m.video_id, m.content, q.question, q.question_mode, q.task_spec_json
       FROM questions q
       JOIN materials m ON m.id = q.material_id
       LEFT JOIN runs gr ON gr.id = q.generation_run_id
@@ -324,6 +324,8 @@ export class RunRepository {
       video_id: string;
       content: string;
       question: string;
+      question_mode?: string | null;
+      task_spec_json?: string | null;
     }>;
 
     const materialSplitMap = targetSplit !== undefined ? this.corpus.getMaterialVideoAndSplitMap() : undefined;
@@ -334,20 +336,37 @@ export class RunRepository {
         const matSplit = materialSplitMap.get(Number(row.material_id))?.split ?? "train";
         return matSplit === targetSplit;
       })
-      .map((row) => ({
-        id: Number(row.id),
-        materialId: Number(row.material_id),
-        videoId: row.video_id,
-        materialContent: row.content,
-        question: row.question,
-      }));
+      .map((row) => {
+        let taskSpec: import("../../shared/types.js").QuestionTaskSpec | null = null;
+        if (row.task_spec_json) {
+          try {
+            taskSpec = JSON.parse(row.task_spec_json) as import("../../shared/types.js").QuestionTaskSpec;
+          } catch {
+            taskSpec = null;
+          }
+        }
+        const questionMode = (row.question_mode === "todo_plan" || row.question_mode === "clarify_question")
+          ? row.question_mode
+          : "direct";
+        return {
+          id: Number(row.id),
+          materialId: Number(row.material_id),
+          videoId: row.video_id,
+          materialContent: row.content,
+          question: row.question,
+          questionMode,
+          ...(taskSpec ? { taskSpec } : {}),
+        };
+      });
   }
 
   queryResultTurns(runId: number): ResultTurnRow[] {
     return this.db.prepare(`
       SELECT r.id AS result_id,
              i.run_id,
+             json_extract(ru.config_json, '$.profile') AS run_profile,
              q.id AS question_id,
+             q.question_mode,
              q.material_id,
              r.turn_count,
              t.turn_no,
@@ -357,6 +376,7 @@ export class RunRepository {
              a.attempt_no
       FROM results r
       JOIN run_items i ON i.id = r.run_item_id
+      JOIN runs ru ON ru.id = i.run_id
       JOIN questions q ON q.id = i.question_id
       JOIN turns t ON t.run_item_id = i.id
       JOIN attempts a ON a.id = t.passed_attempt_id

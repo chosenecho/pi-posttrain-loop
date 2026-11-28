@@ -19,6 +19,10 @@ test("all built-in synth and cot presets resolve cleanly and reject unknown name
   assert.equal(resolveSynthRunPreset("train-trap")?.maxQuestionsPerVideo, 2);
   assert.equal(resolveSynthRunPreset("train-search")?.profile, "search");
   assert.equal(resolveSynthRunPreset("train-search")?.maxQuestionsPerVideo, 2);
+  assert.equal(resolveSynthRunPreset("train-todo")?.profile, "todo");
+  assert.equal(resolveSynthRunPreset("train-todo")?.maxQuestionsPerVideo, 2);
+  assert.equal(resolveSynthRunPreset("train-clarify")?.profile, "clarify");
+  assert.equal(resolveSynthRunPreset("train-clarify")?.maxQuestionsPerVideo, 2);
   assert.equal(resolveSynthRunPreset("dpo-pool")?.split, "dpo");
   assert.throws(() => resolveSynthRunPreset("test-freeze"), /未知 synth 预设/);
   assert.throws(() => resolveSynthRunPreset("bad-preset"), /未知 synth 预设/);

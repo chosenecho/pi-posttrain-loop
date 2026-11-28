@@ -22,7 +22,7 @@
 
 ## 保存
 
-调用 `save_questions(video_id, questions)`，其中 `questions` 是问题字符串数组。
+调用 `save_questions(video_id, questions)`，其中 `questions` 是问题数组（常规档位为问题字符串数组；长流程规划档 `todo` 与反问澄清档 `clarify` 可按 `question-design` Skill 要求传入包含 `question` 及 `expected_phases` / `hidden_user_persona` / `missing_slots` 的对象数组，或问题字符串数组）。
 收到成功回执后，简短报告保存结果，以工具返回的实际数量为准。
 
 工具未接入或调用失败时，输出以下结构的待保存 JSON，并明确尚未入库：

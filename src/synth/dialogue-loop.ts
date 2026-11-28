@@ -258,7 +258,11 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
                     options.runSearchAnswer!({
                       role: "answer",
                       systemPrompt: answerPrompt,
-                      input: answerWireInput,
+                      input: {
+                        ...answerWireInput,
+                        ...(item.questionMode && item.questionMode !== "direct" ? { _questionMode: item.questionMode } : {}),
+                        ...(item.taskSpec ? { _taskSpec: item.taskSpec } : {}),
+                      },
                     }),
                   );
                   lastRawOutput = result.answer;
@@ -332,6 +336,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
           material: item.materialContent,
           ...(historyMessages.length > 0 ? { history: [...historyMessages] } : {}),
           question: currentUserContent,
+          ...(item.taskSpec && (item.questionMode === "todo_plan" || item.questionMode === "clarify_question")
+            ? { taskSpec: item.taskSpec }
+            : {}),
           ...(attemptToolSteps.length > 0
             ? {
                 toolSteps: attemptToolSteps.map((s) => ({
