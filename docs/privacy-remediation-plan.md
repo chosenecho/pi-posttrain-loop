@@ -6,6 +6,8 @@
 - 基线：`c98ecfc`（创建分支时的 `main`）
 - 目标：收紧密钥与服务地址的绑定，减少日志正文暴露，在发布与旧配置迁移时阻止敏感字段流出。
 
+> 后续模块整理说明（2026-11-28）：本文保留 `c98ecfc`时期的问题、分支与历史验收数量。可映射的源码引用已指向现行模块；已删除的旧 JSONL 迁移器与测试保留为历史路径，不代表当前命令。当前运行契约与最新验收见[架构说明](architecture.md)和[代码修复验收记录](code-quality-remediation-validation.md)。
+
 ## 证据与范围
 
 本轮检查尚未确认真实凭据或个人信息已经泄露。以下四项均为源码可达的条件风险；实施顺序按潜在影响及改动依赖安排，不代表已确认漏洞的严重度。
@@ -18,9 +20,9 @@
 
 ### 基线行为与修改位置
 
-- [候选模型配置](../src/eval/candidate-client.ts#L59) 分别回退 `baseUrl` 和 `apiKey`；只覆盖地址时，可能把 `LLM_API_KEY` 发往新服务。
-- [推理配置](../src/reasoning-engine.ts#L113) 的 writer、judge 存在同类回退。
-- [评测入口](../src/eval-cli.ts#L897) 多处合并 `EVAL_LLM_*` 与主配置，需一并核对所有调用入口。
+- [候选模型配置](../src/eval/candidate-client.ts) 分别回退 `baseUrl` 和 `apiKey`；只覆盖地址时，可能把 `LLM_API_KEY` 发往新服务。
+- [推理配置](../src/reasoning/engine.ts) 的 writer、judge 存在同类回退。
+- [评测工作流](../src/eval/workflows.ts) 多处合并 `EVAL_LLM_*` 与主配置，需一并核对所有调用入口。
 
 ### 实施规则
 
@@ -38,16 +40,16 @@
 - 更换主机、端口、协议或 API 路径后，缺少专用密钥时，在调用网络客户端之前失败。
 - 专用密钥只发送至其对应地址；候选客户端使用 `EMPTY` 或显式空密钥时省略 `Authorization`。
 - 错误、进度和配置快照均未出现合成密钥标记。
-- 扩展[候选模型测试](../test/eval-m3.test.ts)、[推理测试](../test/reasoning.test.ts)及相关评测入口测试；使用替身客户端检查请求头，覆盖同地址、跨地址、显式密钥和无认证场景。
+- 扩展[候选模型测试](../test/eval-evaluate-and-cli.test.ts)、[推理测试](../test/reasoning.test.ts)及相关评测入口测试；使用替身客户端检查请求头，覆盖同地址、跨地址、显式密钥和无认证场景。
 
 ## 2. 收紧普通日志与错误内容
 
 ### 基线行为与修改位置
 
-- [出题失败分支](../src/corpus-questions.ts#L164) 将完整模型输出拼入异常，再进入重试及最终进度日志。
+- [出题失败分支](../src/synth/corpus-questions.ts) 将完整模型输出拼入异常，再进入重试及最终进度日志。
 - [评测循环](../src/eval/probe-loop.ts) 将 feedback、issues 的正文片段写入进度日志。
-- [候选模型客户端](../src/eval/candidate-client.ts#L243) 将上游错误响应正文片段放入异常；后续流程会记录或输出异常。
-- [Pi 客户端](../src/pi-runner.ts#L115) 当前仅替换本次密钥的精确字面值，未对其他正文信息作通用处理。
+- [候选模型客户端](../src/eval/candidate-client.ts) 将上游错误响应正文片段放入异常；后续流程会记录或输出异常。
+- [Pi 客户端](../src/shared/pi-runner.ts) 当前仅替换本次密钥的精确字面值，未对其他正文信息作通用处理。
 
 ### 实施规则
 
@@ -62,13 +64,13 @@
 - 用合成的密钥、邮箱和个人信息标记构造模型异常输出、feedback、HTTP 错误及非 JSON 响应，断言这些标记均未进入普通异常消息、进度或 stdout/stderr。
 - 模型未调用保存工具时，日志仍可显示失败类型、重试次数及调用编号。
 - 现有原始输出追溯能力保持可用；新增错误字段不会重复存放正文。
-- 扩展[语料流程测试](../test/corpus.test.ts)、[Pi 客户端测试](../test/pi-runner.test.ts)、[候选模型测试](../test/eval-m3.test.ts)及[评测构建测试](../test/eval-probe.test.ts)。测试替身覆盖失败和重试路径。
+- 扩展[语料流程测试](../test/corpus.test.ts)、[Pi 客户端测试](../test/pi-runner.test.ts)、[候选模型测试](../test/eval-evaluate-and-cli.test.ts)及[评测构建测试](../test/eval-store-and-make.test.ts)。测试替身覆盖失败和重试路径。
 
 ## 3. 为发布流程增加文件白名单与敏感信息检查
 
 ### 基线行为与修改位置
 
-[发布脚本](../scripts/publish_modelscope.py#L507) 的最终检查主要覆盖说明和清单的绝对路径；[上传入口](../scripts/publish_modelscope.py#L533) 只确认必需文件存在，随后上传整个目录。训练正文及意外混入文件缺少完整检查。
+[发布脚本](../scripts/publish_modelscope.py) 的最终检查主要覆盖说明和清单的绝对路径；[上传入口](../scripts/publish_modelscope.py) 只确认必需文件存在，随后上传整个目录。训练正文及意外混入文件缺少完整检查。
 
 ### 实施规则
 
@@ -92,18 +94,18 @@
 
 ### 基线行为与修改位置
 
-[迁移代码](../src/migrate.ts#L268) 复制整个旧 `model` 对象后，只删除顶层 `apiKey` 和 `LLM_API_KEY`；其他命名或嵌套的认证字段可能被写入运行快照。
+历史迁移模块 `src/migrate.ts`（现已删除） 复制整个旧 `model` 对象后，只删除顶层 `apiKey` 和 `LLM_API_KEY`；其他命名或嵌套的认证字段可能被写入运行快照。
 
 ### 实施规则
 
-1. 参考[主 CLI 的快照构造](../src/cli.ts#L135)，只保留模型标识、API 根地址、token/context 上限、思考等级及超时等明确需要的字段。
+1. 参考[通用模型快照构造](../src/shared/pi-runner.ts)，只保留模型标识、API 根地址、token/context 上限、思考等级及超时等明确需要的字段。
 2. 对保留值做类型检查；处理旧版 `id` 与 `modelId` 等兼容字段，不展开任意嵌套对象。
 3. API 根地址复用已有校验规则，排除 userinfo、查询参数和片段，避免凭据藏入被允许的地址字段。
 4. 历史原始文件和既有数据库保持原样。代码修复只约束后续迁移；若后续发现历史敏感快照，另行制定数据处理步骤。
 
 ### 验收
 
-- 扩展[迁移测试](../test/migrate.test.ts)，覆盖 `apiKey`、`LLM_API_KEY`、`api_key`、`Authorization`、嵌套 headers/auth 及未知字段。
+- 扩展历史迁移测试 `test/migrate.test.ts`（随旧入口退役），覆盖 `apiKey`、`LLM_API_KEY`、`api_key`、`Authorization`、嵌套 headers/auth 及未知字段。
 - 用合成秘密值检查迁移后的 `config_json`，确认未落库；合法模型配置仍完整可用。
 - 含凭据的 URL 在写库前校验失败，诊断隐藏原始值。
 - 保留已有问题 ID、结果、分区和迁移行为的回归断言。

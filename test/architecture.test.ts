@@ -74,6 +74,7 @@ test("no production module outside dedicated store files executes raw SQL via .d
     rel.startsWith("synth/store/")
     || rel.startsWith("eval/store/")
     || rel === "reasoning/store.ts"
+    || rel === "shared/task-store.ts" // local writer coordination only
     || rel === "synth/eval-guard.ts" // intentional read-only cross-DB guard (must not import src/eval/* per ADR 0004)
     || rel === "synth/question-store.ts"; // legacy standalone createSaveQuestionsTool helper accepts raw DatabaseSync
 

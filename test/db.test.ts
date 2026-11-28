@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { DataMakerStore, normalizeText, sha256Hex } from "../src/synth/store/index.js";
@@ -265,7 +266,7 @@ test("negative constraints reject invalid results, cross-turn attempts, partial 
 
     // 1. Cannot bind a revise attempt as passed_attempt_id
     assert.throws(() => {
-      store.db.prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t1Revise, t1);
+      storeConnection(store).prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t1Revise, t1);
     }, /passed_attempt_id must reference a completed pass attempt/);
 
     // 2. Cannot bind an attempt from another turn/question
@@ -274,26 +275,26 @@ test("negative constraints reject invalid results, cross-turn attempts, partial 
     store.recordAttemptAnswer(t2Pass, "问题2通过回答");
     store.finishAttemptReview(t2Pass, { decision: "pass", issues: [], feedback: "" });
     assert.throws(() => {
-      store.db.prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t2Pass, t1);
+      storeConnection(store).prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t2Pass, t1);
     }, /passed_attempt_id must reference a completed pass attempt/);
 
     // 3. Cannot insert result for non-pass run_item
     assert.throws(() => {
-      store.db.prepare("INSERT INTO results (run_item_id, turn_count, created_at) VALUES (?, 1, ?)").run(item1, new Date().toISOString());
+      storeConnection(store).prepare("INSERT INTO results (run_item_id, turn_count, created_at) VALUES (?, 1, ?)").run(item1, new Date().toISOString());
     }, /result requires run_item with status = pass/);
 
     // 4. Cannot insert result for multi-turn where Turn 1 passed but Turn 2 did not pass
-    store.db.prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t2Pass, t2);
+    storeConnection(store).prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t2Pass, t2);
     const t2Turn2 = store.createTurn({ runItemId: item2, turnNo: 2, userContent: "追问" });
     store.finishTurnNonPass(t2Turn2, "exhausted");
     assert.throws(() => {
       store.transaction(() => {
-        store.db.prepare("UPDATE run_items SET status = 'pass' WHERE id = ?").run(item2);
-        store.db.prepare("INSERT INTO results (run_item_id, turn_count, created_at) VALUES (?, 2, ?)").run(item2, new Date().toISOString());
+        storeConnection(store).prepare("UPDATE run_items SET status = 'pass' WHERE id = ?").run(item2);
+        storeConnection(store).prepare("INSERT INTO results (run_item_id, turn_count, created_at) VALUES (?, 2, ?)").run(item2, new Date().toISOString());
       });
     }, /every turn in a result must have status = pass/);
     // Also verify the transaction rolled back run_item status cleanly!
-    const item2Status = (store.db.prepare("SELECT status FROM run_items WHERE id = ?").get(item2) as { status: string }).status;
+    const item2Status = (storeConnection(store).prepare("SELECT status FROM run_items WHERE id = ?").get(item2) as { status: string }).status;
     assert.equal(item2Status, "running");
 
     // 5. Cross-run / cross-turn model_calls must fail
@@ -309,18 +310,18 @@ test("negative constraints reject invalid results, cross-turn attempts, partial 
     const t1Pass = store.startAttempt({ turnId: t1, attemptNo: 2 });
     store.recordAttemptAnswer(t1Pass, "最终通过回答");
     store.finishAttemptReview(t1Pass, { decision: "pass", issues: [], feedback: "" });
-    store.db.prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t1Pass, t1);
+    storeConnection(store).prepare("UPDATE turns SET status = 'pass', passed_attempt_id = ? WHERE id = ?").run(t1Pass, t1);
     store.finalizePassedRunItem(item1, 1);
 
-    assert.throws(() => store.db.prepare("UPDATE materials SET content = '篡改' WHERE id = ?").run(mat.id), /cannot modify material/);
-    assert.throws(() => store.db.prepare("DELETE FROM materials WHERE id = ?").run(mat.id), /cannot delete material/);
-    assert.throws(() => store.db.prepare("UPDATE questions SET question = '篡改' WHERE id = ?").run(q1.id), /cannot modify question/);
-    assert.throws(() => store.db.prepare("DELETE FROM questions WHERE id = ?").run(q1.id), /cannot delete question/);
-    assert.throws(() => store.db.prepare("UPDATE run_items SET status = 'drop' WHERE id = ?").run(item1), /cannot modify run_item/);
-    assert.throws(() => store.db.prepare("UPDATE turns SET status = 'drop', passed_attempt_id = NULL WHERE id = ?").run(t1), /cannot modify turn/);
+    assert.throws(() => storeConnection(store).prepare("UPDATE materials SET content = '篡改' WHERE id = ?").run(mat.id), /cannot modify material/);
+    assert.throws(() => storeConnection(store).prepare("DELETE FROM materials WHERE id = ?").run(mat.id), /cannot delete material/);
+    assert.throws(() => storeConnection(store).prepare("UPDATE questions SET question = '篡改' WHERE id = ?").run(q1.id), /cannot modify question/);
+    assert.throws(() => storeConnection(store).prepare("DELETE FROM questions WHERE id = ?").run(q1.id), /cannot delete question/);
+    assert.throws(() => storeConnection(store).prepare("UPDATE run_items SET status = 'drop' WHERE id = ?").run(item1), /cannot modify run_item/);
+    assert.throws(() => storeConnection(store).prepare("UPDATE turns SET status = 'drop', passed_attempt_id = NULL WHERE id = ?").run(t1), /cannot modify turn/);
     assert.throws(() => store.createTurn({ runItemId: item1, turnNo: 2, userContent: "强行追加" }), /cannot add turn/);
-    assert.throws(() => store.db.prepare("UPDATE attempts SET answer = '篡改' WHERE id = ?").run(t1Pass), /cannot modify winning attempt/);
-    assert.throws(() => store.db.prepare("DELETE FROM attempts WHERE id = ?").run(t1Pass), /cannot delete winning attempt/);
+    assert.throws(() => storeConnection(store).prepare("UPDATE attempts SET answer = '篡改' WHERE id = ?").run(t1Pass), /cannot modify winning attempt/);
+    assert.throws(() => storeConnection(store).prepare("DELETE FROM attempts WHERE id = ?").run(t1Pass), /cannot delete winning attempt/);
 
     assert.equal(store.checkIntegrity().ok, true);
   } finally {
@@ -334,8 +335,9 @@ test("startup recovery marks orphaned running records as interrupted without tou
     const mat = store.upsertMaterial({ videoId: "BV4/P001", content: "中断恢复原文" });
     const q1 = store.insertQuestion({ id: 1, materialId: mat.id, question: "已完成问题" }).record;
     const q2 = store.insertQuestion({ id: 2, materialId: mat.id, question: "中途崩溃问题" }).record;
+    const q3 = store.insertQuestion({ id: 3, materialId: mat.id, question: "崩溃时尚未派发的问题" }).record;
     const runId = createSampleRun(store, { maxAttempts: 3, maxTurns: 1 });
-    const items = store.createRunItems(runId, [q1.id, q2.id]);
+    const items = store.createRunItems(runId, [q1.id, q2.id, q3.id]);
 
     // Item 1 completed & in results
     const i1 = items.get(q1.id)!;
@@ -360,9 +362,11 @@ test("startup recovery marks orphaned running records as interrupted without tou
     const a2 = store.startAttempt({ turnId: t2, attemptNo: 1 });
     store.startModelCall({ runId, role: "answer", turnId: t2, attemptId: a2, inputRefs: {} });
 
+    // Emulate a record imported from an earlier process, rather than interrupting this live owner.
+    storeConnection(store).prepare("UPDATE runs SET owner_token = NULL WHERE id = ?").run(runId);
     const interrupted = store.markInterruptedRuns();
-    assert.deepEqual(interrupted, { runs: 1, runItems: 1, turns: 1, attempts: 1, modelCalls: 1 });
-    assert.deepEqual(store.queryOutcomeCounts(runId), { pass: 1, interrupted: 1 });
+    assert.deepEqual(interrupted, { runs: 1, runItems: 2, turns: 1, attempts: 1, modelCalls: 1 });
+    assert.deepEqual(store.queryOutcomeCounts(runId), { pass: 1, interrupted: 2 });
     assert.equal(store.queryResultTurns(runId).length, 1);
     assert.equal(store.checkIntegrity().ok, true);
   } finally {

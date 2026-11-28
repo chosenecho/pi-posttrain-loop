@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,7 @@ import { ReasoningStore } from "../src/reasoning/store.js";
 import { runProbeCalibration } from "../src/eval/calibrate.js";
 import { EvalStore } from "../src/eval/store/index.js";
 import { gradeEvalRun } from "../src/eval/eval-grader.js";
+import { bindCandidate } from "../src/eval/candidate-client.js";
 import { runSuiteEvaluation } from "../src/eval/eval-runner.js";
 import type { RoleRunner, Skill } from "../src/shared/types.js";
 
@@ -97,8 +99,8 @@ test("question generation publishes only controlled errors and retains malformed
         assert.equal(summary.errors, 1);
         const code = malformed ? "model_save_tool_missing" : "unexpected_error";
         assertPublic(progress, code);
-        assertErrorColumns(store.db, ["model_calls"], code);
-        const call = store.db.prepare("SELECT output_text FROM model_calls").get();
+        assertErrorColumns(storeConnection(store), ["model_calls"], code);
+        const call = storeConnection(store).prepare("SELECT output_text FROM model_calls").get();
         assert.equal(call?.output_text, malformed ? PRIVATE_MESSAGE : null);
       } finally {
         store.close();
@@ -135,7 +137,7 @@ test("dialogue role failures hide exceptions across retries, progress and every 
         assert.equal(summary.errors, 1);
         assertPublic(progress);
         assert.ok(progress.some((message) => message.includes("第 1/2 次")));
-        assertErrorColumns(store.db, ["model_calls", "attempts", "turns", "run_items", "runs"]);
+        assertErrorColumns(storeConnection(store), ["model_calls", "attempts", "turns", "run_items", "runs"]);
       } finally {
         store.close();
       }
@@ -163,8 +165,8 @@ test("malformed judge and followup outputs stay in trace instead of public error
           onProgress: (message) => progress.push(message),
         });
         assertPublic(progress, "model_output_invalid");
-        assertErrorColumns(store.db, ["model_calls", "attempts", "turns", "run_items"], "model_output_invalid");
-        const row = store.db.prepare("SELECT output_text FROM model_calls WHERE role = ? AND status = 'error'").get(failedRole);
+        assertErrorColumns(storeConnection(store), ["model_calls", "attempts", "turns", "run_items"], "model_output_invalid");
+        const row = storeConnection(store).prepare("SELECT output_text FROM model_calls WHERE role = ? AND status = 'error'").get(failedRole);
         assert.equal(row?.output_text, PRIVATE_MESSAGE);
       } finally {
         store.close();
@@ -184,18 +186,19 @@ test("candidate evaluation hides Error, string and object exceptions in retry pr
         const summary = await runSuiteEvaluation({
           evalStore: store, suiteName: "privacy-fixture", candidate: "fixture", modelId: "candidate-fixture",
           callMaxAttempts: 2, callRetryDelayMs: 0,
-          runCandidate: async () => {
+          baseUrl: "http://fixture.invalid/v1",
+          candidateFactory: (spec) => bindCandidate(spec, async () => {
             calls++;
             if (kind === "string") throw PRIVATE_MESSAGE;
             if (kind === "object") throw { message: PRIVATE_MESSAGE, body: PRIVATE_MESSAGE, status: 503 };
             throw sensitiveException();
-          },
+          }),
           onProgress: (message) => progress.push(message),
         });
         assert.equal(calls, 2);
         assert.equal(summary.errorTurns, 1);
         assertPublic(progress);
-        assertErrorColumns(store.db, ["agent_calls", "eval_predictions", "eval_runs"]);
+        assertErrorColumns(storeConnection(store), ["agent_calls", "eval_predictions", "eval_runs"]);
       } finally {
         store.close();
       }
@@ -211,7 +214,7 @@ test("evaluation grading publishes controlled transport and parsing failures", a
         seedSuite(store);
         const evaluated = await runSuiteEvaluation({
           evalStore: store, suiteName: "privacy-fixture", candidate: "fixture", modelId: "candidate-fixture",
-          runCandidate: async () => "fixture answer", callMaxAttempts: 1,
+          baseUrl: "http://fixture.invalid/v1", candidateFactory: (spec) => bindCandidate(spec, async () => "fixture answer"), callMaxAttempts: 1,
         });
         const progress: string[] = [];
         let calls = 0;
@@ -229,7 +232,7 @@ test("evaluation grading publishes controlled transport and parsing failures", a
         assert.equal(summary.errors, 1);
         const code = malformed ? "model_output_invalid" : "unexpected_error";
         assertPublic(progress, code);
-        assertErrorColumns(store.db, ["agent_calls"], code);
+        assertErrorColumns(storeConnection(store), ["agent_calls"], code);
       } finally {
         store.close();
       }
@@ -278,9 +281,9 @@ test("calibration hides injected bare-model/grader exceptions and malformed grad
         assert.equal(summary.errors, 1);
         const code = failure === "parse" ? "model_output_invalid" : "unexpected_error";
         assertPublic(progress, code);
-        assertErrorColumns(store.db, ["agent_calls"], code);
+        assertErrorColumns(storeConnection(store), ["agent_calls"], code);
         if (failure === "parse") {
-          const row = store.db.prepare("SELECT output_text FROM agent_calls WHERE error IS NOT NULL").get();
+          const row = storeConnection(store).prepare("SELECT output_text FROM agent_calls WHERE error IS NOT NULL").get();
           assert.equal(row?.output_text, PRIVATE_MESSAGE);
         }
       } finally {
@@ -296,14 +299,14 @@ test("fatal evaluation progress exceptions remain controlled in the failed run r
     seedSuite(store);
     await assert.rejects(runSuiteEvaluation({
       evalStore: store, suiteName: "privacy-fixture", candidate: "fixture", modelId: "candidate-fixture",
-      runCandidate: async () => "fixture answer", callMaxAttempts: 1,
+      baseUrl: "http://fixture.invalid/v1", candidateFactory: (spec) => bindCandidate(spec, async () => "fixture answer"), callMaxAttempts: 1,
       onProgress: () => { throw sensitiveException(); },
     }), (error: unknown) => {
       assert.ok(error instanceof Error);
       assertPublic([error.message]);
       return true;
     });
-    assertErrorColumns(store.db, ["eval_runs"]);
+    assertErrorColumns(storeConnection(store), ["eval_runs"]);
   } finally {
     store.close();
   }
@@ -325,7 +328,7 @@ test("fatal calibration progress exceptions remain controlled in the failed run 
       assertPublic([error.message]);
       return true;
     });
-    assertErrorColumns(store.db, ["probe_runs", "agent_calls"]);
+    assertErrorColumns(storeConnection(store), ["probe_runs", "agent_calls"]);
   } finally {
     store.close();
   }
@@ -362,7 +365,7 @@ test("reasoning backfill hides injected writer/grader exceptions in trace errors
       assert.equal(result.stats.errored, 1);
       assert.equal(progress.length, 1);
       assert.equal(JSON.stringify(progress).includes(SECRET), false);
-      assertErrorColumns(store.db, ["reasoning_traces", "reasoning_runs"]);
+      assertErrorColumns(storeConnection(store), ["reasoning_traces", "reasoning_runs"]);
 
       const rawWriter = "先把提问里的两个条件分开，明确各自成立时会推导出什么，再找出真正影响判断的前提，最后围绕这个前提给出直接回应。";
       for (const malformed of [false, true]) {
@@ -377,7 +380,7 @@ test("reasoning backfill hides injected writer/grader exceptions in trace errors
           callMaxAttempts: 2, callRetryDelayMs: 0, maxRewrites: 0,
         });
         assert.equal(graded.stats.errored, 1);
-        const row = store.db.prepare("SELECT error, raw_output FROM reasoning_traces WHERE reasoning_run_id = ?").get(graded.reasoningRunId);
+        const row = storeConnection(store).prepare("SELECT error, raw_output FROM reasoning_traces WHERE reasoning_run_id = ?").get(graded.reasoningRunId);
         assertPublic([row?.error], malformed ? "model_output_invalid" : "unexpected_error");
         assert.equal(row?.raw_output, rawWriter);
       }
@@ -391,7 +394,7 @@ test("reasoning backfill hides injected writer/grader exceptions in trace errors
         assertPublic([error.message]);
         return true;
       });
-      assertErrorColumns(store.db, ["reasoning_runs"]);
+      assertErrorColumns(storeConnection(store), ["reasoning_runs"]);
     } finally {
       store.close();
     }

@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { nonEmpty } from "./schema.js";
 import type { ToolStep } from "./types.js";
+import { combineSignals, createAttemptCancellation, throwIfAborted } from "./cancellation.js";
+import { createCallBudget, type CallBudget } from "./call-budget.js";
 
-const execFileAsync = promisify(execFile);
+import { PublicError } from "./public-error.js";
 
 export type SearchContextSize = "low" | "medium" | "high";
 
@@ -12,6 +13,7 @@ export interface WebSearchRequest {
   query: string;
   count?: number;
   searchContextSize?: SearchContextSize;
+  signal?: AbortSignal;
 }
 
 export interface WebSearchResponse {
@@ -25,6 +27,8 @@ export type WebSearchRunner = (request: WebSearchRequest) => Promise<WebSearchRe
 export interface MagpieWebSearchOptions {
   /** Override magpie executable path (defaults to MAGPIE_BIN env or "magpie"). */
   binPath?: string;
+  /** Arguments before the Magpie command, for executable wrappers (e.g. node path/to/gateway.js). */
+  argsPrefix?: readonly string[];
   /** Default result count passed to `magpie tool web_search --count` (1–20, default 5). */
   defaultCount?: number;
   /** Default context size passed to `magpie tool web_search --search_context_size` (default "low"). */
@@ -44,34 +48,60 @@ interface MagpieToolJsonOutput {
   isError?: boolean;
 }
 
-function createSemaphore(limit: number): <T>(fn: () => Promise<T>) => Promise<T> {
+function createSemaphore(limit: number): (signal?: AbortSignal) => Promise<() => void> {
   const max = Math.max(1, Math.floor(limit));
   let active = 0;
-  const queue: Array<() => void> = [];
-
-  const acquire = async (): Promise<void> => {
-    if (active < max) {
-      active++;
-      return;
-    }
-    await new Promise<void>((resolve) => queue.push(resolve));
-    active++;
-  };
-
-  const release = (): void => {
-    active--;
+  const queue: Array<{ grant: () => void }> = [];
+  const release = () => {
     const next = queue.shift();
-    if (next) next();
+    if (next) next.grant(); // Transfer the live permit directly: no re-acquisition window.
+    else active--;
   };
+  const permit = () => {
+    let released = false;
+    return () => { if (!released) { released = true; release(); } };
+  };
+  return async (signal) => {
+    throwIfAborted(signal);
+    if (active < max) { active++; return permit(); }
+    return new Promise<() => void>((resolve, reject) => {
+      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      const entry = { grant: () => { cleanup(); resolve(permit()); } };
+      const onAbort = () => {
+        const index = queue.indexOf(entry);
+        if (index >= 0) queue.splice(index, 1);
+        cleanup();
+        try { throwIfAborted(signal); } catch (error) { reject(error); }
+      };
+      queue.push(entry);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+}
 
-  return async <T>(fn: () => Promise<T>): Promise<T> => {
-    await acquire();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  };
+/** execFile reports abort before close on some platforms; a permit stays held until both settle. */
+function runMagpieProcess(binPath: string, args: string[], signal: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    let closed = false;
+    let callbackDone = false;
+    let failure: Error | null = null;
+    let output = "";
+    const settle = () => {
+      if (!closed || !callbackDone) return;
+      if (failure) reject(failure);
+      else resolve(output);
+    };
+    const child = execFile(binPath, args, {
+      signal, maxBuffer: 4 * 1024 * 1024, windowsHide: true, encoding: "utf8",
+    }, (error, stdout) => {
+      failure = error;
+      output = stdout;
+      callbackDone = true;
+      settle();
+    });
+    child.once("close", () => { closed = true; settle(); });
+  });
 }
 
 export function truncateSearchText(text: string, maxChars = 4000): string {
@@ -120,7 +150,7 @@ export function normalizeSearchCacheKey(
 
 /**
  * Calls the local Magpie MCP gateway's `web_search` tool via `magpie tool web_search --json`.
- * Includes bounded concurrency and in-memory query deduplication so retries don't double-fetch.
+ * Includes a cancellable permit queue and a completed-success cache; in-flight calls remain independent.
  */
 export function createMagpieWebSearchRunner(options: MagpieWebSearchOptions = {}): WebSearchRunner {
   const binPath = options.binPath?.trim() || process.env.MAGPIE_BIN?.trim() || "magpie";
@@ -129,48 +159,42 @@ export function createMagpieWebSearchRunner(options: MagpieWebSearchOptions = {}
   const maxOutputChars = options.maxOutputChars ?? 4000;
   const timeoutMs = options.timeoutMs ?? 30_000;
   const enableCache = options.enableCache ?? true;
-  const withLimit = createSemaphore(options.maxConcurrency ?? 8);
-  const cache = new Map<string, Promise<WebSearchResponse>>();
+  const acquire = createSemaphore(options.maxConcurrency ?? 8);
+  const cache = new Map<string, WebSearchResponse>();
 
   return async (request: WebSearchRequest): Promise<WebSearchResponse> => {
+    throwIfAborted(request.signal);
     const query = nonEmpty(request.query, "web_search query");
     const count = Math.min(20, Math.max(1, Math.floor(request.count ?? defaultCount)));
     const searchContextSize = request.searchContextSize ?? defaultContextSize;
     const cacheKey = normalizeSearchCacheKey(query, count, searchContextSize);
-
-    if (enableCache) {
-      const existing = cache.get(cacheKey);
-      if (existing) return existing;
-    }
-
-    const promise = withLimit(async (): Promise<WebSearchResponse> => {
+    const cancellation = createAttemptCancellation(request.signal, timeoutMs);
+    let release: (() => void) | undefined;
+    try {
+      throwIfAborted(cancellation.signal);
+      const existing = enableCache ? cache.get(cacheKey) : undefined;
+      if (existing) return { ...existing, query };
+      release = await acquire(cancellation.signal);
+      throwIfAborted(cancellation.signal);
       const args = [
-        "tool",
-        "web_search",
-        "--query",
-        query,
-        "--count",
-        String(count),
-        "--search_context_size",
-        searchContextSize,
-        "--json",
+        ...(options.argsPrefix ?? []),
+        "tool", "web_search", "--query", query,
+        "--count", String(count), "--search_context_size", searchContextSize, "--json",
       ];
-      try {
-        const { stdout } = await execFileAsync(binPath, args, {
-          timeout: timeoutMs,
-          maxBuffer: 4 * 1024 * 1024,
-          windowsHide: true,
-        });
-        return parseMagpieWebSearchOutput(stdout, query, maxOutputChars);
-      } catch (error) {
-        if (enableCache) cache.delete(cacheKey);
-        const msg = error instanceof Error ? error.message : String(error);
-        throw new Error(`本地 magpie web_search 调用失败（query="${query}"）：${msg}`);
-      }
-    });
-
-    if (enableCache) cache.set(cacheKey, promise);
-    return promise;
+      const stdout = await runMagpieProcess(binPath, args, cancellation.signal);
+      throwIfAborted(cancellation.signal);
+      const response = parseMagpieWebSearchOutput(stdout, query, maxOutputChars);
+      if (enableCache && !response.isError) cache.set(cacheKey, response);
+      return response;
+    } catch (error) {
+      throwIfAborted(cancellation.signal);
+      if (error instanceof PublicError) throw error;
+      throw new PublicError("tool_execution_failed");
+    } finally {
+      // runMagpieProcess settles only after close, including aborted child processes.
+      release?.();
+      cancellation.dispose();
+    }
   };
 }
 
@@ -181,6 +205,10 @@ export interface CreateWebSearchToolOptions {
   count?: number;
   searchContextSize?: SearchContextSize;
   onStep?: (step: ToolStep) => void;
+  /** Internal identity-aware success projection; onStep retains its existing shape. */
+  onCallStep?: (toolCallId: string, step: ToolStep) => void;
+  budget?: CallBudget;
+  signal?: AbortSignal;
 }
 
 /**
@@ -193,7 +221,7 @@ export function createWebSearchAgentTool(
   options: CreateWebSearchToolOptions = {},
 ): AgentTool {
   const maxCalls = Math.max(1, Math.floor(options.maxCalls ?? 3));
-  let stepCount = 0;
+  const budget = options.budget ?? createCallBudget(maxCalls);
 
   return {
     name: "web_search",
@@ -211,15 +239,19 @@ export function createWebSearchAgentTool(
       required: ["query"],
       additionalProperties: false,
     },
-    async execute(_toolCallId, input) {
+    async execute(toolCallId, input, sdkSignal) {
+      const signal = combineSignals(options.signal, sdkSignal);
+      throwIfAborted(signal);
       if (!input || typeof input !== "object" || !("query" in input)) {
         throw new Error("web_search 必须提供 query 字符串参数");
       }
       const query = nonEmpty((input as { query: unknown }).query, "web_search query");
-      if (stepCount >= maxCalls) {
+      const claim = budget.claim(toolCallId);
+      if (!claim) {
         const text = `本轮搜索次数已达上限（${maxCalls} 次），请基于已有检索结果直接作答或如实说明未查到。`;
         return {
           content: [{ type: "text", text }],
+          isError: true,
           details: { query, skipped: true },
         };
       }
@@ -227,15 +259,21 @@ export function createWebSearchAgentTool(
         query,
         count: options.count,
         searchContextSize: options.searchContextSize,
+        signal,
       });
-      stepCount++;
-      options.onStep?.({
-        stepNo: stepCount,
+      throwIfAborted(signal);
+      const step: ToolStep = {
+        stepNo: claim.sequence,
         toolName: "web_search",
         arguments: { query },
         toolOutput: response.text,
-      });
+      };
+      if (!response.isError) {
+        options.onStep?.(step);
+        options.onCallStep?.(toolCallId, step);
+      }
       return {
+        isError: response.isError,
         content: [{ type: "text", text: response.text }],
         details: response,
       };

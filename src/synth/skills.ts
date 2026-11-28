@@ -1,10 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import {
-  DEFAULT_PROMPTS_DIR,
-  DEFAULT_SKILLS_DIR,
-  NO_SKILL_PROMPTS_DIR,
-} from "../shared/paths.js";
+import { DEFAULT_PROMPTS_DIR, NO_SKILL_PROMPTS_DIR } from "../shared/paths.js";
+import { getSynthProfile, type ProfileSkillPaths } from "./profiles.js";
 import { errorMessage, nonEmpty, parseMaterial } from "../shared/schema.js";
 import { isEvalSkillPath, readSkillFile } from "../shared/skill-loader.js";
 import type { Material, Rubric, Skill, SkillSnapshot, SynthProfile } from "../shared/types.js";
@@ -18,117 +15,46 @@ import {
 
 export { isEvalSkillPath, readSkillFile };
 
-export const DEFAULT_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "question-design/SKILL.md");
-export const DEFAULT_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "followup-strategy/SKILL.md");
-export const DEFAULT_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "answer-style/SKILL.md");
-export const DEFAULT_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "quality-judge/SKILL.md");
-
-export const SHORT_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "short/question-design/SKILL.md");
-export const SHORT_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "short/followup-strategy/SKILL.md");
-export const SHORT_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "short/answer-style/SKILL.md");
-export const SHORT_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "short/quality-judge/SKILL.md");
-
-export const MEDIUM_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "medium/question-design/SKILL.md");
-export const MEDIUM_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "medium/followup-strategy/SKILL.md");
-export const MEDIUM_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "medium/answer-style/SKILL.md");
-export const MEDIUM_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "medium/quality-judge/SKILL.md");
-
-export const LONG_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "long/question-design/SKILL.md");
-export const LONG_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "long/followup-strategy/SKILL.md");
-export const LONG_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "long/answer-style/SKILL.md");
-export const LONG_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "long/quality-judge/SKILL.md");
-
-export const XLONG_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "xlong/question-design/SKILL.md");
-export const XLONG_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "xlong/followup-strategy/SKILL.md");
-export const XLONG_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "xlong/answer-style/SKILL.md");
-export const XLONG_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "xlong/quality-judge/SKILL.md");
-
-export const TRAP_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "trap/question-design/SKILL.md");
-export const TRAP_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "trap/followup-strategy/SKILL.md");
-export const TRAP_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "trap/answer-style/SKILL.md");
-export const TRAP_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "trap/quality-judge/SKILL.md");
-
-export const SEARCH_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "search/question-design/SKILL.md");
-export const SEARCH_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "search/followup-strategy/SKILL.md");
-export const SEARCH_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "search/answer-style/SKILL.md");
-export const SEARCH_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "search/quality-judge/SKILL.md");
-
-export const TODO_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "todo/question-design/SKILL.md");
-export const TODO_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "todo/followup-strategy/SKILL.md");
-export const TODO_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "todo/answer-style/SKILL.md");
-export const TODO_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "todo/quality-judge/SKILL.md");
-
-export const CLARIFY_QUESTION_SKILL = join(DEFAULT_SKILLS_DIR, "clarify/question-design/SKILL.md");
-export const CLARIFY_FOLLOWUP_SKILL = join(DEFAULT_SKILLS_DIR, "clarify/followup-strategy/SKILL.md");
-export const CLARIFY_ANSWER_STYLE = join(DEFAULT_SKILLS_DIR, "clarify/answer-style/SKILL.md");
-export const CLARIFY_QUALITY_JUDGE = join(DEFAULT_SKILLS_DIR, "clarify/quality-judge/SKILL.md");
-
-interface ProfileSkillPaths {
-  questionSkill: string;
-  followupSkill: string;
-  answerStyle: string;
-  qualityJudge: string;
-}
-
-const PROFILE_SKILL_PATHS: Record<SynthProfile, ProfileSkillPaths> = {
-  standard: {
-    questionSkill: DEFAULT_QUESTION_SKILL,
-    followupSkill: DEFAULT_FOLLOWUP_SKILL,
-    answerStyle: DEFAULT_ANSWER_STYLE,
-    qualityJudge: DEFAULT_QUALITY_JUDGE,
-  },
-  short: {
-    questionSkill: SHORT_QUESTION_SKILL,
-    followupSkill: SHORT_FOLLOWUP_SKILL,
-    answerStyle: SHORT_ANSWER_STYLE,
-    qualityJudge: SHORT_QUALITY_JUDGE,
-  },
-  medium: {
-    questionSkill: MEDIUM_QUESTION_SKILL,
-    followupSkill: MEDIUM_FOLLOWUP_SKILL,
-    answerStyle: MEDIUM_ANSWER_STYLE,
-    qualityJudge: MEDIUM_QUALITY_JUDGE,
-  },
-  long: {
-    questionSkill: LONG_QUESTION_SKILL,
-    followupSkill: LONG_FOLLOWUP_SKILL,
-    answerStyle: LONG_ANSWER_STYLE,
-    qualityJudge: LONG_QUALITY_JUDGE,
-  },
-  xlong: {
-    questionSkill: XLONG_QUESTION_SKILL,
-    followupSkill: XLONG_FOLLOWUP_SKILL,
-    answerStyle: XLONG_ANSWER_STYLE,
-    qualityJudge: XLONG_QUALITY_JUDGE,
-  },
-  trap: {
-    questionSkill: TRAP_QUESTION_SKILL,
-    followupSkill: TRAP_FOLLOWUP_SKILL,
-    answerStyle: TRAP_ANSWER_STYLE,
-    qualityJudge: TRAP_QUALITY_JUDGE,
-  },
-  search: {
-    questionSkill: SEARCH_QUESTION_SKILL,
-    followupSkill: SEARCH_FOLLOWUP_SKILL,
-    answerStyle: SEARCH_ANSWER_STYLE,
-    qualityJudge: SEARCH_QUALITY_JUDGE,
-  },
-  todo: {
-    questionSkill: TODO_QUESTION_SKILL,
-    followupSkill: TODO_FOLLOWUP_SKILL,
-    answerStyle: TODO_ANSWER_STYLE,
-    qualityJudge: TODO_QUALITY_JUDGE,
-  },
-  clarify: {
-    questionSkill: CLARIFY_QUESTION_SKILL,
-    followupSkill: CLARIFY_FOLLOWUP_SKILL,
-    answerStyle: CLARIFY_ANSWER_STYLE,
-    qualityJudge: CLARIFY_QUALITY_JUDGE,
-  },
-};
+// Compatibility names; profile paths and defaults live together in profiles.ts.
+export const {
+  questionSkill: DEFAULT_QUESTION_SKILL, followupSkill: DEFAULT_FOLLOWUP_SKILL,
+  answerStyle: DEFAULT_ANSWER_STYLE, qualityJudge: DEFAULT_QUALITY_JUDGE,
+} = getSynthProfile("standard").skills;
+export const {
+  questionSkill: SHORT_QUESTION_SKILL, followupSkill: SHORT_FOLLOWUP_SKILL,
+  answerStyle: SHORT_ANSWER_STYLE, qualityJudge: SHORT_QUALITY_JUDGE,
+} = getSynthProfile("short").skills;
+export const {
+  questionSkill: MEDIUM_QUESTION_SKILL, followupSkill: MEDIUM_FOLLOWUP_SKILL,
+  answerStyle: MEDIUM_ANSWER_STYLE, qualityJudge: MEDIUM_QUALITY_JUDGE,
+} = getSynthProfile("medium").skills;
+export const {
+  questionSkill: LONG_QUESTION_SKILL, followupSkill: LONG_FOLLOWUP_SKILL,
+  answerStyle: LONG_ANSWER_STYLE, qualityJudge: LONG_QUALITY_JUDGE,
+} = getSynthProfile("long").skills;
+export const {
+  questionSkill: XLONG_QUESTION_SKILL, followupSkill: XLONG_FOLLOWUP_SKILL,
+  answerStyle: XLONG_ANSWER_STYLE, qualityJudge: XLONG_QUALITY_JUDGE,
+} = getSynthProfile("xlong").skills;
+export const {
+  questionSkill: TRAP_QUESTION_SKILL, followupSkill: TRAP_FOLLOWUP_SKILL,
+  answerStyle: TRAP_ANSWER_STYLE, qualityJudge: TRAP_QUALITY_JUDGE,
+} = getSynthProfile("trap").skills;
+export const {
+  questionSkill: SEARCH_QUESTION_SKILL, followupSkill: SEARCH_FOLLOWUP_SKILL,
+  answerStyle: SEARCH_ANSWER_STYLE, qualityJudge: SEARCH_QUALITY_JUDGE,
+} = getSynthProfile("search").skills;
+export const {
+  questionSkill: TODO_QUESTION_SKILL, followupSkill: TODO_FOLLOWUP_SKILL,
+  answerStyle: TODO_ANSWER_STYLE, qualityJudge: TODO_QUALITY_JUDGE,
+} = getSynthProfile("todo").skills;
+export const {
+  questionSkill: CLARIFY_QUESTION_SKILL, followupSkill: CLARIFY_FOLLOWUP_SKILL,
+  answerStyle: CLARIFY_ANSWER_STYLE, qualityJudge: CLARIFY_QUALITY_JUDGE,
+} = getSynthProfile("clarify").skills;
 
 export function getProfileSkillPaths(profile: SynthProfile): ProfileSkillPaths {
-  return PROFILE_SKILL_PATHS[profile];
+  return getSynthProfile(profile).skills;
 }
 
 export async function readMaterials(path: string): Promise<Material[]> {
@@ -226,8 +152,9 @@ export async function resolveSynthBundle(options: ResolveSynthBundleOptions): Pr
     ? await readQuestionGeneratorPrompt(DEFAULT_PROMPTS_DIR)
     : undefined;
   let answerPromptFile = join(promptDir, "answer.md");
-  if ((profile === "search" || profile === "todo" || profile === "clarify") && !noSkill) {
-    const dedicatedFile = join(promptDir, `answer-${profile}.md`);
+  const dedicatedAnswerPrompt = getSynthProfile(profile).dedicatedAnswerPrompt;
+  if (dedicatedAnswerPrompt && !noSkill) {
+    const dedicatedFile = join(promptDir, dedicatedAnswerPrompt);
     try {
       await readFile(dedicatedFile, "utf8");
       answerPromptFile = dedicatedFile;

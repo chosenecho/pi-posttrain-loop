@@ -1,4 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
+import { ensureRunOwnerColumn } from "../../shared/task-store.js";
+import { ensureProbeBuildSchema } from "./build-plan-schema.js";
 import { EVAL_SCHEMA_VERSION } from "./types.js";
 
 /**
@@ -243,32 +245,25 @@ CREATE TABLE IF NOT EXISTS agent_calls (
 CREATE INDEX IF NOT EXISTS idx_agent_calls_run_role ON agent_calls(run_ref, role);
 `;
 
-/**
- * Verifies an existing eval DB is Schema v3 (rejecting v1/v2 without migration)
- * or initializes a brand-new database with Schema v3.
- */
-export function ensureEvalSchemaV3(db: DatabaseSync, readOnly: boolean): void {
+/** Read-only reports support v3; existing databases are upgraded only by the explicit migrator. */
+export function ensureEvalSchema(db: DatabaseSync, readOnly: boolean): void {
   const tables = (
     db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as Array<{
       name: string;
     }>
-  ).map((r) => r.name);
+  ).map((row) => row.name).filter((name) => name !== "runtime_task_lock");
 
   if (tables.length > 0) {
-    let foundVersion: string | null = null;
-    if (tables.includes("eval_meta")) {
-      const row = db.prepare("SELECT value FROM eval_meta WHERE key = 'schema_version'").get() as
-        | { value: string }
-        | undefined;
-      foundVersion = row?.value ?? null;
+    const row = tables.includes("eval_meta")
+      ? db.prepare("SELECT value FROM eval_meta WHERE key = 'schema_version'").get() as { value: string } | undefined
+      : undefined;
+    const foundVersion = row?.value ?? null;
+    if (foundVersion === EVAL_SCHEMA_VERSION || (readOnly && foundVersion === "3")) return;
+    if (foundVersion === "3") {
+      throw new Error("评测库 v3 保留只读访问；写入前请运行 npm run dm -- eval migrate 显式迁移至 v4，原有业务数据将保留。[eval_migration_required]");
     }
-    if (foundVersion !== EVAL_SCHEMA_VERSION) {
-      const label = foundVersion ? `v${foundVersion}` : "旧版";
-      throw new Error(
-        `评测库 schema 版本不兼容（当前 ${label}，需要 v${EVAL_SCHEMA_VERSION}）。请删除或改名 data/eval.sqlite 后重新运行 npm run dm -- eval make 重建。`,
-      );
-    }
-    return;
+    const label = foundVersion ? `v${foundVersion}` : "旧版";
+    throw new Error(`评测库 schema 版本不兼容（当前 ${label}，需要 v${EVAL_SCHEMA_VERSION}）。请保留原库；v1/v2 暂无跨版本迁移，请使用对应版本工具读取历史数据。`);
   }
 
   if (readOnly) {
@@ -276,5 +271,11 @@ export function ensureEvalSchemaV3(db: DatabaseSync, readOnly: boolean): void {
   }
 
   db.exec(EVAL_SCHEMA_V3_SQL);
-  db.prepare("INSERT OR REPLACE INTO eval_meta (key, value) VALUES ('schema_version', ?)").run(EVAL_SCHEMA_VERSION);
+  ensureProbeBuildSchema(db);
+  ensureRunOwnerColumn(db, "probe_runs");
+  ensureRunOwnerColumn(db, "eval_runs");
+  db.prepare("INSERT INTO eval_meta (key, value) VALUES ('schema_version', ?)").run(EVAL_SCHEMA_VERSION);
 }
+
+/** Compatibility export for callers migrating to the version-independent initializer name. */
+export const ensureEvalSchemaV3 = ensureEvalSchema;

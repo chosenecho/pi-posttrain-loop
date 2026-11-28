@@ -1,22 +1,20 @@
 import { dirname, join, resolve } from "node:path";
+import { combineSignals, throwIfAborted } from "../shared/cancellation.js";
 import {
   appendTimestampToPath,
   formatLocalTimestamp,
   writeOutputFile,
 } from "../shared/cli-helpers.js";
 import { DEFAULT_CORPUS_DIR, DEFAULT_MAIN_DB } from "../shared/paths.js";
-import { createPiRunner, createPiSearchRunner, readPiConfig, sanitizePiConfig, type PiConfig } from "../shared/pi-runner.js";
-import { createMagpieWebSearchRunner, type WebSearchRunner } from "../shared/web-search.js";
-import {
-  DEFAULT_CALL_MAX_ATTEMPTS,
-  DEFAULT_CALL_RETRY_DELAY_MS,
-  validateCallMaxAttempts,
-  validateCallRetryDelayMs,
-} from "../shared/retry.js";
+import { readPiConfig, type PiConfig } from "../shared/pi-runner.js";
+import type { WebSearchRunner } from "../shared/web-search.js";
+import { assertSynthSplit, resolveSynthPlan, resolveSynthQuestionPlan } from "./plan.js";
+import { defaultMaxTurnsForProfile } from "./profiles.js";
+import { createSynthRunners } from "./runners.js";
+export { assertSynthSplit, DEFAULT_SYNTH_MAX_ATTEMPTS, SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE } from "./plan.js";
+export { defaultMaxTurnsForProfile } from "./profiles.js";
 import {
   nonEmpty,
-  validateConcurrency,
-  validateMaxAttempts,
   validateMaxTurns,
   validateSplit,
 } from "../shared/schema.js";
@@ -42,33 +40,9 @@ import {
 import { runCorpusQuestionGeneration, type RunCorpusQuestionsSummary } from "./corpus-questions.js";
 import { loadTargetQuestions, runDialogueBatch, type RunDialogueBatchSummary } from "./dialogue-loop.js";
 import { assertNoEvalLeak, readEvalVideoKeys } from "./eval-guard.js";
-import { questionPrompt, readQuestionGeneratorPrompt } from "./prompts.js";
-import {
-  DEFAULT_QUESTION_SKILL,
-  getProfileSkillPaths,
-  readQuestionSkill,
-  resolveSynthBundle,
-  type SynthSkillOverrides,
-} from "./skills.js";
+import type { SynthSkillOverrides } from "./skills.js";
 import { summarizeSplitCounts, syncCorpusSplits, type SplitBreakdown } from "./splits.js";
 import { DataMakerStore, formatSamplesJsonl, type DedupPolicy } from "./store/index.js";
-
-/** test 分区仅由独立 eval 流水线（eval.sqlite）生产，synth 侧一律拒绝。 */
-export const SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE =
-  "test 分区仅供 eval 流水线使用，请使用 npm run dm -- eval make";
-
-export function assertSynthSplit(split: DatasetSplit): DatasetSplit {
-  if (split === "test") {
-    throw new Error(SYNTH_TEST_SPLIT_FORBIDDEN_MESSAGE);
-  }
-  return split;
-}
-
-export function defaultMaxTurnsForProfile(profile: SynthProfile): number {
-  return profile === "standard" || profile === "long" || profile === "xlong" ? 3 : 2;
-}
-
-export const DEFAULT_SYNTH_MAX_ATTEMPTS = 4;
 
 export interface SynthStatusReport {
   db: string;
@@ -84,6 +58,8 @@ export interface SynthStatusReport {
   unjudgedQuestionsForMaxTurns: number;
   maxTurns: number;
   splits: SplitBreakdown;
+  /** Predicted split counts include these videos; a generation/sync write persists their assignments. */
+  pendingSplitSyncVideos: number;
 }
 
 export async function getSynthStatus(options: {
@@ -100,10 +76,13 @@ export async function getSynthStatus(options: {
     options.maxTurns ?? (options.profile ? defaultMaxTurnsForProfile(options.profile) : 3),
   );
 
-  const store = new DataMakerStore(dbPath);
+  const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
     const units = await scanCorpusVideos(inputDir);
-    syncCorpusSplits(store, units);
+    const persistedVideoKeys = new Set(store.listVideoSplits().map((row) => row.video_key));
+    const { processedVideoKeys } = queryProcessedVideoIndex(store);
+    const pendingVideoKeys = new Set([...units.map((unit) => extractVideoKey(unit.videoId)), ...processedVideoKeys]);
+    const pendingSplitSyncVideos = [...pendingVideoKeys].filter((key) => !persistedVideoKeys.has(key)).length;
     const status = summarizeCorpusStatus(units, store, options.profile);
     const processedByProfile = Object.fromEntries(
       ALL_SYNTH_PROFILES.map((p) => {
@@ -132,6 +111,7 @@ export async function getSynthStatus(options: {
       unjudgedQuestionsForMaxTurns: unjudged,
       maxTurns,
       splits,
+      pendingSplitSyncVideos,
     };
   } finally {
     store.close();
@@ -166,80 +146,39 @@ export interface SynthBatchWorkflowOptions {
   runSearchAnswer?: SearchAnswerRunner;
   webSearchRunner?: WebSearchRunner;
   onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions): Promise<Record<string, unknown>> {
-  const profile = options.profile ?? "standard";
-  const targetSplit = assertSynthSplit(validateSplit(options.split ?? "train", "--split"));
-  const sortMode = options.sort ?? "id";
-  if (sortMode === "core-first" && options.shuffle) {
-    throw new Error("--sort core-first 不能与 --shuffle 同时指定");
-  }
-
-  const inputDir = resolve(options.inputDir ?? DEFAULT_CORPUS_DIR);
-  const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
-  const limit = options.limit ?? 10;
-  const maxQuestionsPerVideo = options.maxQuestionsPerVideo
-    ?? (profile === "trap" || profile === "search" || profile === "todo" || profile === "clarify" ? 2 : undefined);
-  const defaultMaxTurns = defaultMaxTurnsForProfile(profile);
-  const maxTurns = validateMaxTurns(options.maxTurns ?? defaultMaxTurns);
-  const maxAttempts = validateMaxAttempts(options.maxAttempts ?? DEFAULT_SYNTH_MAX_ATTEMPTS);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-  const concurrency = validateConcurrency(options.concurrency ?? 10);
-
-  const bundle = await resolveSynthBundle({
-    profile,
-    noSkill: options.noSkill,
-    maxTurns,
-    includeQuestionGenerator: true,
-    promptsDir: options.promptsDir,
-    overrides: options.skillOverrides,
-  });
-
-  const trainingEnabled = targetSplit === "train" && bundle.rubricReady;
-  const evalEnabled = targetSplit !== "train" && bundle.rubricReady;
-
-  const config = options.config ?? readPiConfig();
-  const sanitizedModel = sanitizePiConfig(config);
-  const runRole = options.runRole ?? createPiRunner(config);
-  const isToolProfile = profile === "search" || profile === "todo" || profile === "clarify";
-  const shouldEnableSearch = options.enableSearch ?? (profile !== "standard" && !options.noSkill && !options.runRole);
-  const shouldUseToolRunner = Boolean(
-    options.runSearchAnswer
-    || isToolProfile
-    || shouldEnableSearch,
-  );
-  const runSearchAnswer = options.runSearchAnswer
-    ?? (shouldUseToolRunner && !options.runRole
-      ? createPiSearchRunner(
-          config,
-          shouldEnableSearch || profile === "search"
-            ? (options.webSearchRunner ?? createMagpieWebSearchRunner())
-            : undefined,
-          {
-            profile,
-            enableSearch: shouldEnableSearch || profile === "search",
-            simulatorRunner: runRole,
-          },
-        )
-      : undefined);
+  throwIfAborted(options.signal);
+  const plan = await resolveSynthPlan({ ...options, mode: "batch" });
+  throwIfAborted(options.signal);
+  const {
+    profile, inputDir, dbPath, limit, maxQuestionsPerVideo, maxTurns, maxAttempts,
+    callMaxAttempts, callRetryDelayMs, concurrency, bundle, trainingEnabled, evalEnabled,
+    config, sanitizedModel, sort: sortMode, effectiveSplit: targetSplit,
+  } = plan;
+  const { runRole, runSearchAnswer } = createSynthRunners(plan, options);
   const log = options.onProgress;
 
   const store = new DataMakerStore(dbPath);
+  const signal = combineSignals(options.signal, store.signal);
   try {
+    throwIfAborted(signal);
     store.markInterruptedRuns();
 
     const allUnits = await scanCorpusVideos(inputDir);
+    throwIfAborted(signal);
     const splitMap = syncCorpusSplits(store, allUnits);
     const { processedVideoKeys } = queryProcessedVideoIndex(store, profile);
     const unprocessedPool = allUnits.filter((u) => !processedVideoKeys.has(extractVideoKey(u.videoId)));
     const splitPool = selectVideos(unprocessedPool, {
-      shuffle: Boolean(options.shuffle),
+      shuffle: plan.shuffle,
       split: targetSplit,
       splitMap,
     });
     const orderedPool = sortMode === "core-first" ? await rankVideosCoreFirst(splitPool) : splitPool;
+    throwIfAborted(signal);
     const selectedVideos = orderedPool.slice(0, limit);
 
     let questionSummary: RunCorpusQuestionsSummary | undefined;
@@ -249,9 +188,10 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
       log?.(`=== 阶段 1/2：出题（分区 ${targetSplit}，profile=${profile}，选中 ${selectedVideos.length} 个未处理视频，并发 ${concurrency}，模型 ${config.modelId}）===`);
       questionSummary = await runCorpusQuestionGeneration({
         store,
+        signal,
         config,
         systemPrompt: bundle.questionPrompt!,
-        skills: bundle.questionSkills as unknown as Array<Record<string, unknown>>,
+        skills: bundle.questionSkills.map((skill) => ({ ...skill })),
         candidates: selectedVideos,
         concurrency,
         split: targetSplit,
@@ -261,6 +201,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
         maxQuestionsPerVideo,
         onProgress: log,
       });
+      throwIfAborted(signal);
       targetQuestionIds = questionSummary.generatedQuestionIds;
     }
 
@@ -295,6 +236,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
     log?.(`=== 阶段 2/2：问答质检（分区 ${targetSplit}，profile=${profile}，${targetQuestionIds.length} 题，最多 ${maxTurns} 轮，每轮最多 ${maxAttempts} 次，并发 ${concurrency}）===`);
     const dialogueSummary: RunDialogueBatchSummary = await runDialogueBatch({
       store,
+      signal,
       runRole,
       ...(runSearchAnswer ? { runSearchAnswer } : {}),
       prompts: bundle.dialoguePrompts,
@@ -306,7 +248,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
       split: targetSplit,
       questionIds: targetQuestionIds,
       config: {
-        mode: options.noSkill ? "sqlite-batch-no-skill" : "sqlite-batch",
+        mode: plan.noSkill ? "sqlite-batch-no-skill" : "sqlite-batch",
         split: targetSplit,
         profile,
         model: sanitizedModel,
@@ -314,19 +256,12 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
         questionRunId: questionSummary?.runId ?? null,
         inputSchemaVersion: maxTurns > 1 ? "v2-multiturn-json" : "v1-minimal-json",
       },
-      skills: bundle.dialogueSkills,
-      exportPolicy: targetSplit === "train"
-        ? { format: "messages_jsonl", split: "train", training_enabled: trainingEnabled }
-        : {
-            format: "messages_jsonl",
-            split: targetSplit,
-            purpose: targetSplit,
-            training_enabled: false,
-            eval_enabled: evalEnabled,
-          },
+      skills: [...bundle.dialogueSkills],
+      exportPolicy: plan.exportPolicy,
       onProgress: log,
     });
 
+    throwIfAborted(signal);
     let exportedPath: string | undefined;
     if (options.exportPath !== undefined) {
       if (targetSplit === "train") {
@@ -341,6 +276,7 @@ export async function runSynthBatchWorkflow(options: SynthBatchWorkflowOptions):
       }
       const jsonl = store.exportRunJsonl(dialogueSummary.runId, { systemPrompt: options.exportSystemPrompt });
       exportedPath = await writeOutputFile(nonEmpty(options.exportPath, "--export"), jsonl);
+      throwIfAborted(signal);
     }
 
     const totalErrors = (questionSummary?.errors ?? 0) + dialogueSummary.errors;
@@ -395,6 +331,7 @@ export interface SynthSuiteWorkflowOptions {
   runSearchAnswer?: SearchAnswerRunner;
   webSearchRunner?: WebSearchRunner;
   onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 /**
@@ -404,6 +341,8 @@ export interface SynthSuiteWorkflowOptions {
 export async function runSynthSuiteWorkflow(
   options: SynthSuiteWorkflowOptions = {},
 ): Promise<Record<string, unknown>> {
+  throwIfAborted(options.signal);
+  const config = structuredClone(options.config ?? readPiConfig());
   const profiles: SynthProfile[] = options.profiles && options.profiles.length > 0
     ? options.profiles
     : [...TRAIN_SUITE_PROFILES];
@@ -418,6 +357,7 @@ export async function runSynthSuiteWorkflow(
   let allIntegrityOk = true;
 
   for (const profile of profiles) {
+    throwIfAborted(options.signal);
     options.onProgress?.(`\n>>> [suite] 开始执行 profile=${profile}（limit=${limit}，split=${targetSplit}）`);
     const summary = await runSynthBatchWorkflow({
       dbPath: options.dbPath,
@@ -435,12 +375,14 @@ export async function runSynthSuiteWorkflow(
       includeUnjudged: options.includeUnjudged,
       evalDbPath: options.evalDbPath,
       enableSearch: options.enableSearch,
-      config: options.config,
+      config,
+      signal: options.signal,
       runRole: options.runRole,
       runSearchAnswer: options.runSearchAnswer,
       webSearchRunner: options.webSearchRunner,
       onProgress: options.onProgress,
     });
+    throwIfAborted(options.signal);
     perProfile[profile] = summary;
     totalSavedQuestions += Number(summary.savedQuestions ?? 0);
     totalResults += Number(summary.results ?? 0);
@@ -480,48 +422,26 @@ export interface SynthQuestionsWorkflowOptions {
   noSkill?: boolean;
   config?: PiConfig;
   onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowOptions): Promise<Record<string, unknown>> {
-  const hasInput = options.input !== undefined;
-  const hasInputDir = options.inputDir !== undefined;
-  if (hasInput && hasInputDir) {
-    throw new Error("--input 与 --input-dir 不能同时指定");
-  }
-  const sortMode = options.sort ?? "id";
-  if (sortMode === "core-first" && options.shuffle) {
-    throw new Error("--sort core-first 不能与 --shuffle 同时指定");
-  }
-  const profile = options.profile ?? "standard";
-  const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
-  const targetSplit = assertSynthSplit(validateSplit(options.split ?? "train", "--split"));
-  const concurrency = validateConcurrency(options.concurrency ?? 10);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-  const inputDir = !hasInput ? resolve(options.inputDir ?? DEFAULT_CORPUS_DIR) : undefined;
-
-  const basePrompt = await readQuestionGeneratorPrompt();
-  let systemPrompt = basePrompt;
-  const skills: Array<Record<string, unknown>> = [];
-  if (!options.noSkill) {
-    const defaultSkillPath = options.profile
-      ? getProfileSkillPaths(profile).questionSkill
-      : DEFAULT_QUESTION_SKILL;
-    const skillPath = resolve(options.questionSkillPath ?? defaultSkillPath);
-    const qSkill = await readQuestionSkill(skillPath);
-    systemPrompt = questionPrompt(basePrompt, qSkill.body);
-    skills.push({ name: "question-design", path: skillPath, status: qSkill.status, body: qSkill.body, sha256: qSkill.sha256 });
-  }
-
-  const config = options.config ?? readPiConfig();
+  throwIfAborted(options.signal);
+  const plan = await resolveSynthQuestionPlan(options);
+  throwIfAborted(options.signal);
+  const { dbPath, inputDir, profile, concurrency, callMaxAttempts, callRetryDelayMs, config, systemPrompt, sort: sortMode, split: targetSplit } = plan;
+  const skills = plan.skills.map((skill) => ({ ...skill }));
   const store = new DataMakerStore(dbPath);
+  const signal = combineSignals(options.signal, store.signal);
   try {
+    throwIfAborted(signal);
     store.markInterruptedRuns();
     const { processedVideoKeys } = queryProcessedVideoIndex(store, profile);
 
     let candidates: VideoUnit[];
     if (inputDir !== undefined) {
       const allUnits = await scanCorpusVideos(inputDir);
+      throwIfAborted(signal);
       const splitMap = syncCorpusSplits(store, allUnits);
       const pool = options.force
         ? allUnits
@@ -532,6 +452,7 @@ export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowO
         splitMap,
       });
       const orderedPool = sortMode === "core-first" ? await rankVideosCoreFirst(splitPool) : splitPool;
+      throwIfAborted(signal);
       candidates = options.limit !== undefined ? orderedPool.slice(0, options.limit) : orderedPool;
       if (candidates.length === 0) {
         return {
@@ -549,6 +470,7 @@ export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowO
         videoIdOverride: options.videoIdOverride,
         mergeSiblingParts: true,
       });
+      throwIfAborted(signal);
       if (!options.force && processedVideoKeys.has(extractVideoKey(unit.videoId))) {
         return {
           db: dbPath,
@@ -567,6 +489,7 @@ export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowO
 
     const summary = await runCorpusQuestionGeneration({
       store,
+      signal,
       config,
       systemPrompt,
       skills,
@@ -581,6 +504,7 @@ export async function runSynthQuestionsWorkflow(options: SynthQuestionsWorkflowO
       onProgress: options.onProgress,
     });
 
+    throwIfAborted(signal);
     return {
       db: dbPath,
       split: targetSplit,
@@ -623,61 +547,23 @@ export interface SynthJudgeWorkflowOptions {
   runSearchAnswer?: SearchAnswerRunner;
   webSearchRunner?: WebSearchRunner;
   onProgress?: (message: string) => void;
+  signal?: AbortSignal;
 }
 
 export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions): Promise<Record<string, unknown>> {
-  const profile = options.profile ?? "standard";
-  const dbPath = resolve(options.dbPath ?? DEFAULT_MAIN_DB);
-  const targetSplit = options.split !== undefined ? assertSynthSplit(validateSplit(options.split, "--split")) : undefined;
-  const maxAttempts = validateMaxAttempts(options.maxAttempts ?? DEFAULT_SYNTH_MAX_ATTEMPTS);
-  const defaultMaxTurns = defaultMaxTurnsForProfile(profile);
-  const maxTurns = validateMaxTurns(options.maxTurns ?? defaultMaxTurns);
-  const concurrency = validateConcurrency(options.concurrency ?? 10);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-
-  const bundle = await resolveSynthBundle({
-    profile,
-    noSkill: options.noSkill,
-    maxTurns,
-    includeQuestionGenerator: false,
-    promptsDir: options.promptsDir,
-    overrides: options.skillOverrides,
-  });
-
-  const config = options.config ?? readPiConfig();
-  const sanitizedModel = sanitizePiConfig(config);
-  const runRole = options.runRole ?? createPiRunner(config);
-  const hasCustomPromptOverrides = Boolean(
-    options.noSkill
-    || options.promptsDir
-    || options.skillOverrides?.answerStyle
-    || options.skillOverrides?.qualityJudge,
-  );
-  const isToolProfile = profile === "search" || profile === "todo" || profile === "clarify";
-  const shouldEnableSearch = options.enableSearch ?? (profile !== "standard" && !hasCustomPromptOverrides && !options.runRole);
-  const shouldUseToolRunner = Boolean(
-    options.runSearchAnswer
-    || isToolProfile
-    || shouldEnableSearch,
-  );
-  const runSearchAnswer = options.runSearchAnswer
-    ?? (shouldUseToolRunner && !options.runRole
-      ? createPiSearchRunner(
-          config,
-          shouldEnableSearch || profile === "search"
-            ? (options.webSearchRunner ?? createMagpieWebSearchRunner())
-            : undefined,
-          {
-            profile,
-            enableSearch: shouldEnableSearch || profile === "search",
-            simulatorRunner: runRole,
-          },
-        )
-      : undefined);
+  throwIfAborted(options.signal);
+  const plan = await resolveSynthPlan({ ...options, mode: "judge" });
+  throwIfAborted(options.signal);
+  const {
+    profile, dbPath, maxTurns, maxAttempts, concurrency, callMaxAttempts, callRetryDelayMs,
+    bundle, sanitizedModel, trainingEnabled, split: targetSplit,
+  } = plan;
+  const { runRole, runSearchAnswer } = createSynthRunners(plan, options);
 
   const store = new DataMakerStore(dbPath);
+  const signal = combineSignals(options.signal, store.signal);
   try {
+    throwIfAborted(signal);
     const onlyUnjudged = Boolean(options.onlyUnjudged);
     if (onlyUnjudged) {
       store.markInterruptedRuns();
@@ -702,12 +588,9 @@ export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions):
       }
     }
 
-    const effectiveSplit = targetSplit ?? "train";
-    const trainingEnabled = effectiveSplit === "train" && bundle.rubricReady;
-    const evalEnabled = effectiveSplit !== "train" && bundle.rubricReady;
-
     const summary = await runDialogueBatch({
       store,
+      signal,
       runRole,
       ...(runSearchAnswer ? { runSearchAnswer } : {}),
       prompts: bundle.dialoguePrompts,
@@ -721,30 +604,24 @@ export async function runSynthJudgeWorkflow(options: SynthJudgeWorkflowOptions):
       questionIds: options.questionIds,
       onlyUnjudged,
       config: {
-        mode: options.noSkill ? "sqlite-judge-no-skill" : "sqlite-judge",
+        mode: plan.noSkill ? "sqlite-judge-no-skill" : "sqlite-judge",
         ...(targetSplit ? { split: targetSplit } : {}),
         profile,
         model: sanitizedModel,
         promptDirectory: bundle.promptDir,
         inputSchemaVersion: maxTurns > 1 ? "v2-multiturn-json" : "v1-minimal-json",
       },
-      skills: bundle.dialogueSkills,
-      exportPolicy: effectiveSplit === "train"
-        ? { format: "messages_jsonl", training_enabled: trainingEnabled }
-        : {
-            format: "messages_jsonl",
-            split: effectiveSplit,
-            purpose: effectiveSplit,
-            training_enabled: false,
-            eval_enabled: evalEnabled,
-          },
+      skills: [...bundle.dialogueSkills],
+      exportPolicy: plan.exportPolicy,
       onProgress: options.onProgress,
     });
 
+    throwIfAborted(signal);
     let exportedPath: string | undefined;
     if (options.exportPath !== undefined) {
       const jsonl = store.exportRunJsonl(summary.runId, { systemPrompt: options.exportSystemPrompt });
       exportedPath = await writeOutputFile(nonEmpty(options.exportPath, "--export"), jsonl);
+      throwIfAborted(signal);
     }
 
     return {
@@ -777,9 +654,11 @@ export interface SynthExportWorkflowOptions {
   systemPrompt?: string;
   generalizeTools?: boolean;
   negativeToolsRatio?: number;
+  signal?: AbortSignal;
 }
 
 export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions): Promise<Record<string, unknown>> {
+  throwIfAborted(options.signal);
   if ((options.valOutPath !== undefined) !== (options.valRatio !== undefined)) {
     throw new Error("--val-out 与 --val-ratio 必须成对指定");
   }
@@ -834,7 +713,9 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
     }
 
     const trainJsonl = formatSamplesJsonl(merged.train.map((r) => r.sample));
+    throwIfAborted(options.signal);
     await writeOutputFile(outPath, trainJsonl);
+    throwIfAborted(options.signal);
 
     let valOutPath: string | undefined;
     let valSha256: string | undefined;
@@ -842,6 +723,7 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
       valOutPath = resolveExportPath(nonEmpty(options.valOutPath, "--val-out"));
       const valJsonl = formatSamplesJsonl(merged.val.map((r) => r.sample));
       await writeOutputFile(valOutPath, valJsonl);
+      throwIfAborted(options.signal);
       valSha256 = sha256Hex(valJsonl);
     }
 
@@ -881,6 +763,7 @@ export async function runSynthExportWorkflow(options: SynthExportWorkflowOptions
 
     if (manifestPath !== undefined) {
       await writeOutputFile(manifestPath, JSON.stringify(report, null, 2) + "\n");
+      throwIfAborted(options.signal);
     }
 
     return report;

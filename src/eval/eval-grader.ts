@@ -1,3 +1,4 @@
+import { combineSignals, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
@@ -10,6 +11,7 @@ import {
 import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { RoleRunner } from "../shared/types.js";
 import { extractSuiteDialogueTurns } from "./eval-runner.js";
+import { EvaluationSpecError, readEvaluationSpec } from "./evaluation-spec.js";
 import { scoreGradedTurn } from "./grader-core.js";
 import { parseGradeResult } from "./probe-schema.js";
 import { EvalStore, type SuiteItemRecord, type SuiteRubricEntry } from "./store/index.js";
@@ -48,6 +50,7 @@ export interface GradeEvalRunOptions {
   concurrency?: number;
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
+  signal?: AbortSignal;
   onProgress?: (message: string) => void;
 }
 
@@ -85,7 +88,17 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
     throw new Error(`未找到评测运行：eval_run #${evalRunId}`);
   }
 
-  const sameModelNotice = graderModelId.trim().toLowerCase() === evalRun.model.trim().toLowerCase();
+  const spec = readEvaluationSpec(evalRun);
+  if (!spec) throw new EvaluationSpecError("legacy_spec_incomplete", "旧运行缺少完整评测规格，保留只读");
+  const suite = evalStore.getSuite(evalRun.suiteName);
+  if (!suite || suite.id !== spec.suiteId || suite.sha256 !== spec.suiteSha256 || evalRun.model !== spec.modelId ||
+      evalRun.candidate !== spec.candidate || evalRun.historyMode !== spec.historyMode || evalRun.systemPrompt !== spec.systemPrompt) {
+    throw new EvaluationSpecError("evaluation_spec_invalid", "运行或套卷与评测规格身份不一致");
+  }
+  const signal = combineSignals(evalStore.signal, options.signal);
+  throwIfAborted(signal);
+
+  const sameModelNotice = graderModelId.trim().toLowerCase() === spec.modelId.trim().toLowerCase();
   if (sameModelNotice && !options.allowSameModel) {
     throw new Error(
       `批卷守卫拦截：批卷模型（${graderModelId}）与被测候选模型（${evalRun.model}）相同。` +
@@ -127,11 +140,25 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
     return true;
   });
 
+  const selectedItemIds = new Set(spec.itemIds);
+  for (const itemId of selectedItemIds) {
+    if (!itemById.has(itemId)) throw new EvaluationSpecError("evaluation_spec_invalid", `规格包含套卷外条目 #${itemId}`);
+  }
+  // Validate the entire dispatch set before any worker can contact a grader.
+  for (const prediction of toGrade) {
+    const item = itemById.get(prediction.suiteItemId);
+    if (!item || !selectedItemIds.has(item.id) || !turnsByItemId.get(item.id)?.some((turn) => turn.turnNo === prediction.turnNo)) {
+      throw new EvaluationSpecError("evaluation_spec_invalid", `预测 #${prediction.id} 不属于本次规格的套卷条目或对话轮`);
+    }
+    getTurnRubric(item, prediction.turnNo);
+  }
+
   const runRef = `eval_run:${evalRunId}`;
   let newlyGraded = 0;
   let errors = 0;
 
-  await runConcurrentPool(toGrade, concurrency, async (pred, idx) => {
+  await runConcurrentPool(toGrade, concurrency, async (pred, idx, workerSignal) => {
+    throwIfAborted(workerSignal);
     const item = itemById.get(pred.suiteItemId);
     if (!item) {
       errors++;
@@ -165,6 +192,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
       const graded = await runWithRetry({
         maxAttempts: callMaxAttempts,
         delayMs: callRetryDelayMs,
+        signal: workerSignal,
         onRetry: (attempt, max, error) => {
           options.onProgress?.(`${tag} 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
         },
@@ -183,10 +211,12 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
           let rawOutput: string | undefined;
           try {
             rawOutput = await runGrader({
+              signal: workerSignal,
               role: "eval_grader",
               systemPrompt: graderPrompt,
               input: gradeInput,
             });
+            throwIfAborted(workerSignal);
             let judgement: ReturnType<typeof parseGradeResult>;
             try {
               judgement = parseGradeResult(rawOutput, rubricEntry.rubric);
@@ -202,6 +232,7 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
         },
       });
 
+      throwIfAborted(workerSignal);
       const scored = scoreGradedTurn(graded.judgement, rubricEntry.rubric);
       evalStore.saveEvalScore({
         predictionId: pred.id,
@@ -227,10 +258,11 @@ export async function gradeEvalRun(options: GradeEvalRunOptions): Promise<GradeE
       newlyGraded++;
       options.onProgress?.(`${tag} -> score=${scored.finalScore}, behaviorOk=${scored.behaviorOk}`);
     } catch (error) {
+      rethrowIfAborted(error, workerSignal);
       errors++;
       options.onProgress?.(`${tag} 批卷失败：${publicErrorMessage(error)}`);
     }
-  });
+  }, { signal });
 
   const allScores = evalStore.listEvalScores(evalRunId);
   const meanTurnScore =

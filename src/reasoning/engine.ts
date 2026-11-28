@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resolveApiEndpoint } from "../shared/api-config.js";
+import { combineSignals, isOperationAborted, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import { DEFAULT_PROMPTS_DIR, DEFAULT_SKILLS_DIR } from "../shared/paths.js";
 import { createPiRunner, readPiConfig, type PiConfig, type ThinkingLevel } from "../shared/pi-runner.js";
@@ -259,6 +260,7 @@ export interface AttemptAuditEntry {
 
 export interface ReasoningBackfillOptions {
   store: ReasoningStore;
+  signal?: AbortSignal;
   candidates: CandidateTurn[];
   writerPrompt: string;
   writerSkill: Skill;
@@ -293,6 +295,8 @@ function validateMaxRewrites(value: number): number {
 }
 
 export async function runReasoningBackfill(options: ReasoningBackfillOptions): Promise<ReasoningBackfillResult> {
+  const signal = combineSignals(options.signal, options.store.signal);
+  throwIfAborted(signal);
   const maxRewrites = validateMaxRewrites(options.maxRewrites ?? 6);
   const concurrency = validateConcurrency(options.concurrency ?? 10);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
@@ -346,7 +350,8 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
   const statItems: TraceStatInput[] = new Array(options.candidates.length);
   let completedCount = 0;
 
-  async function processOne(turn: CandidateTurn, index: number): Promise<void> {
+  async function processOne(turn: CandidateTurn, index: number, signal: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
     const traceId = options.store.startTrace({
       reasoningRunId,
       attemptId: turn.attemptId,
@@ -368,6 +373,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
     try {
       const totalAttempts = maxRewrites + 1;
       for (let attemptNo = 1; attemptNo <= totalAttempts; attemptNo++) {
+        throwIfAborted(signal);
         rewriteCount = attemptNo - 1;
         const serializedToolSteps = turn.toolSteps && turn.toolSteps.length > 0
           ? turn.toolSteps.map((s) => ({
@@ -391,13 +397,16 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
         const rawWriter = await runWithRetry({
           maxAttempts: callMaxAttempts,
           delayMs: callRetryDelayMs,
+          signal,
           run: () =>
             options.runWriter({
               role: "answer",
               systemPrompt: composedWriterPrompt,
               input: writerInput,
+              signal,
             }),
         });
+        throwIfAborted(signal);
         const candidateReasoning = rawWriter.trim();
         lastRawOutput = rawWriter;
 
@@ -453,12 +462,15 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
         const review = await runWithRetry({
           maxAttempts: callMaxAttempts,
           delayMs: callRetryDelayMs,
+          signal,
           run: async () => {
             const rawJudge = await options.runJudge!({
               role: "judge",
               systemPrompt: composedJudgePrompt,
               input: judgeInput,
+              signal,
             });
+            throwIfAborted(signal);
             try {
               return parseReview(rawJudge);
             } catch (error) {
@@ -466,6 +478,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
             }
           },
         });
+        throwIfAborted(signal);
         lastLlmReview = review;
 
         attemptsLog.push({
@@ -497,6 +510,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
         finalReasoning = previousReasoning ?? null;
       }
 
+      throwIfAborted(signal);
       options.store.completeTrace(traceId, {
         status: "completed",
         decision: finalDecision,
@@ -534,6 +548,7 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
         rawOutput: lastRawOutput,
         error: msg,
       });
+      rethrowIfAborted(error, signal);
       statItems[index] = {
         status: "error",
         decision: null,
@@ -548,10 +563,14 @@ export async function runReasoningBackfill(options: ReasoningBackfillOptions): P
   }
 
   try {
-    await runConcurrentPool(options.candidates, concurrency, processOne);
+    await runConcurrentPool(options.candidates, concurrency, processOne, { signal });
+    throwIfAborted(signal);
     options.store.finishReasoningRun(reasoningRunId, "completed");
   } catch (error) {
-    options.store.finishReasoningRun(reasoningRunId, "error", publicErrorMessage(error));
+    const message = publicErrorMessage(error);
+    options.store.interruptOwnedRun(reasoningRunId, message);
+    options.store.finishReasoningRun(reasoningRunId, isOperationAborted(error) || signal?.aborted ? "interrupted" : "error", message);
+    rethrowIfAborted(error, signal);
     throw toPublicError(error);
   }
 

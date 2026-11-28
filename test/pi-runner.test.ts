@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { test, type TestContext } from "node:test";
-import { createPiRunner, readPiConfig, type PiConfig } from "../src/shared/pi-runner.js";
+import { createPiRunner, createPiSearchRunner, readPiConfig, type PiConfig } from "../src/shared/pi-runner.js";
 
 async function localApi(t: TestContext, handler: (request: IncomingMessage, response: ServerResponse) => void): Promise<string> {
   const server = createServer(handler);
@@ -253,4 +253,148 @@ test("Pi adapter bounds a stalled stream with a whole-call timeout", async (t) =
     response.flushHeaders();
   });
   await assert.rejects(createPiRunner(config(baseUrl, 150))({ role: "answer", systemPrompt: "x", input: {} }));
+});
+
+
+function sendTools(response: ServerResponse, calls: Array<{ id: string; name: string; arguments: unknown }>, thought = "batch thought"): void {
+  response.writeHead(200, { "Content-Type": "text/event-stream" });
+  const delta = {
+    role: "assistant", reasoning_content: thought,
+    tool_calls: calls.map((call, index) => ({ index, id: call.id, type: "function", function: {
+      name: call.name, arguments: JSON.stringify(call.arguments),
+    } })),
+  };
+  response.write(`data: ${JSON.stringify({ id: "fixture", choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+  response.write(`data: ${JSON.stringify({ id: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`);
+  response.end("data: [DONE]\n\n");
+}
+
+test("real parallel Pi batch executes only one search at cap=1 and audits every call by identity", async (t) => {
+  let httpCalls = 0;
+  let searchCalls = 0;
+  const baseUrl = await localApi(t, (_request, response) => {
+    if (++httpCalls === 1) sendTools(response, ["a", "b", "c"].map((id) => ({ id, name: "web_search", arguments: { query: id } })));
+    else sendText(response, "final answer");
+  });
+  const run = createPiSearchRunner(config(baseUrl), async ({ query }) => {
+    searchCalls++;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return { query, text: `result ${query}`, isError: false };
+  }, { maxSearchCalls: 1 });
+  const result = await run({ role: "answer", systemPrompt: "search", input: {} });
+  assert.equal(searchCalls, 1);
+  assert.equal(httpCalls, 2);
+  assert.equal(result.toolSteps.length, 1);
+  assert.equal(result.toolSteps[0]?.arguments.query, "a");
+  assert.equal(result.toolSteps[0]?.preCallThought, "batch thought");
+  assert.deepEqual(result.toolAttempts?.map((call) => [call.toolCallId, call.status]), [
+    ["a", "succeeded"], ["b", "limit_reached"], ["c", "limit_reached"],
+  ]);
+});
+
+
+test("real Pi deadline aborts a slow search and waits for tool cleanup without another model turn", async (t) => {
+  let httpCalls = 0;
+  let aborted = false;
+  let cleaned = false;
+  const baseUrl = await localApi(t, (_request, response) => {
+    httpCalls++;
+    sendTools(response, [{ id: "slow", name: "web_search", arguments: { query: "slow" } }]);
+  });
+  const run = createPiSearchRunner(config(baseUrl, 100), async ({ query, signal }) => {
+    await new Promise<void>((resolve) => {
+      const fallback = setTimeout(resolve, 400);
+      signal?.addEventListener("abort", () => {
+        aborted = true;
+        clearTimeout(fallback);
+        setTimeout(() => { cleaned = true; resolve(); }, 20);
+      }, { once: true });
+    });
+    return { query, text: "late success", isError: false };
+  });
+  await assert.rejects(run({ role: "answer", systemPrompt: "search", input: {} }), /model_timeout/);
+  assert.equal(aborted, true);
+  assert.equal(cleaned, true);
+  assert.equal(httpCalls, 1);
+});
+
+
+test("Pi parent cancellation is distinct from deadline and an already cancelled request makes no HTTP call", async (t) => {
+  let calls = 0;
+  const controller = new AbortController();
+  const baseUrl = await localApi(t, (_request, response) => {
+    calls++;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.flushHeaders();
+    controller.abort();
+  });
+  const run = createPiRunner(config(baseUrl, 5000));
+  const request = { role: "answer" as const, systemPrompt: "x", input: {}, signal: controller.signal };
+  await assert.rejects(run(request), /operation_aborted/);
+  await assert.rejects(run(request), /operation_aborted/);
+  assert.equal(calls, 1);
+});
+
+test("an extension ignoring cancellation keeps Pi pending until its real promise settles", async (t) => {
+  let release!: () => void;
+  const work = new Promise<void>((resolve) => { release = resolve; });
+  let cancelled!: () => void;
+  const observedAbort = new Promise<void>((resolve) => { cancelled = resolve; });
+  let calls = 0;
+  const baseUrl = await localApi(t, (_request, response) => {
+    calls++;
+    sendTools(response, [{ id: "stubborn", name: "extension", arguments: {} }]);
+  });
+  const run = createPiSearchRunner(config(baseUrl, 100), undefined, {
+    extraToolsFactory: ({ recordStep }) => [{
+      name: "extension", label: "extension", description: "fixture", parameters: { type: "object", properties: {} },
+      async execute(_id, _input, signal) {
+        signal?.addEventListener("abort", cancelled, { once: true });
+        await work;
+        recordStep({ toolName: "extension", arguments: {}, toolOutput: "late success" });
+        return { content: [{ type: "text", text: "late success" }], details: undefined };
+      },
+    }],
+  });
+  let settled = false;
+  const result = run({ role: "answer", systemPrompt: "x", input: {} }).then(
+    () => { settled = true; return "unexpected success"; },
+    (error: unknown) => { settled = true; return error; },
+  );
+  await observedAbort;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const premature = settled;
+  release();
+  const error = await result;
+  assert.equal(premature, false);
+  assert.ok(error instanceof Error && error.message.includes("model_timeout"));
+  assert.equal(calls, 1);
+});
+
+test("Pi tool audit survives reverse completion, reused IDs across batches, and schema rejection", async (t) => {
+  let calls = 0;
+  let release!: () => void;
+  const first = new Promise<void>((resolve) => { release = resolve; });
+  const baseUrl = await localApi(t, (_request, response) => {
+    calls++;
+    if (calls === 1) sendTools(response, [
+      { id: "a", name: "web_search", arguments: { query: "slow" } },
+      { id: "b", name: "web_search", arguments: { query: "fast" } },
+      { id: "bad", name: "web_search", arguments: {} },
+    ], "first batch");
+    else if (calls === 2) sendTools(response, [{ id: "a", name: "web_search", arguments: { query: "again" } }], "second batch");
+    else sendText(response, "final");
+  });
+  const run = createPiSearchRunner(config(baseUrl), async ({ query }) => {
+    if (query === "slow") await first;
+    if (query === "fast") release();
+    return { query, text: query, isError: false };
+  }, { maxSearchCalls: 3 });
+  const result = await run({ role: "answer", systemPrompt: "x", input: {} });
+  assert.deepEqual(result.toolSteps.map((step) => [step.arguments.query, step.toolOutput, step.preCallThought]), [
+    ["slow", "slow", "first batch"], ["fast", "fast", "first batch"], ["again", "again", "second batch"],
+  ]);
+  assert.deepEqual(result.toolAttempts?.map((call) => [call.batchId, call.toolCallId, call.status]), [
+    [1, "a", "succeeded"], [1, "b", "succeeded"], [1, "bad", "invalid_arguments"], [2, "a", "succeeded"],
+  ]);
 });

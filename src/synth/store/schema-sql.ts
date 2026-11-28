@@ -295,6 +295,19 @@ CREATE TABLE IF NOT EXISTS results (
   created_at TEXT NOT NULL CHECK(length(trim(created_at)) > 0)
 );
 
+CREATE TABLE IF NOT EXISTS tool_attempt_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  model_call_id INTEGER NOT NULL REFERENCES model_calls(id) ON DELETE CASCADE,
+  attempt_id TEXT NOT NULL,
+  batch_id INTEGER NOT NULL,
+  tool_call_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('attempted', 'succeeded', 'failed', 'limit_reached', 'cancelled', 'invalid_arguments')),
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(model_call_id, attempt_id, batch_id, tool_call_id)
+);
+
 CREATE TABLE IF NOT EXISTS attempt_tool_steps (
   id INTEGER PRIMARY KEY,
   attempt_id INTEGER NOT NULL REFERENCES attempts(id),

@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -79,7 +80,7 @@ test("offline dm demo writes unified SQLite results and outcomes with training_e
   const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
     assert.equal(store.checkIntegrity().ok, true);
-    const runs = store.db.prepare("SELECT id, kind, status, export_policy_json, skills_json FROM runs ORDER BY id").all() as Array<{
+    const runs = storeConnection(store).prepare("SELECT id, kind, status, export_policy_json, skills_json FROM runs ORDER BY id").all() as Array<{
       id: number; kind: string; status: string; export_policy_json: string; skills_json: string;
     }>;
     assert.deepEqual(runs.map((r) => [r.kind, r.status]), [
@@ -92,7 +93,7 @@ test("offline dm demo writes unified SQLite results and outcomes with training_e
     assert.deepEqual(store.queryOutcomeCounts(runs[1].id), { pass: 2, drop: 1 });
     assert.equal(store.exportRunSamples(runs[1].id).length, 2);
 
-    const callCounts = store.db.prepare("SELECT role, COUNT(*) AS c FROM model_calls GROUP BY role").all() as Array<{
+    const callCounts = storeConnection(store).prepare("SELECT role, COUNT(*) AS c FROM model_calls GROUP BY role").all() as Array<{
       role: string; c: number;
     }>;
     assert.deepEqual(Object.fromEntries(callCounts.map((r) => [r.role, Number(r.c)])), {
@@ -113,7 +114,7 @@ test("dm demo honors max-attempts and records exhaustion without inserting into 
 
   const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
-    const judgeRun = store.db.prepare("SELECT id FROM runs WHERE kind = 'answer_judge'").get() as { id: number };
+    const judgeRun = storeConnection(store).prepare("SELECT id FROM runs WHERE kind = 'answer_judge'").get() as { id: number };
     assert.deepEqual(store.queryOutcomeCounts(judgeRun.id), { pass: 1, drop: 1, exhausted: 1 });
     assert.equal(store.exportRunSamples(judgeRun.id).length, 1);
   } finally {
@@ -239,7 +240,7 @@ test("live dm synth judge preserves minimal wire inputs, isolated Skills, SQLite
   const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
     assert.equal(store.checkIntegrity().ok, true);
-    const judgeRuns = store.db.prepare(
+    const judgeRuns = storeConnection(store).prepare(
       "SELECT id, config_json, skills_json, export_policy_json FROM runs WHERE kind = 'answer_judge' ORDER BY id",
     ).all() as Array<{ id: number; config_json: string; skills_json: string; export_policy_json: string }>;
     assert.equal(judgeRuns.length, 2);

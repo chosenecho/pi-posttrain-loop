@@ -9,6 +9,7 @@ import {
 } from "../shared/cli-helpers.js";
 import { nonEmpty, validateSplit } from "../shared/schema.js";
 import type { DedupPolicy } from "../shared/types.js";
+import { ALL_SYNTH_PROFILES } from "../shared/types.js";
 import { parseProfileFilter, parseTierFilter } from "../reasoning/checks.js";
 import type { ReasoningExportFormat } from "../reasoning/export.js";
 import {
@@ -52,7 +53,7 @@ ${Object.values(COT_BACKFILL_PRESETS).map((p) => `  ${p.name.padEnd(10)} ${p.des
   --stratified              按档位 × 轮次分层抽样（搭配 --limit）
   --seed N                  随机种子（默认 42）
   --only-missing            跳过已有通过思考链的轮次（--preset pilot/full 默认开启）
-  --profile FILTER          筛选来源风格：all | standard | short | medium | long | xlong | trap | search
+  --profile FILTER          筛选来源风格：all | ${ALL_SYNTH_PROFILES.join(" | ")}
   --tier LIST               筛选长度档位，逗号分隔：short,medium,long
   --split SPLIT             筛选分区：train | test | dpo
   --runs ID1,ID2            仅筛选指定 answer_judge run_id
@@ -94,7 +95,7 @@ ${Object.values(COT_EXPORT_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descr
   --format FORMAT           导出格式：inline（默认）| reasoning_content
   --no-expand-turns         关闭按轮展开（默认按轮展开以兼容 ms-swift）
   --split SPLIT             筛选分区：train | test | dpo
-  --profile FILTER          筛选来源风格：all | standard | short | medium | long | xlong | trap | search
+  --profile FILTER          筛选来源风格：all | ${ALL_SYNTH_PROFILES.join(" | ")}
   --tier LIST               筛选长度档位：short,medium,long
   --runs ID1,ID2 / --exclude-runs IDs / --min-turns N / --max-turns N / --dedup POLICY
   --shuffle / --seed N      打乱顺序与随机种子
@@ -150,7 +151,7 @@ export async function runCotCli(args: string[]): Promise<void> {
       allowPositionals: false,
     });
     if (values.help) {
-      console.log("用法：npm run dm -- cot status [--db PATH] [--split train|test|dpo] [--profile all|standard|short] [--tier short,medium,long]");
+      console.log("用法：npm run dm -- cot status [--db PATH] [--split train|test|dpo] [--profile FILTER] [--tier short,medium,long]");
       return;
     }
     const status = getReasoningStatus({

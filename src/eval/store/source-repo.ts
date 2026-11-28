@@ -107,10 +107,12 @@ export class EvalSourceRepo {
     return rows.map(mapSourceRow);
   }
 
-  /** Lists source materials that have NOT yet had any probe created (for resumable `eval make`). */
+  /** Latest generation decides pending work; legacy probes alone never prove batch completeness. */
   listUnbuiltSourceMaterials(filter: { videoKeys?: string[]; limit?: number } = {}): SourceMaterialRecord[] {
     const clauses: string[] = [
-      "NOT EXISTS (SELECT 1 FROM probes p WHERE p.source_material_id = s.id)",
+      `NOT EXISTS (SELECT 1 FROM probe_build_plans p WHERE p.source_material_id = s.id
+       AND p.generation = (SELECT max(n.generation) FROM probe_build_plans n WHERE n.source_material_id = s.id)
+       AND p.plan_complete = 1 AND p.status IN ('done', 'skipped'))`,
     ];
     const params: Array<string | number> = [];
     if (filter.videoKeys && filter.videoKeys.length > 0) {
@@ -198,6 +200,11 @@ export class EvalSourceRepo {
     this.db
       .prepare("UPDATE agent_calls SET output_text = ?, error = ?, ended_at = ? WHERE id = ?")
       .run(outcome.output ?? null, outcome.error ?? null, nowIso(), callId);
+  }
+
+  getAgentCall(callId: number): { id: number; output: string | null; error: string | null; inputRefs: Record<string, unknown> } | undefined {
+    const row = this.db.prepare("SELECT * FROM agent_calls WHERE id = ?").get(callId);
+    return row ? { id: Number(row.id), output: row.output_text === null ? null : String(row.output_text), error: row.error === null ? null : String(row.error), inputRefs: parseJsonObject(String(row.input_refs_json)) } : undefined;
   }
 
   countAgentCalls(runRef: string, role?: string): number {

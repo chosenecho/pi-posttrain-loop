@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { runCli } from "../src/cli/index.js";
+import { bindCandidate } from "../src/eval/candidate-client.js";
 import { gradeEvalRun } from "../src/eval/eval-grader.js";
 import { runSuiteEvaluation } from "../src/eval/eval-runner.js";
 import { BEHAVIOR_FAIL_SCORE_CAP, classifyProbeDifficulty, scoreGradedTurn } from "../src/eval/grader-core.js";
@@ -152,7 +154,8 @@ test("evaluate workflow supports gold/self history modes, same-model guard, repo
       noSystemPrompt: true,
       outPath: baseOut,
       callMaxAttempts: 1,
-      runCandidate: async () => "嗯，你说得也有道理，各方面都要看。",
+      baseUrl: "http://fixture.invalid/v1",
+      candidateFactory: (spec) => bindCandidate(spec, async () => "嗯，你说得也有道理，各方面都要看。"),
       runGrader: async () =>
         JSON.stringify({
           verdict: "fail", score: 30, behaviorOk: false, hallucinated: false,
@@ -176,10 +179,11 @@ test("evaluate workflow supports gold/self history modes, same-model guard, repo
       historyMode: "self",
       noSystemPrompt: true,
       callMaxAttempts: 1,
-      runCandidate: async ({ messages }) => {
+      baseUrl: "http://fixture.invalid/v1",
+      candidateFactory: (spec) => bindCandidate(spec, async ({ messages }) => {
         seenHistoryCounts.push(messages.length);
         return "SFT 精准回答：直接纠正前提并守住核心立场。";
-      },
+      }),
       runGrader: async () =>
         JSON.stringify({
           verdict: "pass", score: 88, behaviorOk: true, hallucinated: false,
@@ -190,6 +194,19 @@ test("evaluate workflow supports gold/self history modes, same-model guard, repo
     assert.equal(sftRes.grade.meanTurnScore, 88);
     assert.ok(seenHistoryCounts.includes(3)); // turn 2 received prior user + candidate assistant + turn 2 user
 
+    // The CLI must leave omitted identity fields undefined all the way to the resolver.
+    const resumedCli = spawnSync(process.execPath, ["--import", "tsx", "src/cli/index.ts", "eval", "evaluate", "--eval-db", evalDb, "--suite", "suite-v1", "--candidate", "sft-v1", "--resume-run", String(sftRes.run.evalRunId)], {
+      cwd: process.cwd(), encoding: "utf8", env: { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH,
+        EVAL_LLM_BASE_URL: "http://fixture.invalid/v1", EVAL_LLM_API_KEY: "fixture-key", EVAL_LLM_MODEL: "judge-model",
+        CANDIDATE_LLM_MODEL: "changed-current-default", CANDIDATE_LLM_TEMPERATURE: "0.9" },
+    });
+    assert.equal(resumedCli.status, 0, resumedCli.stderr);
+    const resumed = JSON.parse(resumedCli.stdout);
+    assert.equal(resumed.run.historyMode, "self");
+    assert.equal(resumed.run.modelId, "qwen-sft");
+    assert.equal(resumed.run.skippedExistingTurns, 3);
+    assert.equal(resumed.grade.skippedAlreadyGraded, 3);
+
     // Same-model grader guard
     const store2 = new EvalStore(evalDb);
     try {
@@ -198,7 +215,8 @@ test("evaluate workflow supports gold/self history modes, same-model guard, repo
         suiteName: "suite-v1",
         candidate: "same-check",
         modelId: "same-model",
-        runCandidate: async () => "回答",
+        baseUrl: "http://fixture.invalid/v1",
+        candidateFactory: (spec) => bindCandidate(spec, async () => "回答"),
         callMaxAttempts: 1,
       });
       await assert.rejects(

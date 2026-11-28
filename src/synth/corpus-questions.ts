@@ -1,7 +1,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { combineSignals, isOperationAborted, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { runConcurrentPool } from "../shared/concurrency.js";
 import { createPiRunner, sanitizePiConfig, type PiConfig } from "../shared/pi-runner.js";
-import { PublicError, publicErrorMessage } from "../shared/public-error.js";
+import { PublicError, publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
   DEFAULT_CALL_RETRY_DELAY_MS,
   runWithRetry,
@@ -23,6 +24,7 @@ import type { DataMakerStore } from "./store/index.js";
 
 export interface RunCorpusQuestionsOptions {
   store: DataMakerStore;
+  signal?: AbortSignal;
   config: PiConfig;
   systemPrompt: string;
   skills: Array<Record<string, unknown>>;
@@ -56,6 +58,8 @@ export async function runCorpusQuestionGeneration(
   options: RunCorpusQuestionsOptions,
 ): Promise<RunCorpusQuestionsSummary> {
   const { store, config, systemPrompt, skills, candidates } = options;
+  const signal = combineSignals(options.signal, store.signal);
+  throwIfAborted(signal);
   const concurrency = validateConcurrency(options.concurrency);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? 1);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
@@ -98,7 +102,8 @@ export async function runCorpusQuestionGeneration(
   const seenBatchSha256 = new Set<string>(force ? [] : processedSha256s);
   const perVideoQuestionIds: number[][] = Array.from({ length: candidates.length }, () => []);
 
-  async function processChunk(loaded: LoadedVideoUnit, index: number): Promise<"processed" | "skipped" | "error"> {
+  async function processChunk(loaded: LoadedVideoUnit, index: number, signal: AbortSignal): Promise<"processed" | "skipped" | "error"> {
+    throwIfAborted(signal);
     if (!force && seenBatchSha256.has(loaded.sha256)) {
       skippedBySha++;
       options.onProgress?.(`[${loaded.videoId}] 跳过（全文指纹与已处理视频完全相同）`);
@@ -142,6 +147,7 @@ export async function runCorpusQuestionGeneration(
       const result = await runWithRetry({
         maxAttempts: callMaxAttempts,
         delayMs: callRetryDelayMs,
+        signal,
         run: async () => {
           receipt = undefined;
           lastRawOutput = undefined;
@@ -155,9 +161,18 @@ export async function runCorpusQuestionGeneration(
             },
             { maxQuestions, profile: options.profile },
           );
+          const guardedTool: AgentTool = {
+            ...tool,
+            async execute(...args) {
+              throwIfAborted(signal);
+              const result = await tool.execute(...args);
+              throwIfAborted(signal);
+              return result;
+            },
+          };
           const runner = options.createRunner
-            ? options.createRunner([tool])
-            : createPiRunner(config, [tool]);
+            ? options.createRunner([guardedTool])
+            : createPiRunner(config, [guardedTool]);
           const output = await runner({
             role: "question",
             systemPrompt,
@@ -167,7 +182,9 @@ export async function runCorpusQuestionGeneration(
               max_questions: maxQuestions,
               transcript: material.content,
             },
+            signal,
           });
+          throwIfAborted(signal);
           lastRawOutput = output;
           if (!receipt) {
             throw new PublicError("model_save_tool_missing");
@@ -183,6 +200,7 @@ export async function runCorpusQuestionGeneration(
           );
         },
       });
+      throwIfAborted(signal);
       const savedReceipt = receipt!;
       store.finishModelCall(callId, result);
       savedTotal += savedReceipt.saved_count;
@@ -198,30 +216,41 @@ export async function runCorpusQuestionGeneration(
       if (store.getModelCallStatus(callId) === "running") {
         store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
       }
+      rethrowIfAborted(error, signal);
       errors++;
       options.onProgress?.(`[${loaded.videoId}][question:call:${callId}] 错误${callMaxAttempts > 1 ? "（已丢弃本分块）" : ""}：${finalMsg}`);
       return "error";
     }
   }
 
-  await runConcurrentPool(candidates, concurrency, async (unit, index) => {
-    const chunks = await loadVideoChunks(unit, { maxChunkChars: options.maxChunkChars });
-    if (chunks.length > 1) {
-      options.onProgress?.(`[${unit.videoId}] 多P长合集（共${unit.partPaths.length}P）自动切分为 ${chunks.length} 个分块处理`);
-    }
-    let anyProcessed = false;
-    for (const chunk of chunks) {
-      const status = await processChunk(chunk, index);
-      if (status === "processed") anyProcessed = true;
-    }
-    if (anyProcessed) {
-      processed++;
-    }
-  });
-
-  store.finishRun(runId, processed === 0 && errors > 0 ? "error" : "completed", {
-    error: errors > 0 ? `${errors} 个视频出题失败` : null,
-  });
+  try {
+    await runConcurrentPool(candidates, concurrency, async (unit, index, workerSignal) => {
+      throwIfAborted(workerSignal);
+      const chunks = await loadVideoChunks(unit, { maxChunkChars: options.maxChunkChars });
+      throwIfAborted(workerSignal);
+      if (chunks.length > 1) {
+        options.onProgress?.(`[${unit.videoId}] 多P长合集（共${unit.partPaths.length}P）自动切分为 ${chunks.length} 个分块处理`);
+      }
+      let anyProcessed = false;
+      for (const chunk of chunks) {
+        const status = await processChunk(chunk, index, workerSignal);
+        if (status === "processed") anyProcessed = true;
+      }
+      if (anyProcessed) {
+        processed++;
+      }
+    }, { signal });
+    throwIfAborted(signal);
+    store.finishRun(runId, processed === 0 && errors > 0 ? "error" : "completed", {
+      error: errors > 0 ? `${errors} 个视频出题失败` : null,
+    });
+  } catch (error) {
+    const message = publicErrorMessage(error);
+    store.interruptOwnedRun(runId, message);
+    store.finishRun(runId, isOperationAborted(error) || signal?.aborted ? "interrupted" : "error", { error: message });
+    rethrowIfAborted(error, signal);
+    throw toPublicError(error);
+  }
 
   const generatedQuestionIds: number[] = [];
   const seenIds = new Set<number>();

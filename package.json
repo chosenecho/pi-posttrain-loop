@@ -10,7 +10,9 @@
     "dm": "node --env-file-if-exists=.env --import tsx src/cli/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "check": "npm run typecheck && npm test"
+    "check:ts": "npm run typecheck && npm test",
+    "test:python": "node scripts/test-python.mjs",
+    "check": "npm run check:ts && npm run test:python"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.6.0",

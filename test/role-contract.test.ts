@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
@@ -113,7 +114,7 @@ test("two revisions send only the latest answer and feedback while keeping role 
   }
 
   // Verify SQLite model_calls store reference-based input_refs_json without duplicating raw material text
-  const dbCalls = store.db.prepare("SELECT role, input_refs_json FROM model_calls ORDER BY id").all() as Array<{
+  const dbCalls = storeConnection(store).prepare("SELECT role, input_refs_json FROM model_calls ORDER BY id").all() as Array<{
     role: string; input_refs_json: string;
   }>;
   assert.deepEqual(dbCalls.map((c) => c.role), ["answer", "judge", "answer", "judge", "answer", "judge"]);

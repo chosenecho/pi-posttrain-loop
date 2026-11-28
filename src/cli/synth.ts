@@ -8,6 +8,8 @@ import {
 } from "../shared/cli-helpers.js";
 import { nonEmpty, parseOptionalSynthProfile, validateSplit } from "../shared/schema.js";
 import type { DatasetSplit, DedupPolicy, SynthProfile } from "../shared/types.js";
+import { ALL_SYNTH_PROFILES, TRAIN_SUITE_PROFILES } from "../shared/types.js";
+import { DEFAULT_CALL_RETRY_DELAY_MS } from "../shared/retry.js";
 import type { VideoSortMode } from "../synth/corpus.js";
 import { runDemo } from "../synth/demo.js";
 import {
@@ -29,8 +31,8 @@ import {
 const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <子命令>）
 
 子命令：
-  status     查看语料进度、各 profile 覆盖数、分区统计与待质检问题数
-  suite      对同一批视频依次跑完 6 套长度/类型 Skill（short / medium / long / xlong / trap / search）
+  status     只读查看语料进度、profile 覆盖、分区统计、待同步分区数与待质检问题数
+  suite      对同一批视频依次跑完 ${TRAIN_SUITE_PROFILES.length} 套长度/类型/工具 Skill（${TRAIN_SUITE_PROFILES.join(" / ")}）
   run        单套 profile 批量生产（出题 -> 多轮问答质检 -> 可选导出）
   questions  仅执行批量或单文件出题入库（支持按 --profile 独立去重）
   judge      仅对题库执行多轮回答与质检（支持增量续跑）
@@ -46,6 +48,8 @@ const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <
   npm run dm -- synth run --preset train-xlong --limit 20
   npm run dm -- synth run --preset train-trap --limit 20
   npm run dm -- synth run --preset train-search --limit 20
+  npm run dm -- synth run --preset train-todo --limit 5
+  npm run dm -- synth run --preset train-clarify --limit 5
   npm run dm -- synth run --preset dpo-pool --limit 15
   npm run dm -- synth judge --only-unjudged --max-turns 3 --concurrency 10
   npm run dm -- synth export --preset train-val --out output/train.jsonl --val-out output/val.jsonl --manifest output/manifest.json
@@ -57,13 +61,12 @@ const SYNTH_HELP = `问答与多轮对话合成命令组（npm run dm -- synth <
 
 const SUITE_HELP = `npm run dm -- synth suite [选项]
 
-对每个未处理视频依次跑完 6 套独立 Skill（short / medium / long / xlong / trap / search），
-由各套 Skill 自主控制出题数量、回答篇幅、追问复杂度与检索增强：
-  目标参考占比：short ~5% | medium ~20% | long ~25% | xlong ~30% | trap ~10% | search ~10%
+对每个未处理视频依次跑完 ${TRAIN_SUITE_PROFILES.length} 套独立 Skill（${TRAIN_SUITE_PROFILES.join(" / ")}），
+由各套 Skill 在上限内自主控制题量、篇幅和追问；支持规划、反问澄清与按需检索。
 
 常用选项：
   --limit N                 每个 profile 最多抽取未处理视频数量（默认 10）
-  --profiles LIST           仅跑指定子集，逗号分隔（默认 short,medium,long,xlong,trap,search）
+  --profiles LIST           仅跑指定子集，逗号分隔（默认 ${TRAIN_SUITE_PROFILES.join(",")}）
   --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
   --sort MODE               视频排序：core-first（默认）| id（与 --shuffle 互斥）
   --shuffle                 随机打乱待出题视频顺序
@@ -74,7 +77,7 @@ const SUITE_HELP = `npm run dm -- synth suite [选项]
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
   --eval-db PATH            独立评测库路径（默认同目录 eval.sqlite）
   --call-attempts N         单次模型调用最大尝试次数（默认 3）
-  --retry-delay-ms N        重试间隔毫秒数（默认 1500）
+  --retry-delay-ms N        重试间隔毫秒数（默认 ${DEFAULT_CALL_RETRY_DELAY_MS}）
 `;
 
 const RUN_HELP = `npm run dm -- synth run [选项]
@@ -86,11 +89,11 @@ ${Object.values(SYNTH_RUN_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descri
   --preset NAME             内置预设名（推荐）
   --limit N                 本次抽取该 profile 未出题视频数量上限
   --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
-  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
+  --profile PROFILE         风格预设：${ALL_SYNTH_PROFILES.join(" | ")}（默认 standard）
   --sort MODE               视频排序：id | core-first（与 --shuffle 互斥）
   --shuffle                 随机打乱待出题视频顺序
   --max-questions N         单视频最多生成问题数（安全上限覆盖）
-  --max-turns N             多轮对话轮数（short/medium/trap 默认 2，long/xlong/standard 默认 3）
+  --max-turns N             多轮对话轮数（standard/long/xlong 默认 3，其余默认 2）
   --max-attempts N          每轮返工最大尝试次数（默认 4，含初稿）
   --concurrency N           并发数（默认 10）
   --include-unjudged        同时把库中该分区同 profile 历史未质检问题并入本批质检
@@ -103,7 +106,7 @@ ${Object.values(SYNTH_RUN_PRESETS).map((p) => `  ${p.name.padEnd(16)} ${p.descri
   --question-skill / --followup-skill / --answer-style / --quality-judge PATH
   --prompts DIR             覆盖提示词目录
   --call-attempts N         单次模型调用最大尝试次数（默认 3）
-  --retry-delay-ms N        重试间隔毫秒数（默认 1500）
+  --retry-delay-ms N        重试间隔毫秒数（默认 ${DEFAULT_CALL_RETRY_DELAY_MS}）
 `;
 
 const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
@@ -112,7 +115,7 @@ const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
   --input FILE              单视频文稿文件路径（与 --input-dir 互斥）
   --input-dir DIR           语料目录（默认 data/weimingzi-semantic）
   --split SPLIT             数据集分区：train（默认）| dpo（test 仅供 eval 流水线）
-  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
+  --profile PROFILE         风格预设：${ALL_SYNTH_PROFILES.join(" | ")}（默认 standard）
   --limit N                 本次最多处理该 profile 未出题视频数
   --sort MODE               视频排序：id（默认）| core-first
   --shuffle                 随机抽取待出题视频
@@ -123,19 +126,19 @@ const QUESTIONS_HELP = `npm run dm -- synth questions [选项]
   --question-skill PATH     自定义出题 Skill
   --no-skill                关闭出题 Skill
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
-  --call-attempts N         单次调用重试次数（默认 3）
-  --retry-delay-ms N        重试间隔毫秒数（默认 1500）
+  --call-attempts N         单次调用最大尝试次数（默认 3）
+  --retry-delay-ms N        重试间隔毫秒数（默认 ${DEFAULT_CALL_RETRY_DELAY_MS}）
 `;
 
 const JUDGE_HELP = `npm run dm -- synth judge [选项]
 
 选项：
   --split SPLIT             按数据集分区过滤：train | dpo（test 仅供 eval 流水线）
-  --profile PROFILE         风格预设：short | medium | long | xlong | trap | standard（默认）
+  --profile PROFILE         风格预设：${ALL_SYNTH_PROFILES.join(" | ")}（默认 standard）
   --video-id ID             仅处理指定 video_id 的问题
   --question-ids ID1,ID2    仅处理指定问题 ID 列表
   --only-unjudged           仅增量处理未通过且未完成的题（别名 --resume-unjudged）
-  --max-turns N             对话轮数（short/medium/trap 默认 2，long/xlong/standard 默认 3）
+  --max-turns N             对话轮数（standard/long/xlong 默认 3，其余默认 2）
   --max-attempts N          每轮最大返工尝试次数（默认 4，含初稿）
   --concurrency N           并发数（默认 10）
   --export PATH             跑完自动导出本批 JSONL
@@ -144,8 +147,8 @@ const JUDGE_HELP = `npm run dm -- synth judge [选项]
   --prompts DIR             覆盖提示词目录
   --followup-skill / --answer-style / --quality-judge PATH
   --db PATH                 主库路径（默认 data/data-maker.sqlite）
-  --call-attempts N         单次调用重试次数（默认 3）
-  --retry-delay-ms N        重试间隔毫秒数（默认 1500）
+  --call-attempts N         单次调用最大尝试次数（默认 3）
+  --retry-delay-ms N        重试间隔毫秒数（默认 ${DEFAULT_CALL_RETRY_DELAY_MS}）
 `;
 
 const EXPORT_HELP = `npm run dm -- synth export [选项]

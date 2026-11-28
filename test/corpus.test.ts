@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -346,7 +347,7 @@ test("question CLI keeps unsaved model output in trace without printing it or st
   }
   const store = new DataMakerStore(dbPath);
   try {
-    const row = store.db.prepare("SELECT output_text, error FROM model_calls WHERE role = 'question'").get() as { output_text: string; error: string };
+    const row = storeConnection(store).prepare("SELECT output_text, error FROM model_calls WHERE role = 'question'").get() as { output_text: string; error: string };
     assert.equal(row.output_text, marker);
     assert.match(row.error, /model_save_tool_missing/);
     assert.equal(row.error.includes(marker), false);

@@ -168,6 +168,7 @@ export class EvalProbeRepo {
   listProbes(
     filter: {
       runId?: number;
+      executionRunId?: number;
       status?: ProbeStatus;
       probeType?: ProbeType;
       probeTypes?: readonly ProbeType[];
@@ -180,6 +181,10 @@ export class EvalProbeRepo {
     if (filter.runId !== undefined) {
       clauses.push("run_id = ?");
       params.push(filter.runId);
+    }
+    if (filter.executionRunId !== undefined) {
+      clauses.push("EXISTS (SELECT 1 FROM probe_build_slots bs JOIN probe_build_executions be ON be.plan_id = bs.plan_id WHERE bs.probe_id = probes.id AND be.execution_run_id = ?)");
+      params.push(filter.executionRunId);
     }
     if (filter.status !== undefined) {
       clauses.push("status = ?");

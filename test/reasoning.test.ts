@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
@@ -564,6 +565,7 @@ test("end-to-end backfill enforces material isolation, rule/LLM rewrites, drops,
     turnNo: 1,
     lengthTier: "short",
   });
+  storeConnection(store).prepare("UPDATE reasoning_runs SET owner_token = NULL WHERE id = ?").run(orphanRun);
   const recovered = store.recoverInterruptedRuns();
   assert.deepEqual(recovered, { runs: 1, traces: 1 });
   assert.equal(store.getPassedReasoningMap(backfill.reasoningRunId).size, 2);

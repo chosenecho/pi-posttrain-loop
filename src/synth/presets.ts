@@ -1,5 +1,6 @@
 import type { DatasetSplit, SynthProfile } from "../shared/types.js";
 import type { VideoSortMode } from "./corpus.js";
+import { ALL_SYNTH_PROFILES, TRAIN_SUITE_PROFILES, getSynthProfile } from "./profiles.js";
 
 export type SynthRunPresetName =
   | "train-standard"
@@ -24,92 +25,33 @@ export interface SynthRunPreset {
   maxQuestionsPerVideo?: number;
 }
 
-export const SYNTH_RUN_PRESETS: Record<SynthRunPresetName, SynthRunPreset> = {
-  "train-standard": {
-    name: "train-standard",
-    description: "训练集标准综合预设（历史兼容，train 分区 + standard Skill + core-first + 3 轮）",
-    split: "train",
-    profile: "standard",
-    sort: "core-first",
-    maxTurns: 3,
-  },
-  "train-short": {
-    name: "train-short",
-    description: "训练集短答预设（Easy 档组成，train 分区 + short Skill + core-first + 最多 2 轮）",
-    split: "train",
-    profile: "short",
-    sort: "core-first",
-    maxTurns: 2,
-  },
-  "train-medium": {
-    name: "train-medium",
-    description: "训练集中等长度预设（Easy 档组成，train 分区 + medium Skill + core-first + 最多 2 轮）",
-    split: "train",
-    profile: "medium",
-    sort: "core-first",
-    maxTurns: 2,
-  },
-  "train-long": {
-    name: "train-long",
-    description: "训练集长答预设（Medium 进阶档，train 分区 + long Skill + core-first + 最多 3 轮）",
-    split: "train",
-    profile: "long",
-    sort: "core-first",
-    maxTurns: 3,
-  },
-  "train-xlong": {
-    name: "train-xlong",
-    description: "训练集超长深挖预设（Hard 高难档组成，train 分区 + xlong Skill + core-first + 最多 3 轮）",
-    split: "train",
-    profile: "xlong",
-    sort: "core-first",
-    maxTurns: 3,
-  },
-  "train-trap": {
-    name: "train-trap",
-    description: "训练集陷阱拒答预设（Hard 高难档组成，train 分区 + trap Skill + core-first + 最多 2 轮 + 上限 2 题）",
-    split: "train",
-    profile: "trap",
-    sort: "core-first",
-    maxTurns: 2,
-    maxQuestionsPerVideo: 2,
-  },
-  "train-search": {
-    name: "train-search",
-    description: "训练集独立搜索考证专项预设（联网搜证后回答，train 分区 + search Skill + core-first + 最多 2 轮 + 上限 2 题）",
-    split: "train",
-    profile: "search",
-    sort: "core-first",
-    maxTurns: 2,
-    maxQuestionsPerVideo: 2,
-  },
-  "train-todo": {
-    name: "train-todo",
-    description: "训练集长流程规划预设（Pi todo 工具拆解 + 按需搜索，train 分区 + todo Skill + core-first + 最多 2 轮 + 上限 2 题）",
-    split: "train",
-    profile: "todo",
-    sort: "core-first",
-    maxTurns: 2,
-    maxQuestionsPerVideo: 2,
-  },
-  "train-clarify": {
-    name: "train-clarify",
-    description: "训练集反问澄清预设（Pi question/questionnaire 追问 + 用户模拟器，train 分区 + clarify Skill + core-first + 最多 2 轮 + 上限 2 题）",
-    split: "train",
-    profile: "clarify",
-    sort: "core-first",
-    maxTurns: 2,
-    maxQuestionsPerVideo: 2,
-  },
-  "dpo-pool": {
-    name: "dpo-pool",
-    description: "DPO 采题池预设（dpo 分区 + 随机抽选 + 3 轮）",
-    split: "dpo",
-    profile: "standard",
-    shuffle: true,
-    maxTurns: 3,
-  },
+const TRAIN_DESCRIPTIONS: Record<SynthProfile, string> = {
+  standard: "训练集标准综合预设（历史兼容，train 分区 + standard Skill + core-first + 3 轮）",
+  short: "训练集短答预设（Easy 档组成，train 分区 + short Skill + core-first + 最多 2 轮）",
+  medium: "训练集中等长度预设（Easy 档组成，train 分区 + medium Skill + core-first + 最多 2 轮）",
+  long: "训练集长答预设（Medium 进阶档，train 分区 + long Skill + core-first + 最多 3 轮）",
+  xlong: "训练集超长深挖预设（Hard 高难档组成，train 分区 + xlong Skill + core-first + 最多 3 轮）",
+  trap: "训练集陷阱拒答预设（Hard 高难档组成，train 分区 + trap Skill + core-first + 最多 2 轮 + 上限 2 题）",
+  search: "训练集独立搜索考证专项预设（联网搜证后回答，train 分区 + search Skill + core-first + 最多 2 轮 + 上限 2 题）",
+  todo: "训练集长流程规划预设（Pi todo 工具拆解 + 按需搜索，train 分区 + todo Skill + core-first + 最多 2 轮 + 上限 2 题）",
+  clarify: "训练集反问澄清预设（Pi question/questionnaire 追问 + 用户模拟器，train 分区 + clarify Skill + core-first + 最多 2 轮 + 上限 2 题）",
 };
+
+export const SYNTH_RUN_PRESETS = Object.fromEntries([
+  ...ALL_SYNTH_PROFILES.map((profile) => {
+    const descriptor = getSynthProfile(profile);
+    const name = `train-${profile}`;
+    return [name, {
+      name, description: TRAIN_DESCRIPTIONS[profile], split: "train", profile, sort: "core-first",
+      maxTurns: descriptor.maxTurns,
+      ...(descriptor.maxQuestionsPerVideo !== undefined ? { maxQuestionsPerVideo: descriptor.maxQuestionsPerVideo } : {}),
+    }];
+  }),
+  ["dpo-pool", {
+    name: "dpo-pool", description: "DPO 采题池预设（dpo 分区 + 随机抽选 + 3 轮）",
+    split: "dpo", profile: "standard", shuffle: true, maxTurns: getSynthProfile("standard").maxTurns,
+  }],
+]) as Record<SynthRunPresetName, SynthRunPreset>;
 
 export function resolveSynthRunPreset(raw: string | undefined): SynthRunPreset | undefined {
   if (raw === undefined) return undefined;
@@ -131,7 +73,7 @@ export const SYNTH_TIER_PROFILES: Record<"easy" | "medium" | "hard" | "todo" | "
   todo: ["todo"],
   clarify: ["clarify"],
   search: ["search"],
-  all: ["short", "medium", "long", "xlong", "trap", "search", "todo", "clarify"],
+  all: TRAIN_SUITE_PROFILES,
 };
 
 export type SynthExportPresetName = "train-val" | "train-all";

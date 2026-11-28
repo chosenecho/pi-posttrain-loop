@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { selectVideos, type VideoUnit } from "../src/synth/corpus.js";
@@ -75,11 +76,11 @@ test("video_splits enforces immutability triggers and backfills historical proce
 
     // SQLite triggers reject direct UPDATE or DELETE on video_splits
     assert.throws(
-      () => store.db.prepare("UPDATE video_splits SET split = 'test' WHERE video_key = 'BV_LEGACY'").run(),
+      () => storeConnection(store).prepare("UPDATE video_splits SET split = 'test' WHERE video_key = 'BV_LEGACY'").run(),
       /cannot modify assigned video_split/,
     );
     assert.throws(
-      () => store.db.prepare("DELETE FROM video_splits WHERE video_key = 'BV_LEGACY'").run(),
+      () => storeConnection(store).prepare("DELETE FROM video_splits WHERE video_key = 'BV_LEGACY'").run(),
       /cannot delete assigned video_split/,
     );
   } finally {
@@ -283,7 +284,7 @@ test("opening a main DB drops legacy test-v1 tables (eval_rubrics / eval_model_c
         for (const name of legacy) {
           assert.equal(store.hasTable(name), false, `${name} should be dropped (open #${open + 1})`);
         }
-        const leftovers = store.db.prepare(
+        const leftovers = storeConnection(store).prepare(
           "SELECT name FROM sqlite_master WHERE name LIKE '%test_set_version%' OR name LIKE '%eval_rubric%' OR name LIKE '%eval_model_call%'",
         ).all();
         assert.deepEqual(leftovers, []);

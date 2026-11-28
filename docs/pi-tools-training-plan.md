@@ -3,6 +3,10 @@
 创建日期：2026-11-28  
 参考基线：[pi-tool-schemas.md](research/pi-tool-schemas.md) · [production-workflow.md](production-workflow.md) · [0002-isolated-pi-agents-per-role.md](adr/0002-isolated-pi-agents-per-role.md)
 
+> 状态校准（2026-11-28）：本文保留原始工具训练规划。问题范式与隐藏设定、todo / clarify profile、用户模拟器、共享澄清预算、持久工具审计及取消收尾已经实现；当前职责与默认值见[架构说明](architecture.md)。后文的“现有痛点”、目标配比和阶段清单按立项时口径阅读，不能据此判断当前代码缺少这些能力；系统工具回放、开源轨迹重映射等扩展仍按规划管理。
+>
+> Pi 1.7.0 是外部 Schema 研究基线；本项目安装的 Pi SDK 为 1.6.0。检索并非无条件全员挂载：standard 默认关闭，其他 profile 的常规默认及显式 runner / no-skill 例外由当前计划解析器决定。
+
 ---
 
 ## 一、总体规划：系统级工具与内容/认知级工具解耦 + `web_search` 全域底座化
@@ -19,9 +23,9 @@
 
 ## 二、核心改造：出题 Agent 与下游问答流水线解耦
 
-### 2.1 现有架构的耦合痛点
+### 2.1 立项时的耦合痛点（历史背景）
 
-目前 `synth run`（`src/synth/workflows.ts`）把“出题 + 作答 + 质检 + 追问”绑在同一个 `profile`（`short / medium / long / xlong / trap / search`）单通道里：
+立项时 `synth run`（`src/synth/workflows.ts`）把“出题 + 作答 + 质检 + 追问”绑在同一个 `profile`（`short / medium / long / xlong / trap / search`）单通道里：
 1. **搜索被当成一个孤立的“题型档位”**：过去把 `search` 和 `short / long` 并列，导致出题方向容易偏向“为了调搜索而专门考一个外部冷知识/工程查表题”，稀释了三档常规题本身的**思想深度与分析难度**；同时其他复杂档位（`long / xlong / todo`）反而没挂搜索工具。
 2. **`questions` 表缺乏求解范式与隐藏上下文契约**：`questions` 表只存纯字符串 `question` 和 `generation_run_id`，没有显式记录这道题的“求解范式（Task Paradigm）”与“预设隐藏上下文（如模糊题背后的真实用户处境）”。
 

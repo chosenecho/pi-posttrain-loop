@@ -12,6 +12,7 @@ __pycache__/
 
 # Generated outputs & exports
 output/
+.archify/
 
 # Local SQLite databases & corpus checkouts (keep data/materials.example.jsonl tracked)
 data/*.sqlite

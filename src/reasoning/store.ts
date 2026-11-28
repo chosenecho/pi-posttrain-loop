@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { nonEmpty, validateSplit } from "../shared/schema.js";
+import { TaskSession, ensureRunOwnerColumn } from "../shared/task-store.js";
 import { ALL_SYNTH_PROFILES, type DatasetSplit, type DedupPolicy, type ToolStep } from "../shared/types.js";
 import { extractVideoKey, nowIso } from "../shared/utils.js";
 import {
@@ -187,8 +188,9 @@ interface RawResultTurnRow {
 }
 
 export class ReasoningStore {
-  readonly db: DatabaseSync;
+  private readonly db: DatabaseSync;
   readonly readOnly: boolean;
+  private readonly task?: TaskSession;
 
   constructor(databasePath: string, options: { readOnly?: boolean; busyTimeoutMs?: number } = {}) {
     this.readOnly = options.readOnly ?? false;
@@ -198,16 +200,32 @@ export class ReasoningStore {
     this.db = new DatabaseSync(databasePath, { readOnly: this.readOnly });
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 15000};`);
-    if (!this.readOnly) {
-      if (databasePath !== ":memory:") {
-        this.db.exec("PRAGMA journal_mode = WAL;");
+    try {
+      if (!this.readOnly) {
+        this.task = new TaskSession(this.db, "reasoning");
+        if (databasePath !== ":memory:") this.db.exec("PRAGMA journal_mode = WAL;");
+        this.task.mutate(() => {
+          this.db.exec(REASONING_SCHEMA_SQL);
+          ensureRunOwnerColumn(this.db, "reasoning_runs");
+        });
       }
-      this.db.exec(REASONING_SCHEMA_SQL);
+    } catch (error) {
+      try { this.task?.release(); } finally { this.db.close(); }
+      throw error;
     }
   }
 
+  get signal(): AbortSignal | undefined { return this.task?.signal; }
+
+  abort(reason?: unknown): void { this.task?.abort(reason); }
+
   close(): void {
-    this.db.close();
+    try { this.task?.release(); } finally { this.db.close(); }
+  }
+
+  transaction<T>(fn: () => T): T {
+    if (!this.task) throw new Error("只读 Store 不执行写事务");
+    return this.task.mutate(fn);
   }
 
   hasTable(name: string): boolean {
@@ -221,29 +239,42 @@ export class ReasoningStore {
     if (this.readOnly || !this.hasTable("reasoning_runs")) {
       return { runs: 0, traces: 0 };
     }
-    const runs = Number(
-      this.db
-        .prepare(
-          `UPDATE reasoning_runs
-           SET status = 'interrupted',
-               finished_at = COALESCE(finished_at, ?),
-               error = COALESCE(error, '进程中断，启动恢复标记为 interrupted')
-           WHERE status = 'running'`,
-        )
-        .run(finishedAt).changes,
-    );
-    const traces = Number(
-      this.db
-        .prepare(
-          `UPDATE reasoning_traces
-           SET status = 'interrupted',
-               finished_at = COALESCE(finished_at, ?),
-               error = COALESCE(error, '进程中断，启动恢复标记为 interrupted')
-           WHERE status = 'running'`,
-        )
-        .run(finishedAt).changes,
-    );
-    return { runs, traces };
+    return this.transaction(() => {
+      const runs = Number(
+        this.db
+          .prepare(
+            `UPDATE reasoning_runs
+             SET status = 'interrupted',
+                 finished_at = COALESCE(finished_at, ?),
+                 error = COALESCE(error, '进程中断，启动恢复标记为 interrupted')
+             WHERE status = 'running' AND (owner_token IS NULL OR owner_token != ?)`,
+          )
+          .run(finishedAt, this.task?.ownerToken ?? "").changes,
+      );
+      const traces = Number(
+        this.db
+          .prepare(
+            `UPDATE reasoning_traces
+             SET status = 'interrupted',
+                 finished_at = COALESCE(finished_at, ?),
+                 error = COALESCE(error, '进程中断，启动恢复标记为 interrupted')
+             WHERE status = 'running' AND reasoning_run_id IN (SELECT id FROM reasoning_runs WHERE owner_token IS NULL OR owner_token != ?)`,
+          )
+          .run(finishedAt, this.task?.ownerToken ?? "").changes,
+      );
+      return { runs, traces };
+    });
+  }
+
+  /** Finalize only in-flight traces after actual worker cleanup. */
+  interruptOwnedRun(runId: number, error?: string): { traces: number } {
+    return this.transaction(() => {
+      const owned = this.db.prepare("SELECT id FROM reasoning_runs WHERE id = ? AND owner_token = ?").get(runId, this.task!.ownerToken);
+      if (!owned) throw new Error("运行不属于当前写会话 [database_owner_lost]");
+      const result = this.db.prepare(`UPDATE reasoning_traces SET status='interrupted', finished_at=COALESCE(finished_at, ?), error=COALESCE(error, ?)
+        WHERE status='running' AND reasoning_run_id=?`).run(nowIso(), error ?? null, runId);
+      return { traces: Number(result.changes) };
+    });
   }
 
   createReasoningRun(input: {
@@ -254,32 +285,37 @@ export class ReasoningStore {
     skills: unknown[];
     startedAt?: string;
   }): number {
-    const startedAt = input.startedAt ?? nowIso();
-    const res = this.db
-      .prepare(
-        `INSERT INTO reasoning_runs
-           (status, writer_model, judge_model, config_json, prompts_json, skills_json, started_at)
-         VALUES ('running', ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        nonEmpty(input.writerModel, "writerModel"),
-        input.judgeModel ? nonEmpty(input.judgeModel, "judgeModel") : null,
-        JSON.stringify(input.config),
-        JSON.stringify(input.prompts),
-        JSON.stringify(input.skills),
-        startedAt,
-      );
-    return Number(res.lastInsertRowid);
+    return this.transaction(() => {
+      const startedAt = input.startedAt ?? nowIso();
+      const res = this.db
+        .prepare(
+          `INSERT INTO reasoning_runs
+             (status, writer_model, judge_model, config_json, prompts_json, skills_json, started_at, owner_token)
+           VALUES ('running', ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          nonEmpty(input.writerModel, "writerModel"),
+          input.judgeModel ? nonEmpty(input.judgeModel, "judgeModel") : null,
+          JSON.stringify(input.config),
+          JSON.stringify(input.prompts),
+          JSON.stringify(input.skills),
+          startedAt,
+          this.task?.ownerToken ?? null,
+        );
+      return Number(res.lastInsertRowid);
+    });
   }
 
   finishReasoningRun(runId: number, status: Exclude<ReasoningRunStatus, "running">, error?: string | null): void {
-    this.db
-      .prepare(
-        `UPDATE reasoning_runs
-         SET status = ?, finished_at = ?, error = ?
-         WHERE id = ?`,
-      )
-      .run(status, nowIso(), error ?? null, runId);
+    return this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE reasoning_runs
+           SET status = ?, finished_at = ?, error = ?
+           WHERE id = ?`,
+        )
+        .run(status, nowIso(), error ?? null, runId);
+    });
   }
 
   startTrace(input: {
@@ -289,14 +325,16 @@ export class ReasoningStore {
     turnNo: number;
     lengthTier: ThinkTier;
   }): number {
-    const res = this.db
-      .prepare(
-        `INSERT INTO reasoning_traces
-           (reasoning_run_id, attempt_id, result_id, turn_no, length_tier, status, created_at)
-         VALUES (?, ?, ?, ?, ?, 'running', ?)`,
-      )
-      .run(input.reasoningRunId, input.attemptId, input.resultId, input.turnNo, input.lengthTier, nowIso());
-    return Number(res.lastInsertRowid);
+    return this.transaction(() => {
+      const res = this.db
+        .prepare(
+          `INSERT INTO reasoning_traces
+             (reasoning_run_id, attempt_id, result_id, turn_no, length_tier, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+        )
+        .run(input.reasoningRunId, input.attemptId, input.resultId, input.turnNo, input.lengthTier, nowIso());
+      return Number(res.lastInsertRowid);
+    });
   }
 
   completeTrace(
@@ -311,30 +349,32 @@ export class ReasoningStore {
       error?: string | null;
     },
   ): void {
-    this.db
-      .prepare(
-        `UPDATE reasoning_traces
-         SET status = ?,
-             decision = ?,
-             rewrite_count = ?,
-             reasoning = ?,
-             checks_json = ?,
-             raw_output = ?,
-             error = ?,
-             finished_at = ?
-         WHERE id = ?`,
-      )
-      .run(
-        input.status,
-        input.decision,
-        input.rewriteCount,
-        input.reasoning && input.reasoning.trim() ? input.reasoning.trim() : null,
-        input.checks ? JSON.stringify(input.checks) : null,
-        input.rawOutput,
-        input.error ?? null,
-        nowIso(),
-        traceId,
-      );
+    return this.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE reasoning_traces
+           SET status = ?,
+               decision = ?,
+               rewrite_count = ?,
+               reasoning = ?,
+               checks_json = ?,
+               raw_output = ?,
+               error = ?,
+               finished_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          input.status,
+          input.decision,
+          input.rewriteCount,
+          input.reasoning && input.reasoning.trim() ? input.reasoning.trim() : null,
+          input.checks ? JSON.stringify(input.checks) : null,
+          input.rawOutput,
+          input.error ?? null,
+          nowIso(),
+          traceId,
+        );
+    });
   }
 
   getReasoningRun(runId: number): ReasoningRunRecord | undefined {

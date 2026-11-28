@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -72,7 +73,7 @@ test("createUnifiedSaveQuestionsTool writes questions linked to material_id and 
     { video_id: "BV-u/P001", saved_count: 0, skipped_count: 0 },
   ]);
 
-  const rows = store.db.prepare("SELECT material_id, question, generation_run_id FROM questions ORDER BY id").all();
+  const rows = storeConnection(store).prepare("SELECT material_id, question, generation_run_id FROM questions ORDER BY id").all();
   assert.deepEqual(rows.map((r) => [r.material_id, r.question, r.generation_run_id]), [
     [mat.id, "问题一？", runId],
     [mat.id, "问题二？", runId],
@@ -146,7 +147,7 @@ test("runDialogueBatch supports multi-turn pass, early followup stop, Turn 2 exh
 
   // No dangling running records anywhere
   for (const table of ["runs", "run_items", "turns", "attempts", "model_calls"]) {
-    const running = (store.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE status = 'running'`).get() as { c: number }).c;
+    const running = (storeConnection(store).prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE status = 'running'`).get() as { c: number }).c;
     assert.equal(running, 0, `${table} must have zero running rows`);
   }
 
@@ -175,7 +176,7 @@ test("runDialogueBatch supports multi-turn pass, early followup stop, Turn 2 exh
   assert.deepEqual(Object.keys(turn2Answers[1].input), ["material", "history", "question", "previousAnswer", "feedback"]);
 
   // Verify Q4 raw malformed output was preserved in model_calls
-  const failedFollowup = store.db.prepare(
+  const failedFollowup = storeConnection(store).prepare(
     "SELECT status, output_text, error FROM model_calls WHERE role = 'followup' AND status = 'error'",
   ).get() as { status: string; output_text: string; error: string };
   assert.equal(failedFollowup.output_text, "not valid json");
@@ -239,7 +240,7 @@ test("runDialogueBatch executes questions concurrently up to limit, isolates err
     "并发问题 4",
     "并发问题 5",
   ]);
-  const runRow = store.db.prepare("SELECT config_json FROM runs WHERE id = ?").get(summary.runId) as { config_json: string };
+  const runRow = storeConnection(store).prepare("SELECT config_json FROM runs WHERE id = ?").get(summary.runId) as { config_json: string };
   assert.equal((JSON.parse(runRow.config_json) as { concurrency: number }).concurrency, 3);
 
   // Follow-up run with onlyUnjudged=true at maxTurns=1 should pick ONLY failed q3 (plus any new q6), skipping passed q1,q2,q4,q5!
@@ -483,7 +484,7 @@ test("question-cli, judge-cli (--max-turns 2 --export) and export-cli work end-t
   const store = new DataMakerStore(dbPath, { readOnly: true });
   try {
     assert.equal(store.checkIntegrity().ok, true);
-    const runs = store.db.prepare("SELECT kind, status, config_json, skills_json, export_policy_json FROM runs ORDER BY id").all() as Array<{
+    const runs = storeConnection(store).prepare("SELECT kind, status, config_json, skills_json, export_policy_json FROM runs ORDER BY id").all() as Array<{
       kind: string; status: string; config_json: string; skills_json: string; export_policy_json: string;
     }>;
     assert.deepEqual(runs.map((r) => [r.kind, r.status]), [
@@ -537,7 +538,7 @@ test("createUnifiedSaveQuestionsTool enforces maxQuestions hard cap and counts e
   });
 
   assert.deepEqual(receipts, [{ video_id: "BV-cap", saved_count: 3, skipped_count: 2 }]);
-  const saved = store.db.prepare("SELECT question FROM questions WHERE material_id = ? ORDER BY id").all(mat.id) as Array<{ question: string }>;
+  const saved = storeConnection(store).prepare("SELECT question FROM questions WHERE material_id = ? ORDER BY id").all(mat.id) as Array<{ question: string }>;
   assert.deepEqual(saved.map((r) => r.question), ["问题1？", "问题2？", "问题3？"]);
 });
 
@@ -582,7 +583,7 @@ test("runDialogueBatch lets followup Agent decide turn counts naturally and pass
   assert.equal(summary.integrityOk, true);
   assert.equal(summary.results, 3);
 
-  const dbDist = store.db.prepare(
+  const dbDist = storeConnection(store).prepare(
     "SELECT turn_count, COUNT(*) AS c FROM results WHERE run_item_id IN (SELECT id FROM run_items WHERE run_id = ?) GROUP BY turn_count ORDER BY turn_count",
   ).all(summary.runId) as Array<{ turn_count: number; c: number }>;
   assert.deepEqual(dbDist.map((r) => [r.turn_count, Number(r.c)]), [
@@ -592,7 +593,7 @@ test("runDialogueBatch lets followup Agent decide turn counts naturally and pass
   ]);
 
   // Judge model_calls record material reference in input_refs_json without duplicating raw text
-  const judgeCalls = store.db.prepare(
+  const judgeCalls = storeConnection(store).prepare(
     "SELECT input_refs_json FROM model_calls WHERE run_id = ? AND role = 'judge'",
   ).all(summary.runId) as Array<{ input_refs_json: string }>;
   assert.equal(judgeCalls.length, 6);
@@ -672,12 +673,12 @@ test("runDialogueBatch retries transient empty/malformed model errors up to call
   ]);
 
   // The item keeps a public code; the call audit keeps the controlled retry count.
-  const failedItem = store.db.prepare(
+  const failedItem = storeConnection(store).prepare(
     "SELECT status, error FROM run_items WHERE run_id = ? AND question_id = 3",
   ).get(summary.runId) as { status: string; error: string };
   assert.equal(failedItem.status, "error");
   assert.match(failedItem.error, /unexpected_error/);
-  const failedCall = store.db.prepare(
+  const failedCall = storeConnection(store).prepare(
     "SELECT error FROM model_calls WHERE run_id = ? AND status = 'error'",
   ).get(summary.runId) as { error: string };
   assert.match(failedCall.error, /重试 3 次后仍失败/);

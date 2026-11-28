@@ -1,3 +1,5 @@
+import { assertDistinctDatabaseFiles } from "../shared/database-path.js";
+import { combineSignals, throwIfAborted } from "../shared/cancellation.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { writeOutputFile } from "../shared/cli-helpers.js";
@@ -12,12 +14,13 @@ import {
 import { nonEmpty, validateConcurrency } from "../shared/schema.js";
 import type { RoleRunner } from "../shared/types.js";
 import { runProbeCalibration, type RunProbeCalibrationSummary } from "./calibrate.js";
-import { createOpenAiCandidateRunner, readCandidateConfig, type CandidateRunner } from "./candidate-client.js";
+import type { CandidateFactory, CandidateRunner } from "./candidate-client.js";
 import { gradeEvalRun, type GradeEvalRunSummary } from "./eval-grader.js";
 import {
   loadCalibrationPromptBundle,
   loadEvalBuildPromptBundle,
   resolveCandidateSystemPrompt,
+  type EvalSkillSnapshot,
 } from "./eval-prompts.js";
 import { runSuiteEvaluation, type RunSuiteEvaluationSummary } from "./eval-runner.js";
 import { renderInspectMarkdown, stratifiedSampleProbes } from "./inspect.js";
@@ -102,6 +105,8 @@ export interface MakeEvalSuiteOptions {
   maxRevisions?: number;
   maxAnswerAttempts?: number;
   rebuild?: boolean;
+  resumeBuildRunId?: number;
+  allowPartialBuild?: boolean;
   recalibrate?: boolean;
   bareModel?: string;
   graderModel?: string;
@@ -122,6 +127,7 @@ export interface MakeEvalSuiteOptions {
   runBareModel?: RoleRunner;
   runGrader?: RoleRunner;
   modelId?: string;
+  signal?: AbortSignal;
   onProgress?: (message: string) => void;
 }
 
@@ -130,6 +136,8 @@ export interface MakeEvalSuiteResult {
   evalDb: string;
   mainDb: string;
   import: ImportTestSourcesReport;
+  partial: boolean;
+  exitCode: 0 | 1;
   build: RunProbeBuildLoopSummary | { skipped: true; reason: string };
   calibrate: RunProbeCalibrationSummary | { skipped: true; reason: string };
   freeze: FreezeSuiteReport | { skipped: true; reason: string };
@@ -143,6 +151,7 @@ export interface MakeEvalSuiteResult {
 export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Promise<MakeEvalSuiteResult> {
   const evalDbPath = resolve(options.evalDbPath ?? DEFAULT_EVAL_DB);
   const mainDbPath = resolve(options.mainDbPath ?? DEFAULT_MAIN_DB);
+  assertDistinctDatabaseFiles(mainDbPath, evalDbPath);
   if (!options.noFreeze && !options.suiteName?.trim()) {
     throw new Error("请指定 --suite <套卷名>（或传入 --no-freeze 只造题标定不冻结）");
   }
@@ -163,6 +172,9 @@ export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Prom
 
   const evalStore = new EvalStore(evalDbPath);
   try {
+    const signal = combineSignals(evalStore.signal, options.signal);
+    throwIfAborted(signal);
+    if (options.rebuild && options.resumeBuildRunId !== undefined) throw new Error("build_config_conflict: --rebuild 与 --resume-build 互斥");
     evalStore.setMeta("main_db_path", mainDbPath);
 
     // 1. Import test split (read-only from main DB, idempotent)
@@ -181,48 +193,59 @@ export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Prom
       `[eval make 1/4] 导入完成：新增视频 ${importReport.importedVideos}，新增分块 ${importReport.importedChunks}，跳过已有 ${importReport.skippedExistingChunks}`,
     );
 
-    // 2. Build probes for unbuilt sources (or all matching sources if --rebuild)
-    const targetSources = options.rebuild
-      ? evalStore.listSourceMaterials({ videoKeys: options.videoKeys, limit: options.limit })
-      : evalStore.listUnbuiltSourceMaterials({ videoKeys: options.videoKeys, limit: options.limit });
-
-    let buildResult: RunProbeBuildLoopSummary | { skipped: true; reason: string };
-    if (targetSources.length === 0) {
-      buildResult = { skipped: true, reason: "全部目标材料均已出题（如需重出请传 --rebuild）" };
-      options.onProgress?.("[eval make 2/4] 跳过出题：目标材料均已处理");
-    } else {
-      verifySourceSplits(mainDbPath, targetSources);
-      const bundle = await loadEvalBuildPromptBundle({
-        promptsDir: options.promptsDir,
-        skillsDir: options.skillsDir,
-        answerStylePath: options.answerStylePath,
-      });
-      const evalPi = options.runRole ? undefined : readEvalPiConfig();
-      const modelId = options.modelId ?? evalPi!.modelId;
-      const runRole = options.runRole ?? createPiRunner(evalPi!);
-
-      options.onProgress?.(`[eval make 2/4] 开始出题（${targetSources.length} 份材料，模型=${modelId}）...`);
-      buildResult = await runProbeBuildLoop({
-        evalStore,
-        sources: targetSources,
-        prompts: bundle.prompts,
-        skills: bundle.skills,
-        modelId,
-        runRole,
-        allowedTypes: options.probeTypes,
-        maxProbesPerVideo: options.maxProbesPerVideo ?? DEFAULT_MAX_PROBES_PER_VIDEO,
-        maxRevisions: options.maxRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS,
-        maxAnswerAttempts: options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS,
-        concurrency,
-        callMaxAttempts,
-        callRetryDelayMs,
-        onProgress: options.onProgress,
-      });
+    // Link every plan in the requested source scope, including zero-HTTP terminal reuse.
+    const selectedSourceIds = new Set(importReport.selectedSourceMaterialIds);
+    let targetSources = evalStore.listSourceMaterials().filter((source) => selectedSourceIds.has(source.id));
+    const resumePlans = options.resumeBuildRunId === undefined ? [] : evalStore.listBuildPlans({ originRunId: options.resumeBuildRunId });
+    if (options.resumeBuildRunId !== undefined) {
+      if (!resumePlans.length) throw new Error(`build_snapshot_missing: origin run #${options.resumeBuildRunId}`);
+      const sourceIds = new Set(resumePlans.map((plan) => plan.sourceMaterialId));
+      targetSources = targetSources.filter((source) => sourceIds.has(source.id));
     }
+    verifySourceSplits(mainDbPath, targetSources);
+    const storedSpecs = resumePlans.filter((plan) => targetSources.some((source) => source.id === plan.sourceMaterialId)).map((plan) => {
+      if (!plan.spec) throw new Error("build_snapshot_missing: 旧计划缺少生成规格，请使用 --rebuild 创建新 generation");
+      return plan.spec;
+    });
+    const storedModels = new Set(storedSpecs.map((spec) => spec.modelId));
+    if (storedModels.size > 1) throw new Error("build_config_conflict: 旧计划包含多个模型，请分别续跑");
+    const storedSpec = storedSpecs[0];
+    const bundle = storedSpec ? { prompts: storedSpec.prompts, skills: (evalStore.getRun(options.resumeBuildRunId!)?.skills ?? []) as EvalSkillSnapshot[] } : await loadEvalBuildPromptBundle({
+      promptsDir: options.promptsDir, skillsDir: options.skillsDir, answerStylePath: options.answerStylePath,
+    });
+    const needsBuildCalls = options.rebuild || targetSources.some((source) => {
+      const plan = options.resumeBuildRunId === undefined
+        ? evalStore.listBuildPlans({ sourceMaterialId: source.id, latestOnly: true }).at(-1)
+        : resumePlans.filter((candidate) => candidate.sourceMaterialId === source.id).at(-1);
+      return !plan || (!["done", "skipped"].includes(plan.status) && !(plan.spec === null && plan.errorCode === "legacy_plan_incomplete"));
+    });
+    const requestedBuildModel = storedSpec?.modelId ?? options.modelId;
+    const evalPi = options.runRole || !needsBuildCalls ? undefined : readEvalPiConfig({ ...process.env, ...(requestedBuildModel ? { EVAL_LLM_MODEL: requestedBuildModel } : {}) });
+    const modelId = storedSpec?.modelId ?? options.modelId ?? evalPi?.modelId ?? (needsBuildCalls ? "injected-build-model" : "no-model-calls");
+    const runRole = options.runRole ?? (evalPi ? createPiRunner(evalPi) : async () => { throw new Error("build_snapshot_missing: 没有可执行的生成规格"); });
+    options.onProgress?.(`[eval make 2/4] 处理造题计划（${targetSources.length} 份材料，模型=${modelId}）...`);
+    const buildResult = await runProbeBuildLoop({
+      evalStore, sources: targetSources, prompts: bundle.prompts, skills: bundle.skills,
+      modelId, runRole, allowedTypes: options.probeTypes,
+      maxProbesPerVideo: options.maxProbesPerVideo ?? DEFAULT_MAX_PROBES_PER_VIDEO,
+      maxRevisions: options.maxRevisions ?? DEFAULT_MAX_CRITIC_REVISIONS,
+      maxAnswerAttempts: options.maxAnswerAttempts ?? DEFAULT_MAX_ANSWER_ATTEMPTS,
+      rebuild: options.rebuild, resumeBuildRunId: options.resumeBuildRunId,
+      concurrency, callMaxAttempts, callRetryDelayMs, signal, onProgress: options.onProgress,
+    });
+    const partial = buildResult.partial || !buildResult.plansComplete;
+    if (partial && !options.allowPartialBuild) {
+      const reason = `build_partial: 出题计划未完成（pending=${buildResult.pendingSlots}, errors=${buildResult.errorSlots}, legacy=${buildResult.incompleteLegacyPlans.join(",")}）；请续跑或显式使用 --allow-partial-build`;
+      options.onProgress?.(reason);
+      return { action: "make", evalDb: evalDbPath, mainDb: mainDbPath, import: importReport, build: buildResult, partial: true, exitCode: 1,
+        calibrate: { skipped: true, reason }, freeze: { skipped: true, reason } };
+    }
+    throwIfAborted(signal);
 
     // 3. Calibrate uncalibrated accepted probes (or all accepted if --recalibrate)
     const probesToCalibrate = evalStore.listProbes({
       status: "accepted",
+      executionRunId: buildResult.runId,
       probeTypes: options.probeTypes,
       ...(options.recalibrate ? {} : { difficulty: "uncalibrated" }),
     });
@@ -264,10 +287,12 @@ export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Prom
         concurrency,
         callMaxAttempts,
         callRetryDelayMs,
+        signal,
         onProgress: options.onProgress,
       });
     }
 
+    throwIfAborted(signal);
     // 4. Freeze suite (unless --no-freeze)
     let freezeResult: FreezeSuiteReport | { skipped: true; reason: string };
     if (options.noFreeze) {
@@ -278,6 +303,9 @@ export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Prom
       freezeResult = await freezeEvalSuite({
         evalStore,
         name: options.suiteName!,
+        executionRunId: buildResult.runId,
+        allowPartialBuild: options.allowPartialBuild,
+        signal,
         probeTypes: options.probeTypes,
         maxEasyRatio: options.maxEasyRatio ?? DEFAULT_MAX_EASY_RATIO,
         allowUncalibrated: options.allowUncalibrated,
@@ -294,6 +322,8 @@ export async function makeEvalSuiteWorkflow(options: MakeEvalSuiteOptions): Prom
       evalDb: evalDbPath,
       mainDb: mainDbPath,
       import: importReport,
+      partial,
+      exitCode: 0,
       build: buildResult,
       calibrate: calibrateResult,
       freeze: freezeResult,
@@ -329,7 +359,13 @@ export interface EvaluateCandidateWorkflowOptions {
   jsonOutPath?: string;
   promptsDir?: string;
   skillsDir?: string;
+  candidateFactory?: CandidateFactory;
   runCandidate?: CandidateRunner;
+  candidateSpecHash?: string;
+  stripThinkTags?: boolean;
+  parentRunId?: number;
+  environment?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
   runGrader?: RoleRunner;
   onProgress?: (message: string) => void;
 }
@@ -350,7 +386,6 @@ export async function evaluateEvalCandidateWorkflow(
   requireEvalDbExists(evalDbPath);
   const suiteName = nonEmpty(options.suiteName, "--suite");
   const candidate = nonEmpty(options.candidate, "--candidate");
-  const historyMode = options.historyMode ?? "gold";
 
   const resolvedSys = await resolveCandidateSystemPrompt({
     systemPrompt: options.systemPrompt,
@@ -359,19 +394,6 @@ export async function evaluateEvalCandidateWorkflow(
     isResuming: options.resumeRunId !== undefined,
   });
 
-  const candCfg = options.runCandidate
-    ? undefined
-    : readCandidateConfig({
-        baseUrl: options.baseUrl,
-        modelId: options.modelId,
-        apiKey: options.apiKey,
-        temperature: options.temperature,
-        maxTokens: options.maxTokens,
-        timeoutMs: options.timeoutMs,
-      });
-  const modelId = options.modelId ?? candCfg!.modelId;
-  const runCandidate = options.runCandidate ?? createOpenAiCandidateRunner(candCfg!);
-
   const calBundle = await loadCalibrationPromptBundle({
     promptsDir: options.promptsDir,
     skillsDir: options.skillsDir,
@@ -379,22 +401,33 @@ export async function evaluateEvalCandidateWorkflow(
   const graderPi = options.runGrader
     ? undefined
     : readEvalPiConfig({ ...process.env, ...(options.graderModel ? { EVAL_LLM_MODEL: options.graderModel } : {}) });
-  const graderModelId = options.graderModel ?? graderPi!.modelId;
+  const graderModelId = options.graderModel ?? graderPi?.modelId ?? "injected-grader-model";
   const runGrader = options.runGrader ?? createPiRunner(graderPi!);
 
   const evalStore = new EvalStore(evalDbPath);
   try {
-    options.onProgress?.(`[eval evaluate 1/2] 候选模型 "${candidate}" (${modelId}) 盲测套卷 "${suiteName}"...`);
+    const signal = combineSignals(evalStore.signal, options.signal);
+    throwIfAborted(signal);
+    options.onProgress?.(`[eval evaluate 1/2] 候选模型 "${candidate}" 盲测套卷 "${suiteName}"...`);
     const runSummary = await runSuiteEvaluation({
       evalStore,
       suiteName,
       candidate,
-      modelId,
-      historyMode,
+      modelId: options.modelId,
+      baseUrl: options.baseUrl,
+      apiKey: options.apiKey,
+      timeoutMs: options.timeoutMs,
+      historyMode: options.historyMode,
       systemPrompt: resolvedSys.systemPrompt,
       temperature: options.temperature,
       maxTokens: options.maxTokens,
-      runCandidate,
+      candidateFactory: options.candidateFactory,
+      runCandidate: options.runCandidate,
+      candidateSpecHash: options.candidateSpecHash,
+      stripThinkTags: options.stripThinkTags,
+      parentRunId: options.parentRunId,
+      environment: options.environment,
+      signal,
       resumeRunId: options.resumeRunId,
       limit: options.limit,
       concurrency: options.concurrency,
@@ -407,6 +440,7 @@ export async function evaluateEvalCandidateWorkflow(
     const gradeSummary = await gradeEvalRun({
       evalStore,
       evalRunId: runSummary.evalRunId,
+      signal,
       graderPrompt: calBundle.prompts.evalGrader,
       runGrader,
       graderModelId,
@@ -493,6 +527,7 @@ export async function buildEvalReportWorkflow(options: {
 export async function inspectEvalProbesWorkflow(options: {
   evalDbPath?: string;
   runSpec?: string;
+  executionRunSpec?: string;
   status?: string;
   probeType?: ProbeType;
   sampleSize?: number;
@@ -503,7 +538,11 @@ export async function inspectEvalProbesWorkflow(options: {
   requireEvalDbExists(evalDbPath);
   const evalStore = new EvalStore(evalDbPath, { readOnly: true });
   try {
+    if (options.runSpec !== undefined && options.executionRunSpec !== undefined) throw new Error("--run 与 --execution-run 只能指定一个");
     const runId = resolveProbeRunFilter(evalStore, options.runSpec);
+    if (options.executionRunSpec === "all") throw new Error("--execution-run 必须是正整数或 latest");
+    const executionRunId = resolveProbeRunFilter(evalStore, options.executionRunSpec);
+    if (options.executionRunSpec === "latest" && executionRunId === undefined) throw new Error("尚无造题执行记录");
     const validStatuses: ProbeStatus[] = ["draft", "accepted", "rejected", "dropped"];
     const status =
       options.status && options.status !== "all"
@@ -516,6 +555,7 @@ export async function inspectEvalProbesWorkflow(options: {
 
     const matched = evalStore.listProbes({
       runId,
+      executionRunId,
       status,
       probeType: options.probeType,
     });
@@ -523,7 +563,7 @@ export async function inspectEvalProbesWorkflow(options: {
       options.sampleSize !== undefined
         ? stratifiedSampleProbes(matched, options.sampleSize, options.seed ?? 42)
         : matched;
-    const markdown = renderInspectMarkdown(evalStore, runId, picked, matched.length);
+    const markdown = renderInspectMarkdown(evalStore, runId, picked, matched.length, executionRunId);
     const outPath = options.outPath ? await writeOutputFile(options.outPath, markdown + "\n") : undefined;
 
     return {
@@ -531,6 +571,7 @@ export async function inspectEvalProbesWorkflow(options: {
       summary: {
         evalDb: evalDbPath,
         runId: runId ?? "all",
+        executionRunId: executionRunId ?? null,
         matched: matched.length,
         displayed: picked.length,
         ...(outPath ? { outPath } : {}),

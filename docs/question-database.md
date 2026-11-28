@@ -1,6 +1,8 @@
 # 问题数据库说明（历史单表归档）
 
-> **状态说明**：本文件记录早期单表原型 `data/questions.sqlite` 的结构与首次试跑历史，该库保留为只读来源备份。当前所有出题、多 P 合并、视频级防重复选稿、三分区隔离、单/多轮回答质检、盲测评分要点抽取及 JSONL 导出均已迁移收敛至统一 SQLite 数据库 `data/data-maker.sqlite`，最新说明见 [README.md](<../README.md>) 与 [SQLite 统一存储设计](<sqlite-design.md>)。
+> **状态说明**：本文件记录早期单表原型 `data/questions.sqlite` 的结构与首次试跑历史，该库保留为只读来源备份。当前出题、多 P 合并、分区与问答质检使用主库 `data/data-maker.sqlite`；盲测题、评分卡、冻结套卷与评测结果使用独立评测库 `data/eval.sqlite`（Schema v4），最新说明见 [README.md](<../README.md>) 与 [SQLite 统一存储设计](<sqlite-design.md>)。
+
+下文的单表结构、旧命令与试跑回执按原型时口径归档。当前单文件出题使用 `npm run dm -- synth questions --input PATH`，模块与存储边界见[当前架构](architecture.md)。
 
 ## 1. 用途与位置
 
@@ -59,7 +61,7 @@ video_id：BV1Dt4y1Y7S2/P001
 
 ### 4.1 读取文稿并调用模型
 
-[单篇运行入口](<../src/question-cli.ts>) 接收一个文稿路径，读取整篇文本，并加载[问题生成系统提示词](<../prompts/question-generator.md>)。发送给 Agent 的用户输入为：
+历史单篇运行入口 `src/question-cli.ts`（已退役） 接收一个文稿路径，读取整篇文本，并加载[问题生成系统提示词](<../prompts/question-generator.md>)。发送给 Agent 的用户输入为：
 
 ```json
 {
@@ -91,7 +93,7 @@ Agent 从有价值的观点、解释、建议或个人经历出发，反推自�
 }
 ```
 
-工具名称为 `save_questions`，实现见[问题保存工具](<../src/question-store.ts>)。每次运行时，宿主将工具绑定到当前文稿标识和已打开的数据库。
+工具名称为 `save_questions`，实现见历史问题保存工具 `src/question-store.ts`；当前同类 helper 位于[合成模块](../src/synth/question-store.ts)。每次运行时，宿主将工具绑定到当前文稿标识和已打开的数据库。
 
 保存工具执行以下操作：
 
@@ -118,11 +120,11 @@ Agent 从有价值的观点、解释、建议或个人经历出发，反推自�
 
 `saved_count` 表示这次工具调用实际新增的条数，`skipped_count` 表示因完全重复而跳过的条数。
 
-当前[模型适配器](<../src/pi-runner.ts>) 在一次模型请求产生工具调用后执行工具并结束，由宿主直接展示回执，不再额外调用模型生成确认语。运行入口随后查询并打印该文稿在库中的全部问题，因此打印的总数可能大于本次新增数。
+当时的模型适配器 `src/pi-runner.ts`（当前通用适配器见[shared 模块](../src/shared/pi-runner.ts)） 在一次模型请求产生工具调用后执行工具并结束，由宿主直接展示回执，不再额外调用模型生成确认语。运行入口随后查询并打印该文稿在库中的全部问题，因此打印的总数可能大于本次新增数。
 
 如果模型只返回正文或待保存 JSON、没有成功调用工具，运行入口会报告尚未入库，不会把正文自动解析后写入。当前未配置自动重试。空数组成功保存时回执为新增 0 条，数据库不会额外记录“该文稿已处理”的状态。
 
-## 5. 如何运行
+## 5. 历史运行方式（归档）
 
 在项目根目录执行。需要项目依赖已安装，Node.js 满足 [package.json](<../package.json>) 声明的 `>=22.19.0`，并支持内置 `node:sqlite`。
 

@@ -1,5 +1,7 @@
 import { resolve } from "node:path";
+import { combineSignals, isOperationAborted, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { writeOutputFile } from "../shared/cli-helpers.js";
+import { publicErrorMessage } from "../shared/public-error.js";
 import { DEFAULT_DEMO_DB, EXAMPLE_MATERIALS_PATH } from "../shared/paths.js";
 import { nonEmpty, parseQuestions, validateMaxAttempts } from "../shared/schema.js";
 import type { RoleRunner } from "../shared/types.js";
@@ -26,7 +28,8 @@ export const DEMO_DIRECTION = "根据传感器说明生成使用与告警规则�
 
 /** Deterministic plumbing fixture, not a language model or a quality evaluator. */
 export function createDemoRunner(): RoleRunner {
-  return async ({ role, input }) => {
+  return async ({ role, input, signal }) => {
+    throwIfAborted(signal);
     if (role === "question") {
       return JSON.stringify({ questions: [
         "雨量传感器在什么情况下触发和解除告警？",
@@ -55,6 +58,7 @@ export function createDemoRunner(): RoleRunner {
 }
 
 export interface RunDemoOptions {
+  signal?: AbortSignal;
   dbPath?: string;
   maxAttempts?: number;
   exportPath?: string;
@@ -84,6 +88,7 @@ export interface RunDemoReport {
  * Demonstrates revise -> pass, direct pass, and drop branches with zero API keys.
  */
 export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoReport> {
+  throwIfAborted(options.signal);
   const dbPath = resolve(options.dbPath ?? DEFAULT_DEMO_DB);
   const maxAttempts = validateMaxAttempts(options.maxAttempts ?? 3);
 
@@ -100,8 +105,12 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
   const jSystemPrompt = judgePrompt(prompts.judge, rubric.body);
   const runRole = createDemoRunner();
 
+  throwIfAborted(options.signal);
   const store = new DataMakerStore(dbPath);
+  const signal = combineSignals(options.signal, store.signal);
+  let activeQuestionRunId: number | undefined;
   try {
+    throwIfAborted(signal);
     store.markInterruptedRuns();
 
     const questionRunId = store.createRun({
@@ -124,8 +133,10 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
       exportPolicy: { format: "messages_jsonl", training_enabled: false },
     });
 
+    activeQuestionRunId = questionRunId;
     const generatedQuestionIds: number[] = [];
     for (const raw of materials) {
+      throwIfAborted(signal);
       const materialRecord = store.upsertMaterial({ videoId: raw.id, content: raw.text });
       const callId = store.startModelCall({
         runId: questionRunId,
@@ -137,7 +148,9 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
         role: "question",
         systemPrompt: qSystemPrompt,
         input: { material: raw, direction: DEMO_DIRECTION },
+        signal,
       });
+      throwIfAborted(signal);
       const questions = parseQuestions(output);
       store.transaction(() => {
         store.finishModelCall(callId, output);
@@ -151,10 +164,13 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
         }
       });
     }
+    throwIfAborted(signal);
     store.finishRun(questionRunId, "completed");
+    activeQuestionRunId = undefined;
 
     const dialogue = await runDialogueBatch({
       store,
+      signal,
       runRole,
       prompts: { answer: aSystemPrompt, judge: jSystemPrompt },
       maxAttempts,
@@ -174,10 +190,12 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
       onProgress: options.onProgress,
     });
 
+    throwIfAborted(signal);
     let exportedPath: string | undefined;
     if (options.exportPath !== undefined) {
       const jsonl = store.exportRunJsonl(dialogue.runId, { systemPrompt: options.exportSystemPrompt });
       exportedPath = await writeOutputFile(nonEmpty(options.exportPath, "--export"), jsonl);
+      throwIfAborted(signal);
     }
 
     const passed = dialogue.outcomes.pass ?? 0;
@@ -200,6 +218,14 @@ export async function runDemo(options: RunDemoOptions = {}): Promise<RunDemoRepo
       integrityOk: dialogue.integrityOk,
       ...(exportedPath ? { exportedPath } : {}),
     };
+  } catch (error) {
+    if (activeQuestionRunId !== undefined) {
+      const message = publicErrorMessage(error);
+      store.interruptOwnedRun(activeQuestionRunId, message);
+      store.finishRun(activeQuestionRunId, isOperationAborted(error) || signal?.aborted ? "interrupted" : "error", { error: message });
+    }
+    rethrowIfAborted(error, signal);
+    throw error;
   } finally {
     store.close();
   }

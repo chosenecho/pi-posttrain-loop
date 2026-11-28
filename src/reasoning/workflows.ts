@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { combineSignals, throwIfAborted } from "../shared/cancellation.js";
 import { writeOutputFile } from "../shared/cli-helpers.js";
 import { DEFAULT_MAIN_DB } from "../shared/paths.js";
 import {
@@ -230,6 +231,7 @@ export async function runReasoningExportWorkflow(
 }
 
 export interface ReasoningBackfillWorkflowOptions extends ReasoningQueryFilterOptions {
+  signal?: AbortSignal;
   dbPath?: string;
   onlyMissing?: boolean;
   limit?: number;
@@ -265,6 +267,7 @@ export interface ReasoningBackfillWorkflowOptions extends ReasoningQueryFilterOp
 export async function runReasoningBackfillWorkflow(
   options: ReasoningBackfillWorkflowOptions = {},
 ): Promise<Record<string, unknown>> {
+  throwIfAborted(options.signal);
   if ((options.valOutPath !== undefined) !== (options.valRatio !== undefined)) {
     throw new Error("--val-out 与 --val-ratio 必须成对指定");
   }
@@ -301,8 +304,11 @@ export async function runReasoningBackfillWorkflow(
   });
   const runners = createReasoningRunners(piConfigs);
 
+  throwIfAborted(options.signal);
   const store = new ReasoningStore(dbPath);
+  const taskSignal = combineSignals(options.signal, store.signal);
   try {
+    throwIfAborted(taskSignal);
     const recovered = store.recoverInterruptedRuns();
     const allCandidates = store.queryCandidateTurns({
       ...queryOptions,
@@ -326,6 +332,7 @@ export async function runReasoningBackfillWorkflow(
 
     const backfill = await runReasoningBackfill({
       store,
+      signal: taskSignal,
       candidates: selectedCandidates,
       writerPrompt: prompts.writer,
       writerSkill,
@@ -362,6 +369,7 @@ export async function runReasoningBackfillWorkflow(
       },
     });
 
+    throwIfAborted(taskSignal);
     const summary: Record<string, unknown> = {
       db: dbPath,
       recovered,
@@ -374,6 +382,7 @@ export async function runReasoningBackfillWorkflow(
 
     if (options.reviewMdPath !== undefined) {
       const reviewInfo = await writeReasoningReviewFile(store, options.reviewMdPath, backfill.reasoningRunId);
+      throwIfAborted(taskSignal);
       summary.reviewMd = reviewInfo.reviewMd;
     }
 

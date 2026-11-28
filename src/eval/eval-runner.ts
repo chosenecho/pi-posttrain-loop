@@ -1,14 +1,10 @@
 import { runConcurrentPool } from "../shared/concurrency.js";
+import { combineSignals, createAttemptCancellation, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
-import {
-  DEFAULT_CALL_MAX_ATTEMPTS,
-  DEFAULT_CALL_RETRY_DELAY_MS,
-  runWithRetry,
-  validateCallMaxAttempts,
-  validateCallRetryDelayMs,
-} from "../shared/retry.js";
-import { nonEmpty, validateConcurrency } from "../shared/schema.js";
-import type { CandidateRunner, ChatMessage } from "./candidate-client.js";
+import { runWithRetry } from "../shared/retry.js";
+import { nonEmpty } from "../shared/schema.js";
+import { bindCandidate, createOpenAiCandidate, readCandidateOperationalConfig, type CandidateFactory, type CandidateRunner, type ChatMessage } from "./candidate-client.js";
+import { EvaluationSpecError, resolveEvaluationSpec } from "./evaluation-spec.js";
 import { EvalStore, type EvalHistoryMode, type SuiteItemRecord } from "./store/index.js";
 
 export interface SuiteDialogueTurn {
@@ -44,13 +40,25 @@ export interface RunSuiteEvaluationOptions {
   evalStore: EvalStore;
   suiteName: string;
   candidate: string;
-  modelId: string;
+  modelId?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  timeoutMs?: number;
+  stripThinkTags?: boolean;
+  adapterContractVersion?: string;
+  environment?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
   historyMode?: EvalHistoryMode;
   systemPrompt?: string | null;
   temperature?: number;
   maxTokens?: number;
-  runCandidate: CandidateRunner;
+  candidateFactory?: CandidateFactory;
+  /** Raw runner compatibility requires an explicit resolved-spec identity assertion. */
+  runCandidate?: CandidateRunner;
+  candidateSpecHash?: string;
   resumeRunId?: number;
+  parentRunId?: number;
+  itemIds?: readonly number[];
   limit?: number;
   concurrency?: number;
   callMaxAttempts?: number;
@@ -65,6 +73,8 @@ export interface RunSuiteEvaluationSummary {
   candidate: string;
   modelId: string;
   historyMode: EvalHistoryMode;
+  specHash: string;
+  endpoint: string;
   totalItems: number;
   totalTurns: number;
   completedTurns: number;
@@ -81,100 +91,53 @@ export interface RunSuiteEvaluationSummary {
 export async function runSuiteEvaluation(
   options: RunSuiteEvaluationOptions,
 ): Promise<RunSuiteEvaluationSummary> {
-  const { evalStore, runCandidate } = options;
-  const concurrency = validateConcurrency(options.concurrency ?? 4);
-  const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
-  const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
-
-  evalStore.markInterruptedRuns();
-
-  let evalRunId: number;
-  let resumed = false;
+  const { evalStore } = options;
+  const taskSignal = combineSignals(options.signal, evalStore.signal);
+  throwIfAborted(taskSignal);
   const suiteName = nonEmpty(options.suiteName, "--suite");
-  const candidate = nonEmpty(options.candidate, "--candidate");
-  let modelId = nonEmpty(options.modelId, "--model");
-  let historyMode: EvalHistoryMode = options.historyMode ?? "gold";
-  let effectiveSystemPrompt: string | undefined;
-
   const suite = evalStore.getSuite(suiteName);
-  if (!suite) {
-    throw new Error(`评测库中未找到冻结套卷：${suiteName}`);
+  if (!suite) throw new Error(`评测库中未找到冻结套卷：${suiteName}`);
+  if (options.parentRunId !== undefined) {
+    if (options.resumeRunId !== undefined) throw new Error("parentRunId 与 resumeRunId 只能指定一项 [resume_config_conflict]");
+    const parent = evalStore.getEvalRun(options.parentRunId);
+    if (!parent) throw new Error("关联的父评测运行不存在 [parent_run_missing]");
+    if (parent.suiteId !== suite.id) throw new Error("关联的父评测运行属于其他套卷 [parent_run_suite_conflict]");
   }
+  const existingRun = options.resumeRunId === undefined ? undefined : evalStore.getEvalRun(options.resumeRunId);
+  if (options.resumeRunId !== undefined && !existingRun) throw new Error(`未找到可续跑的 eval_run #${options.resumeRunId}`);
+  const allItems = evalStore.listSuiteItems(suite.id);
+  const spec = resolveEvaluationSpec({ suite, items: allItems, requested: options, existingRun, environment: options.environment });
+  const runtime = readCandidateOperationalConfig(spec, options, options.environment ?? process.env);
+  if (options.runCandidate && options.candidateFactory) throw new Error("candidateFactory 与 runCandidate 只能指定一项");
+  if (options.runCandidate && options.candidateSpecHash !== spec.hash) {
+    throw new EvaluationSpecError("candidate_identity_mismatch", "裸 runner 必须显式绑定同一规格 hash，或使用 candidateFactory + bindCandidate");
+  }
+  const adapter = options.runCandidate
+    ? bindCandidate(spec, options.runCandidate)
+    : (options.candidateFactory ?? createOpenAiCandidate)(spec, runtime);
+  if (adapter.specHash !== spec.hash) throw new EvaluationSpecError("candidate_identity_mismatch", "候选 adapter 的规格身份不匹配");
+  const { concurrency, callMaxAttempts, callRetryDelayMs } = runtime;
+  const { candidate, modelId, historyMode, systemPrompt: effectiveSystemPrompt } = spec;
+  const itemsById = new Map(allItems.map((item) => [item.id, item]));
+  const items = spec.itemIds.map((id) => itemsById.get(id)!);
+  for (const item of items) extractSuiteDialogueTurns(item);
 
-  if (options.resumeRunId !== undefined) {
-    const existingRun = evalStore.getEvalRun(options.resumeRunId);
-    if (!existingRun) {
-      throw new Error(`未找到可续跑的 eval_run #${options.resumeRunId}`);
-    }
-    if (existingRun.suiteId !== suite.id) {
-      throw new Error(`eval_run #${existingRun.id} 属于套卷 ${existingRun.suiteName}，与 --suite ${suiteName} 不一致`);
-    }
-    if (existingRun.candidate !== candidate) {
-      throw new Error(`eval_run #${existingRun.id} 候选名为 ${existingRun.candidate}，与 --candidate ${candidate} 不一致`);
-    }
-    if (options.historyMode !== undefined && existingRun.historyMode !== options.historyMode) {
-      throw new Error(`eval_run #${existingRun.id} 历史模式为 ${existingRun.historyMode}，与 --history-mode ${options.historyMode} 不一致`);
-    }
-    const storedSystemPrompt = existingRun.systemPrompt?.trim() || undefined;
-    if (options.systemPrompt === undefined) {
-      effectiveSystemPrompt = storedSystemPrompt;
-    } else if (options.systemPrompt === null) {
-      if (storedSystemPrompt !== undefined) {
-        throw new Error(`eval_run #${existingRun.id} 原配置包含系统提示词，与 --no-system-prompt 不一致`);
-      }
-      effectiveSystemPrompt = undefined;
-    } else {
-      const requestedPrompt = nonEmpty(options.systemPrompt, "systemPrompt");
-      if (requestedPrompt !== storedSystemPrompt) {
-        throw new Error(`eval_run #${existingRun.id} 原系统提示词与本次指定的不一致`);
-      }
-      effectiveSystemPrompt = requestedPrompt;
-    }
+  // Validation and adapter identity checks must precede recovery or any run mutation.
+  throwIfAborted(taskSignal);
+  evalStore.ensureRecovered();
+  const resumed = existingRun !== undefined;
+  let evalRunId: number;
+  if (existingRun) {
     evalRunId = existingRun.id;
-    historyMode = existingRun.historyMode;
-    modelId = existingRun.model;
-    resumed = true;
     evalStore.reopenEvalRun(evalRunId);
   } else {
-    effectiveSystemPrompt =
-      options.systemPrompt !== undefined && options.systemPrompt !== null
-        ? nonEmpty(options.systemPrompt, "systemPrompt")
-        : undefined;
     evalRunId = evalStore.createEvalRun({
-      suiteId: suite.id,
-      candidate,
-      model: modelId,
-      historyMode,
-      systemPrompt: effectiveSystemPrompt ?? null,
-      config: {
-        suiteName: suite.name,
-        suiteSha256: suite.sha256,
-        candidate,
-        modelId,
-        historyMode,
-        hasSystemPrompt: Boolean(effectiveSystemPrompt),
-        ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
-        ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
-        ...(options.limit !== undefined ? { limit: options.limit } : {}),
-        concurrency,
-        callMaxAttempts,
-        callRetryDelayMs,
-      },
+      suiteId: spec.suiteId, candidate, model: modelId, historyMode, systemPrompt: effectiveSystemPrompt,
+      config: { evaluationSpec: spec, ...(options.parentRunId === undefined ? {} : { parentRunId: options.parentRunId }), operationalExecutions: [] },
     });
   }
-
+  evalStore.recordEvaluationExecution(evalRunId, { timeoutMs: runtime.timeoutMs, concurrency, callMaxAttempts, callRetryDelayMs });
   const runRef = `eval_run:${evalRunId}`;
-  let items = evalStore.listSuiteItems(suite.id);
-  if (options.limit !== undefined) {
-    if (!Number.isSafeInteger(options.limit) || options.limit < 1) {
-      throw new Error("--limit 必须是正整数");
-    }
-    items = items.slice(0, options.limit);
-  }
-  if (items.length === 0) {
-    evalStore.finishEvalRun(evalRunId, "failed", "套卷没有任何条目");
-    throw new Error(`套卷 ${suite.name} 没有任何条目`);
-  }
 
   const existingOkByKey = new Map<string, string>();
   if (resumed) {
@@ -191,7 +154,8 @@ export async function runSuiteEvaluation(
   let errorTurns = 0;
 
   try {
-    await runConcurrentPool(items, concurrency, async (item, itemIdx) => {
+    await runConcurrentPool(items, concurrency, async (item, itemIdx, workerSignal) => {
+      throwIfAborted(workerSignal);
       const turns = extractSuiteDialogueTurns(item);
       totalTurns += turns.length;
       const tag = `[${itemIdx + 1}/${items.length} ${item.itemKey}:${item.probeType}]`;
@@ -200,6 +164,7 @@ export async function runSuiteEvaluation(
       let selfModeBroken = false;
 
       for (const turn of turns) {
+        throwIfAborted(workerSignal);
         const predKey = `${item.id}:${turn.turnNo}`;
         const existingAnswer = existingOkByKey.get(predKey);
 
@@ -209,6 +174,7 @@ export async function runSuiteEvaluation(
           { role: "user", content: turn.user },
         ];
         const inputSnapshot: Record<string, unknown> = {
+          specHash: spec.hash,
           historyMode,
           messages: requestMessages,
         };
@@ -243,6 +209,7 @@ export async function runSuiteEvaluation(
           const answer = await runWithRetry({
             maxAttempts: callMaxAttempts,
             delayMs: callRetryDelayMs,
+            signal: workerSignal,
             onRetry: (attempt, max, error) => {
               options.onProgress?.(`${tag}[t${turn.turnNo}] 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
             },
@@ -256,15 +223,14 @@ export async function runSuiteEvaluation(
                   item_key: item.itemKey,
                   turn_no: turn.turnNo,
                   history_mode: historyMode,
+                  spec_hash: spec.hash,
                 },
               });
               lastCallId = callId;
+              const cancellation = createAttemptCancellation(workerSignal, runtime.timeoutMs);
               try {
-                const raw = await runCandidate({
-                  messages: requestMessages,
-                  temperature: options.temperature,
-                  maxTokens: options.maxTokens,
-                });
+                const raw = await adapter.run({ messages: requestMessages, signal: cancellation.signal });
+                throwIfAborted(cancellation.signal);
                 let trimmed: string;
                 try {
                   trimmed = nonEmpty(raw, "候选模型回答");
@@ -274,8 +240,12 @@ export async function runSuiteEvaluation(
                 evalStore.finishCall(callId, { output: trimmed });
                 return trimmed;
               } catch (error) {
-                evalStore.finishCall(callId, { error: publicErrorMessage(error) });
-                throw toPublicError(error);
+                let failure = error;
+                try { rethrowIfAborted(error, cancellation.signal); } catch (aborted) { failure = aborted; }
+                evalStore.finishCall(callId, { error: publicErrorMessage(failure) });
+                throw toPublicError(failure);
+              } finally {
+                cancellation.dispose();
               }
             },
           });
@@ -296,6 +266,7 @@ export async function runSuiteEvaluation(
             content: historyMode === "gold" ? turn.referenceAnswer : answer,
           });
         } catch (error) {
+          rethrowIfAborted(error, workerSignal);
           const errMsg = publicErrorMessage(error);
           errorTurns++;
           evalStore.saveEvalPrediction({
@@ -318,7 +289,7 @@ export async function runSuiteEvaluation(
       }
 
       options.onProgress?.(`${tag} 完成（${turns.length} 轮）`);
-    });
+    }, { signal: taskSignal });
 
     evalStore.finishEvalRun(evalRunId, "completed");
   } catch (error) {
@@ -333,6 +304,8 @@ export async function runSuiteEvaluation(
     candidate,
     modelId,
     historyMode,
+    specHash: spec.hash,
+    endpoint: spec.endpoint,
     totalItems: items.length,
     totalTurns,
     completedTurns,

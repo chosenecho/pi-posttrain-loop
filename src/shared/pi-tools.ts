@@ -6,6 +6,8 @@ import {
   PI_TODO_TOOL_DEFINITION,
 } from "./tool-schema.js";
 import type { RoleRunner, ToolStep } from "./types.js";
+import { combineSignals, rethrowIfAborted, throwIfAborted } from "./cancellation.js";
+import { createCallBudget, type CallBudget } from "./call-budget.js";
 
 export interface TodoItem {
   id: number;
@@ -17,6 +19,10 @@ export interface CreateTodoToolOptions {
   /** Max todo tool calls allowed within a single turn (default 12). */
   maxCalls?: number;
   onStep?: (step: ToolStep) => void;
+  /** Internal identity-aware success projection; onStep retains its existing shape. */
+  onCallStep?: (toolCallId: string, step: ToolStep) => void;
+  budget?: CallBudget;
+  signal?: AbortSignal;
 }
 
 function formatTodoItem(item: TodoItem): string {
@@ -36,14 +42,16 @@ export function createTodoAgentTool(options: CreateTodoToolOptions = {}): AgentT
   const maxCalls = Math.max(1, Math.floor(options.maxCalls ?? 12));
   const items: TodoItem[] = [];
   let nextId = 1;
-  let callCount = 0;
+  const budget = options.budget ?? createCallBudget(maxCalls);
 
   return {
     name: "todo",
     label: "Todo",
     description: PI_TODO_TOOL_DEFINITION.function.description,
     parameters: PI_TODO_TOOL_DEFINITION.function.parameters as AgentTool["parameters"],
-    async execute(_toolCallId, rawInput) {
+    async execute(toolCallId, rawInput, sdkSignal) {
+      const signal = combineSignals(options.signal, sdkSignal);
+      throwIfAborted(signal);
       if (!rawInput || typeof rawInput !== "object" || !("action" in rawInput)) {
         throw new Error("todo 必须提供 action 参数（list | add | toggle | clear）");
       }
@@ -53,7 +61,14 @@ export function createTodoAgentTool(options: CreateTodoToolOptions = {}): AgentT
         throw new Error(`todo action 必须是 list、add、toggle 或 clear，当前值：${String(action)}`);
       }
 
-      if (callCount >= maxCalls) {
+      if (action === "add" && (typeof input.text !== "string" || !input.text.trim())) {
+        throw new Error("todo add 必须提供 text");
+      }
+      if (action === "toggle" && (!Number.isInteger(Number(input.id)) || Number(input.id) < 1)) {
+        throw new Error("todo toggle 必须提供正整数 id");
+      }
+      const claim = budget.claim(toolCallId);
+      if (!claim) {
         const text = `Todo calls limit (${maxCalls}) reached. Current list:\n${formatTodoList(items)}`;
         return {
           content: [{ type: "text", text }],
@@ -97,13 +112,15 @@ export function createTodoAgentTool(options: CreateTodoToolOptions = {}): AgentT
         outputText = `Cleared ${count} todos`;
       }
 
-      callCount++;
-      options.onStep?.({
-        stepNo: callCount,
+      throwIfAborted(signal);
+      const step: ToolStep = {
+        stepNo: claim.sequence,
         toolName: "todo",
         arguments: recordedArgs,
         toolOutput: outputText,
-      });
+      };
+      options.onStep?.(step);
+      options.onCallStep?.(toolCallId, step);
 
       return {
         content: [{ type: "text", text: outputText }],
@@ -147,6 +164,7 @@ export interface UserSimulatorContext {
   missingSlots?: string[];
   /** Optional LLM runner (`followup` role) for semantic option matching when persona is nuanced. */
   runRole?: RoleRunner;
+  signal?: AbortSignal;
 }
 
 export interface CreateClarifyToolOptions {
@@ -154,6 +172,10 @@ export interface CreateClarifyToolOptions {
   /** Max clarification calls allowed per turn (default 1). */
   maxCalls?: number;
   onStep?: (step: ToolStep) => void;
+  /** Internal identity-aware success projection; onStep retains its existing shape. */
+  onCallStep?: (toolCallId: string, step: ToolStep) => void;
+  budget?: CallBudget;
+  signal?: AbortSignal;
 }
 
 /**
@@ -228,11 +250,13 @@ async function simulateSingleQuestionSelection(
   options: readonly QuestionOptionItem[],
   ctx?: UserSimulatorContext,
 ): Promise<{ selectedLabel: string }> {
+  throwIfAborted(ctx?.signal);
   const persona = ctx?.hiddenUserPersona?.trim() ?? "";
   if (ctx?.runRole && persona) {
     try {
       const raw = await ctx.runRole({
         role: "followup",
+        signal: ctx.signal,
         systemPrompt: USER_SIMULATOR_SYSTEM_PROMPT,
         input: {
           original_question: ctx.question ?? "",
@@ -243,6 +267,7 @@ async function simulateSingleQuestionSelection(
           output_contract: '输出 {"selected_index": 1..N} 或 {"custom_reply": "简短大白话"}',
         },
       });
+      throwIfAborted(ctx.signal);
       const parsed = parseJson(raw) as { selected_index?: unknown; custom_reply?: unknown };
       if (typeof parsed.selected_index === "number" && Number.isInteger(parsed.selected_index)) {
         const picked = options[parsed.selected_index - 1];
@@ -251,7 +276,8 @@ async function simulateSingleQuestionSelection(
       if (typeof parsed.custom_reply === "string" && parsed.custom_reply.trim()) {
         return { selectedLabel: parsed.custom_reply.trim() };
       }
-    } catch {
+    } catch (error) {
+      rethrowIfAborted(error, ctx?.signal);
       // Fallback to deterministic overlap matching if simulator call fails
     }
   }
@@ -263,11 +289,13 @@ async function simulateQuestionnaireSelection(
   questions: readonly QuestionnaireQuestionItem[],
   ctx?: UserSimulatorContext,
 ): Promise<QuestionnaireAnswerItem[]> {
+  throwIfAborted(ctx?.signal);
   const persona = ctx?.hiddenUserPersona?.trim() ?? "";
   if (ctx?.runRole && persona) {
     try {
       const raw = await ctx.runRole({
         role: "followup",
+        signal: ctx.signal,
         systemPrompt: USER_SIMULATOR_SYSTEM_PROMPT,
         input: {
           original_question: ctx.question ?? "",
@@ -286,6 +314,7 @@ async function simulateQuestionnaireSelection(
           output_contract: '输出 {"selections": [{"id": "问题id", "selected_index": 1..N}]}',
         },
       });
+      throwIfAborted(ctx.signal);
       const parsed = parseJson(raw) as { selections?: Array<{ id?: unknown; selected_index?: unknown; custom_reply?: unknown }> };
       if (Array.isArray(parsed.selections)) {
         const byId = new Map(parsed.selections.map((s) => [String(s.id ?? ""), s]));
@@ -322,7 +351,8 @@ async function simulateQuestionnaireSelection(
           };
         });
       }
-    } catch {
+    } catch (error) {
+      rethrowIfAborted(error, ctx?.signal);
       // Fallback to deterministic selection
     }
   }
@@ -345,14 +375,16 @@ async function simulateQuestionnaireSelection(
  */
 export function createQuestionAgentTool(options: CreateClarifyToolOptions = {}): AgentTool {
   const maxCalls = Math.max(1, Math.floor(options.maxCalls ?? 1));
-  let callCount = 0;
+  const budget = options.budget ?? createCallBudget(maxCalls);
 
   return {
     name: "question",
     label: "Question",
     description: PI_QUESTION_TOOL_DEFINITION.function.description,
     parameters: PI_QUESTION_TOOL_DEFINITION.function.parameters as AgentTool["parameters"],
-    async execute(_toolCallId, rawInput) {
+    async execute(toolCallId, rawInput, sdkSignal) {
+      const signal = combineSignals(combineSignals(options.signal, options.context?.signal), sdkSignal);
+      throwIfAborted(signal);
       if (!rawInput || typeof rawInput !== "object") {
         throw new Error("question 参数必须是对象");
       }
@@ -376,28 +408,32 @@ export function createQuestionAgentTool(options: CreateClarifyToolOptions = {}):
         return { label, ...(description ? { description } : {}) };
       });
 
-      if (callCount >= maxCalls) {
+      const claim = budget.claim(toolCallId);
+      if (!claim) {
         const limitText = "User already answered your clarification question. Please provide your final answer directly based on the selected option.";
         return {
           content: [{ type: "text", text: limitText }],
-          details: { question: questionText, options: normalizedOptions, answer: null },
+          isError: true,
+          details: { question: questionText, options: normalizedOptions, answer: null, skipped: true },
         };
       }
 
-      const { selectedLabel } = await simulateSingleQuestionSelection(questionText, normalizedOptions, options.context);
+      const { selectedLabel } = await simulateSingleQuestionSelection(questionText, normalizedOptions, { ...options.context, signal });
       const outputText = `User selected: ${selectedLabel}`;
       const recordedArgs: Record<string, unknown> = {
         question: questionText,
         options: normalizedOptions,
       };
 
-      callCount++;
-      options.onStep?.({
-        stepNo: callCount,
+      throwIfAborted(signal);
+      const step: ToolStep = {
+        stepNo: claim.sequence,
         toolName: "question",
         arguments: recordedArgs,
         toolOutput: outputText,
-      });
+      };
+      options.onStep?.(step);
+      options.onCallStep?.(toolCallId, step);
 
       return {
         content: [{ type: "text", text: outputText }],
@@ -417,14 +453,16 @@ export function createQuestionAgentTool(options: CreateClarifyToolOptions = {}):
  */
 export function createQuestionnaireAgentTool(options: CreateClarifyToolOptions = {}): AgentTool {
   const maxCalls = Math.max(1, Math.floor(options.maxCalls ?? 1));
-  let callCount = 0;
+  const budget = options.budget ?? createCallBudget(maxCalls);
 
   return {
     name: "questionnaire",
     label: "Questionnaire",
     description: PI_QUESTIONNAIRE_TOOL_DEFINITION.function.description,
     parameters: PI_QUESTIONNAIRE_TOOL_DEFINITION.function.parameters as AgentTool["parameters"],
-    async execute(_toolCallId, rawInput) {
+    async execute(toolCallId, rawInput, sdkSignal) {
+      const signal = combineSignals(combineSignals(options.signal, options.context?.signal), sdkSignal);
+      throwIfAborted(signal);
       if (!rawInput || typeof rawInput !== "object") {
         throw new Error("questionnaire 参数必须是对象");
       }
@@ -478,15 +516,17 @@ export function createQuestionnaireAgentTool(options: CreateClarifyToolOptions =
         };
       });
 
-      if (callCount >= maxCalls) {
+      const claim = budget.claim(toolCallId);
+      if (!claim) {
         const limitText = "User already completed the questionnaire. Please provide your final answer directly based on the user's answers.";
         return {
           content: [{ type: "text", text: limitText }],
-          details: { questions: normalizedQuestions, answers: [], cancelled: false },
+          isError: true,
+          details: { questions: normalizedQuestions, answers: [], cancelled: false, skipped: true },
         };
       }
 
-      const answers = await simulateQuestionnaireSelection(normalizedQuestions, options.context);
+      const answers = await simulateQuestionnaireSelection(normalizedQuestions, { ...options.context, signal });
       const formattedLines = answers.map((a) => {
         if (a.wasCustom) {
           return `${a.id}: (wrote) ${a.label}`;
@@ -498,13 +538,15 @@ export function createQuestionnaireAgentTool(options: CreateClarifyToolOptions =
         questions: normalizedQuestions,
       };
 
-      callCount++;
-      options.onStep?.({
-        stepNo: callCount,
+      throwIfAborted(signal);
+      const step: ToolStep = {
+        stepNo: claim.sequence,
         toolName: "questionnaire",
         arguments: recordedArgs,
         toolOutput: outputText,
-      });
+      };
+      options.onStep?.(step);
+      options.onCallStep?.(toolCallId, step);
 
       return {
         content: [{ type: "text", text: outputText }],

@@ -1,3 +1,4 @@
+import { assertDistinctDatabaseFiles } from "../shared/database-path.js";
 import { nonEmpty } from "../shared/schema.js";
 import type { DatasetSplit } from "../shared/types.js";
 import { createSeededRng, extractVideoKey, sha256Hex, shuffleInPlace } from "../shared/utils.js";
@@ -5,8 +6,7 @@ import { loadVideoChunks, scanCorpusVideos, type VideoUnit } from "../synth/corp
 import { DataMakerStore } from "../synth/store/index.js";
 import { EvalStore, type SourceMaterialRecord } from "./store/index.js";
 
-function loadMainMaterialIndex(mainStore: DataMakerStore): Map<string, { id: number; sha256: string }> {
-  const rows = mainStore.listMaterialIndex();
+function loadMainMaterialIndex(rows: ReadonlyArray<{ id: number; video_id: string; sha256: string }>): Map<string, { id: number; sha256: string }> {
   const map = new Map<string, { id: number; sha256: string }>();
   for (const row of rows) {
     map.set(`${row.video_id}\0${row.sha256}`, { id: Number(row.id), sha256: row.sha256 });
@@ -33,6 +33,7 @@ export interface ImportTestSourcesReport {
   videoKeys: string[];
   totalSourceMaterials: number;
   candidateTestVideos: number;
+  selectedSourceMaterialIds: number[];
 }
 
 /**
@@ -48,9 +49,11 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
     throw new Error("--seed 必须是整数");
   }
 
+  assertDistinctDatabaseFiles(mainDbPath, evalStore.path);
   const mainStore = new DataMakerStore(mainDbPath, { readOnly: true });
   try {
-    const splits = mainStore.listVideoSplits();
+    const snapshot = mainStore.readCorpusSourceSnapshot({ includeContent: options.units === undefined && options.inputDir === undefined });
+    const { splits } = snapshot;
     if (splits.length === 0) {
       throw new Error("主库中尚未注册 video_splits，请先在主库完成分区同步");
     }
@@ -73,7 +76,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       }
     }
 
-    const mainMaterialIndex = loadMainMaterialIndex(mainStore);
+    const mainMaterialIndex = loadMainMaterialIndex(snapshot.materials);
 
     // Mode 1: Corpus directory or explicit VideoUnit list
     if (options.units !== undefined || options.inputDir !== undefined) {
@@ -96,6 +99,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       let importedChunks = 0;
       let skippedExistingChunks = 0;
       const importedVideoKeys: string[] = [];
+      const selectedSourceMaterialIds: number[] = [];
 
       for (const unit of selected) {
         const videoKey = extractVideoKey(unit.videoId);
@@ -108,7 +112,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
         evalStore.transaction(() => {
           for (const chunk of chunks) {
             const match = mainMaterialIndex.get(`${chunk.videoId}\0${chunk.sha256}`);
-            const { created } = evalStore.insertSourceMaterial({
+            const { created, record } = evalStore.insertSourceMaterial({
               videoId: chunk.videoId,
               videoKey,
               mainMaterialId: match?.id ?? null,
@@ -117,6 +121,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
               sourcePath: chunk.sourcePath,
               splitSnapshot,
             });
+            selectedSourceMaterialIds.push(record.id);
             if (created) {
               importedChunks++;
               createdForVideo = true;
@@ -135,11 +140,12 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
         videoKeys: importedVideoKeys,
         totalSourceMaterials: evalStore.listSourceMaterials().length,
         candidateTestVideos: candidates.length,
+        selectedSourceMaterialIds,
       };
     }
 
     // Mode 2: Fallback to main DB's `materials` table (only `split = 'test'`)
-    const rows = mainStore.listAllMaterials();
+    const rows = snapshot.materialContents;
     const requestedSet = requestedKeys ? new Set(requestedKeys) : undefined;
     const byVideoKey = new Map<string, typeof rows>();
     for (const row of rows) {
@@ -161,12 +167,13 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
     let importedChunks = 0;
     let skippedExistingChunks = 0;
     const importedVideoKeys: string[] = [];
+    const selectedSourceMaterialIds: number[] = [];
 
     for (const videoKey of selectedKeys) {
       let createdForVideo = false;
       evalStore.transaction(() => {
         for (const row of byVideoKey.get(videoKey)!) {
-          const { created } = evalStore.insertSourceMaterial({
+          const { created, record } = evalStore.insertSourceMaterial({
             videoId: row.video_id,
             videoKey,
             mainMaterialId: Number(row.id),
@@ -175,6 +182,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
             sourcePath: row.source_path,
             splitSnapshot: "test",
           });
+          selectedSourceMaterialIds.push(record.id);
           if (created) {
             importedChunks++;
             createdForVideo = true;
@@ -193,6 +201,7 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
       videoKeys: importedVideoKeys,
       totalSourceMaterials: evalStore.listSourceMaterials().length,
       candidateTestVideos: candidateKeys.length,
+      selectedSourceMaterialIds,
     };
   } finally {
     mainStore.close();
@@ -204,7 +213,11 @@ export async function importTestSources(options: ImportTestSourcesOptions): Prom
  * re-checks every source material's `video_key` in the main DB (read-only) to confirm
  * it is still registered in `split = 'test'`, and verifies content sha256 integrity.
  */
-export function verifySourceSplits(mainDbPath: string, sources: SourceMaterialRecord[]): void {
+export function verifySourceSplits(
+  mainDbPath: string,
+  sources: SourceMaterialRecord[],
+  splitSnapshot?: readonly { video_key: string; split: DatasetSplit }[],
+): void {
   if (sources.length === 0) return;
 
   for (const source of sources) {
@@ -216,23 +229,17 @@ export function verifySourceSplits(mainDbPath: string, sources: SourceMaterialRe
     }
   }
 
-  const mainStore = new DataMakerStore(mainDbPath, { readOnly: true });
-  try {
-    const splitByKey = new Map<string, DatasetSplit>();
-    for (const row of mainStore.listVideoSplits()) {
-      splitByKey.set(row.video_key, row.split);
-    }
-    const invalid: string[] = [];
-    for (const source of sources) {
-      const assigned = splitByKey.get(source.videoKey);
-      if (assigned !== "test") {
-        invalid.push(`${source.videoKey}(实际=${assigned ?? "未注册"})`);
-      }
-    }
-    if (invalid.length > 0) {
-      throw new Error(`跨库分区复核失败：以下评测材料不属于主库 test 分区：${invalid.slice(0, 10).join(", ")}`);
-    }
-  } finally {
-    mainStore.close();
+  const splits = splitSnapshot ?? (() => {
+    const mainStore = new DataMakerStore(mainDbPath, { readOnly: true });
+    try { return mainStore.listVideoSplits(); } finally { mainStore.close(); }
+  })();
+  const splitByKey = new Map(splits.map((row) => [row.video_key, row.split]));
+  const invalid: string[] = [];
+  for (const source of sources) {
+    const assigned = splitByKey.get(source.videoKey);
+    if (assigned !== "test") invalid.push(`${source.videoKey}(实际=${assigned ?? "未注册"})`);
+  }
+  if (invalid.length > 0) {
+    throw new Error(`跨库分区复核失败：以下评测材料不属于主库 test 分区：${invalid.slice(0, 10).join(", ")}`);
   }
 }

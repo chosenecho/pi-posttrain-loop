@@ -1,3 +1,4 @@
+import { combineSignals, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { createWarmupGate, runConcurrentPool } from "../shared/concurrency.js";
 import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
@@ -33,6 +34,7 @@ export interface RunProbeCalibrationOptions {
   callMaxAttempts?: number;
   callRetryDelayMs?: number;
   configSnapshot?: Record<string, unknown>;
+  signal?: AbortSignal;
   onProgress?: (message: string) => void;
 }
 
@@ -60,8 +62,10 @@ export async function runProbeCalibration(
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS);
   const callRetryDelayMs = validateCallRetryDelayMs(options.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS);
 
-  evalStore.markInterruptedRuns();
+  const signal = combineSignals(evalStore.signal, options.signal);
+  throwIfAborted(signal);
 
+  evalStore.ensureRecovered();
   const runId = evalStore.createRun({
     kind: "calibrate",
     config: {
@@ -87,7 +91,8 @@ export async function runProbeCalibration(
   const probeScores: number[] = [];
 
   try {
-    await runConcurrentPool(probes, concurrency, async (probe, idx) => {
+    await runConcurrentPool(probes, concurrency, async (probe, idx, workerSignal) => {
+      throwIfAborted(workerSignal);
       const tag = `[calibrate ${idx + 1}/${probes.length} probe#${probe.id}]`;
 
       if (!options.recalibrate && probe.difficulty !== null) {
@@ -117,6 +122,7 @@ export async function runProbeCalibration(
       const history: Array<{ role: "user" | "assistant"; content: string }> = [];
 
       for (const turn of turns) {
+        throwIfAborted(workerSignal);
         const cached = existingMap.get(turn.turnNo);
         if (cached) {
           turnScores.push(cached.scored);
@@ -132,6 +138,7 @@ export async function runProbeCalibration(
             runWithRetry({
               maxAttempts: callMaxAttempts,
               delayMs: callRetryDelayMs,
+              signal: workerSignal,
               onRetry: (attempt, max, error) => {
                 options.onProgress?.(`${tag}[t${turn.turnNo}] bare 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
               },
@@ -145,6 +152,7 @@ export async function runProbeCalibration(
                 let rawOutput: string | undefined;
                 try {
                   rawOutput = await runBareModel({
+                    signal: workerSignal,
                     role: "bare_answer",
                     systemPrompt: prompts.bareAnswer,
                     input: {
@@ -152,6 +160,7 @@ export async function runProbeCalibration(
                       ...(history.length > 0 ? { history } : {}),
                     },
                   });
+                  throwIfAborted(workerSignal);
                   let cleaned: string;
                   try {
                     cleaned = nonEmpty(rawOutput, "裸答模型输出");
@@ -170,6 +179,7 @@ export async function runProbeCalibration(
           bareAnswer = bareOutcome.answer;
           bareCallId = bareOutcome.callId;
         } catch (error) {
+          rethrowIfAborted(error, workerSignal);
           errors++;
           options.onProgress?.(`${tag}[t${turn.turnNo}] 裸答失败：${publicErrorMessage(error)}`);
           return;
@@ -183,6 +193,7 @@ export async function runProbeCalibration(
             runWithRetry({
               maxAttempts: callMaxAttempts,
               delayMs: callRetryDelayMs,
+              signal: workerSignal,
               onRetry: (attempt, max, error) => {
                 options.onProgress?.(`${tag}[t${turn.turnNo}] grader 重试 ${attempt}/${max}：${publicErrorMessage(error)}`);
               },
@@ -196,6 +207,7 @@ export async function runProbeCalibration(
                 let rawOutput: string | undefined;
                 try {
                   rawOutput = await runGrader({
+                    signal: workerSignal,
                     role: "eval_grader",
                     systemPrompt: prompts.evalGrader,
                     input: {
@@ -209,6 +221,7 @@ export async function runProbeCalibration(
                       candidateAnswer: bareAnswer,
                     },
                   });
+                  throwIfAborted(workerSignal);
                   let parsed: ReturnType<typeof parseGradeResult>;
                   try {
                     parsed = parseGradeResult(rawOutput, turn.rubric);
@@ -228,11 +241,13 @@ export async function runProbeCalibration(
           graderCallId = gradeOutcome.callId;
           scored = scoreGradedTurn(judgement, turn.rubric);
         } catch (error) {
+          rethrowIfAborted(error, workerSignal);
           errors++;
           options.onProgress?.(`${tag}[t${turn.turnNo}] 标定批卷失败：${publicErrorMessage(error)}`);
           return;
         }
 
+        throwIfAborted(workerSignal);
         evalStore.saveCalibration({
           probeId: probe.id,
           turnNo: turn.turnNo,
@@ -257,6 +272,7 @@ export async function runProbeCalibration(
         history.push({ role: "assistant", content: turn.referenceAnswer });
       }
 
+      throwIfAborted(workerSignal);
       const result = classifyProbeDifficulty(turnScores);
       evalStore.setProbeDifficulty(probe.id, result.difficulty);
       calibrated++;
@@ -265,9 +281,9 @@ export async function runProbeCalibration(
       options.onProgress?.(
         `${tag} (${probe.probeType}) -> ${result.difficulty} (bare=${result.aggregateScore}, behaviorOk=${result.allBehaviorOk})`,
       );
-    });
+    }, { signal });
 
-    evalStore.finishRun(runId, "completed");
+    evalStore.finishRun(runId, errors > 0 ? "failed" : "completed");
   } catch (error) {
     evalStore.finishRun(runId, "failed", publicErrorMessage(error));
     throw toPublicError(error);

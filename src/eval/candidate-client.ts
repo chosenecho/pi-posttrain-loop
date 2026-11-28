@@ -1,8 +1,14 @@
 import http from "node:http";
 import https from "node:https";
-import { nonEmpty } from "../shared/schema.js";
-import { PublicError, toPublicError } from "../shared/public-error.js";
 import { resolveApiEndpoint } from "../shared/api-config.js";
+import { createAttemptCancellation, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
+import { PublicError, toPublicError } from "../shared/public-error.js";
+import { DEFAULT_CALL_MAX_ATTEMPTS, DEFAULT_CALL_RETRY_DELAY_MS, validateCallMaxAttempts, validateCallRetryDelayMs } from "../shared/retry.js";
+import { validateConcurrency } from "../shared/schema.js";
+import { readCandidateIdentityConfig } from "./candidate-config.js";
+import { CANDIDATE_ADAPTER_CONTRACT_VERSION, EvaluationSpecError, type ResolvedEvaluationSpec } from "./evaluation-spec.js";
+
+export { readCandidateIdentityConfig, type CandidateIdentityConfig } from "./candidate-config.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -13,9 +19,76 @@ export interface CandidateRequest {
   messages: ChatMessage[];
   temperature?: number;
   maxTokens?: number;
+  signal?: AbortSignal;
 }
 
 export type CandidateRunner = (request: CandidateRequest) => Promise<string>;
+
+export interface CandidateOperationalConfig {
+  readonly apiKey: string;
+  readonly timeoutMs: number;
+  readonly concurrency: number;
+  readonly callMaxAttempts: number;
+  readonly callRetryDelayMs: number;
+}
+
+export interface BoundCandidate {
+  readonly specHash: string;
+  run(request: { messages: ChatMessage[]; signal?: AbortSignal }): Promise<string>;
+}
+
+export type CandidateFactory = (spec: ResolvedEvaluationSpec, runtime: CandidateOperationalConfig) => BoundCandidate;
+
+/** Explicit compatibility adapter for a caller-owned runner. Its identity is a caller assertion. */
+export function bindCandidate(spec: ResolvedEvaluationSpec, runner: CandidateRunner): BoundCandidate {
+  return Object.freeze({
+    specHash: spec.hash,
+    run: async ({ messages, signal }: { messages: ChatMessage[]; signal?: AbortSignal }) => {
+      throwIfAborted(signal);
+      const answer = await runner({ messages, temperature: spec.temperature, maxTokens: spec.maxTokens, signal });
+      throwIfAborted(signal);
+      return answer;
+    },
+  });
+}
+
+export function readCandidateOperationalConfig(
+  spec: ResolvedEvaluationSpec,
+  overrides: Partial<CandidateOperationalConfig> = {},
+  env: NodeJS.ProcessEnv = process.env,
+): CandidateOperationalConfig {
+  const { apiKey } = resolveApiEndpoint({
+    baseUrl: spec.endpoint, apiKey: overrides.apiKey,
+    fallbacks: [
+      { baseUrl: env.CANDIDATE_LLM_BASE_URL ?? env.LLM_BASE_URL, apiKey: env.CANDIDATE_LLM_API_KEY },
+      { baseUrl: env.LLM_BASE_URL, apiKey: env.LLM_API_KEY },
+    ],
+    baseUrlLabel: "候选模型 API 地址", apiKeyLabel: "候选模型密钥", allowEmptyKey: true,
+  });
+  const timeoutMs = overrides.timeoutMs ?? Number(env.CANDIDATE_LLM_TIMEOUT_MS ?? env.LLM_TIMEOUT_MS ?? 90_000);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000) {
+    throw new Error("--timeout-ms 必须是 1–3600000 的整数");
+  }
+  return Object.freeze({
+    apiKey, timeoutMs,
+    concurrency: validateConcurrency(overrides.concurrency ?? 4),
+    callMaxAttempts: validateCallMaxAttempts(overrides.callMaxAttempts ?? DEFAULT_CALL_MAX_ATTEMPTS),
+    callRetryDelayMs: validateCallRetryDelayMs(overrides.callRetryDelayMs ?? DEFAULT_CALL_RETRY_DELAY_MS),
+  });
+}
+
+/** Production requests can only obtain model, sampling and output rules from the resolved spec. */
+export const createOpenAiCandidate: CandidateFactory = (spec, runtime) => {
+  if (spec.adapterContractVersion !== CANDIDATE_ADAPTER_CONTRACT_VERSION) {
+    throw new EvaluationSpecError("candidate_identity_mismatch", "生产 candidate adapter 的契约版本与规格不匹配");
+  }
+  const runner = createOpenAiCandidateRunner({
+    baseUrl: spec.endpoint, modelId: spec.modelId, temperature: spec.temperature,
+    maxTokens: spec.maxTokens, stripThinkTags: spec.stripThinkTags,
+    apiKey: runtime.apiKey, timeoutMs: runtime.timeoutMs,
+  });
+  return Object.freeze({ specHash: spec.hash, run: ({ messages, signal }: { messages: ChatMessage[]; signal?: AbortSignal }) => runner({ messages, signal }) });
+};
 
 export interface OpenAiCandidateConfig {
   baseUrl: string;
@@ -49,32 +122,13 @@ export function readCandidateConfig(
     apiKeyLabel: "候选模型密钥（--api-key / CANDIDATE_LLM_API_KEY）",
     allowEmptyKey: true,
   });
-  const modelId = nonEmpty(
-    overrides.modelId ?? env.CANDIDATE_LLM_MODEL ?? env.LLM_MODEL,
-    "候选模型名称（--model / CANDIDATE_LLM_MODEL / LLM_MODEL）",
-  );
-  const temperature = overrides.temperature ?? 0;
-  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
-    throw new Error("--temperature 必须在 [0, 2] 范围内");
-  }
-  const maxTokens = overrides.maxTokens ?? Number(env.CANDIDATE_LLM_MAX_TOKENS ?? env.LLM_MAX_TOKENS ?? 2048);
-  if (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 131_072) {
-    throw new Error("--max-tokens 必须是 1–131072 的整数");
-  }
+  const identity = readCandidateIdentityConfig(overrides, env);
   const timeoutMs = overrides.timeoutMs ?? Number(env.CANDIDATE_LLM_TIMEOUT_MS ?? env.LLM_TIMEOUT_MS ?? 90_000);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 3_600_000) {
     throw new Error("--timeout-ms 必须是 1–3600000 的整数");
   }
 
-  return {
-    baseUrl,
-    modelId,
-    apiKey,
-    temperature,
-    maxTokens,
-    timeoutMs,
-    stripThinkTags: overrides.stripThinkTags ?? true,
-  };
+  return { ...identity, baseUrl, apiKey, timeoutMs };
 }
 
 /**
@@ -100,62 +154,51 @@ function postJsonViaNodeHttp(
   endpoint: string,
   headers: Record<string, string>,
   body: string,
-  timeoutMs: number,
+  signal: AbortSignal,
 ): Promise<RawHttpResponse> {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint);
     const transport = url.protocol === "https:" ? https : http;
     const payload = Buffer.from(body, "utf8");
-    let settled = false;
-    const finishError = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
-    };
-
+    let response: RawHttpResponse | undefined;
+    let failure: unknown;
     const req = transport.request(
       {
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port || undefined,
-        path: `${url.pathname}${url.search}`,
-        method: "POST",
-        headers: {
-          ...headers,
-          "content-length": String(payload.byteLength),
-        },
+        protocol: url.protocol, hostname: url.hostname, port: url.port || undefined,
+        path: `${url.pathname}${url.search}`, method: "POST",
+        headers: { ...headers, "content-length": String(payload.byteLength) },
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer | string) => {
-          chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-        });
-        res.on("error", (err) => finishError(err));
+        res.on("data", (chunk: Buffer | string) => chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
+        res.on("error", (error) => { failure ??= error; req.destroy(error); });
         res.on("end", () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
           const ctHeader = res.headers["content-type"];
-          const contentType = Array.isArray(ctHeader) ? ctHeader.join(", ") : (ctHeader ?? "");
-          resolve({
+          response = {
             status: res.statusCode ?? 0,
-            contentType,
+            contentType: Array.isArray(ctHeader) ? ctHeader.join(", ") : (ctHeader ?? ""),
             bodyText: Buffer.concat(chunks).toString("utf8"),
-          });
+          };
         });
       },
     );
-
-    const timer = setTimeout(() => {
-      const err = new PublicError("model_timeout");
-      req.destroy(err);
-      finishError(err);
-    }, timeoutMs);
-
-    req.on("error", (err) => finishError(err));
-    req.write(payload);
-    req.end();
+    const onAbort = () => {
+      try { throwIfAborted(signal); } catch (error) { failure = error; }
+      req.destroy(failure instanceof Error ? failure : new PublicError("operation_aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    req.on("error", (error) => { failure ??= error; });
+    // Settle only after the actual request closes, including abort and response stream errors.
+    req.once("close", () => {
+      signal.removeEventListener("abort", onAbort);
+      try { throwIfAborted(signal); } catch (error) { failure = error; }
+      if (failure !== undefined) reject(failure);
+      else if (response) resolve(response);
+      else reject(new PublicError("candidate_request_failed"));
+    });
+    if (signal.aborted) onAbort();
+    else req.end(payload);
   });
 }
 
@@ -166,9 +209,10 @@ function postJsonViaNodeHttp(
 export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): CandidateRunner {
   const endpoint = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
 
-  return async ({ messages, temperature, maxTokens }) => {
-    let requestTimedOut = false;
+  return async ({ messages, temperature, maxTokens, signal }) => {
+    const cancellation = createAttemptCancellation(signal, config.timeoutMs);
     try {
+      throwIfAborted(cancellation.signal);
       const headers: Record<string, string> = {
         "content-type": "application/json",
       };
@@ -185,29 +229,17 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
 
       let rawResponse: RawHttpResponse;
       if (config.fetchFn) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => {
-          requestTimedOut = true;
-          controller.abort(new PublicError("model_timeout"));
-        }, config.timeoutMs);
-        try {
-          const response = await config.fetchFn(endpoint, {
-            method: "POST",
-            headers,
-            body,
-            signal: controller.signal,
-          });
-          rawResponse = {
-            status: response.status,
-            contentType: response.headers.get("content-type") ?? "",
-            bodyText: await response.text(),
-          };
-        } finally {
-          clearTimeout(timer);
-        }
+        const response = await config.fetchFn(endpoint, {
+          method: "POST", headers, body, signal: cancellation.signal,
+        });
+        rawResponse = {
+          status: response.status, contentType: response.headers.get("content-type") ?? "",
+          bodyText: await response.text(),
+        };
       } else {
-        rawResponse = await postJsonViaNodeHttp(endpoint, headers, body, config.timeoutMs);
+        rawResponse = await postJsonViaNodeHttp(endpoint, headers, body, cancellation.signal);
       }
+      throwIfAborted(cancellation.signal);
 
       const { status, contentType, bodyText } = rawResponse;
 
@@ -257,7 +289,10 @@ export function createOpenAiCandidateRunner(config: OpenAiCandidateConfig): Cand
       }
       return cleaned;
     } catch (error) {
-      throw requestTimedOut ? new PublicError("model_timeout") : toPublicError(error, "candidate_request_failed");
+      rethrowIfAborted(error, cancellation.signal);
+      throw toPublicError(error, "candidate_request_failed");
+    } finally {
+      cancellation.dispose();
     }
   };
 }

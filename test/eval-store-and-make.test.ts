@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -36,16 +37,16 @@ function makeRubric(expectedBehavior: ProbeRubric["expectedBehavior"]): ProbeRub
   };
 }
 
-test("Schema v3 initializes 12 tables, enforces immutability, and rejects legacy v1/v2 DBs without migration", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "eval-schema-v3-"));
+test("Schema v4 initializes business and coordination tables, enforces immutability, and retains legacy v1/v2 DBs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "eval-schema-v4-"));
   try {
-    // 1. Fresh v3 DB
+    // 1. Fresh v4 DB
     const dbPath = join(dir, "eval.sqlite");
     const store = new EvalStore(dbPath);
     try {
       assert.equal(store.getMeta("schema_version"), EVAL_SCHEMA_VERSION);
       const tables = (
-        store.db
+        storeConnection(store)
           .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
           .all() as Array<{ name: string }>
       ).map((r) => r.name);
@@ -55,10 +56,14 @@ test("Schema v3 initializes 12 tables, enforces immutability, and rejects legacy
         "eval_predictions",
         "eval_runs",
         "eval_scores",
+        "probe_build_executions",
+        "probe_build_plans",
+        "probe_build_slots",
         "probe_calibrations",
         "probe_runs",
         "probe_turns",
         "probes",
+        "runtime_task_lock",
         "source_materials",
         "suite_items",
         "suite_versions",
@@ -70,8 +75,8 @@ test("Schema v3 initializes 12 tables, enforces immutability, and rejects legacy
         content: "原文内容：结构决定位置。",
         splitSnapshot: "test",
       });
-      assert.throws(() => store.db.prepare("UPDATE source_materials SET content = 'x' WHERE id = ?").run(src.id), /immutable/);
-      assert.throws(() => store.db.prepare("DELETE FROM source_materials WHERE id = ?").run(src.id), /cannot be deleted/);
+      assert.throws(() => storeConnection(store).prepare("UPDATE source_materials SET content = 'x' WHERE id = ?").run(src.id), /immutable/);
+      assert.throws(() => storeConnection(store).prepare("DELETE FROM source_materials WHERE id = ?").run(src.id), /cannot be deleted/);
 
       // Immutability on accepted probe question
       const runId = store.createRun({ kind: "probe_build", config: {}, prompts: {}, skills: [] });
@@ -89,7 +94,7 @@ test("Schema v3 initializes 12 tables, enforces immutability, and rejects legacy
       });
       store.setProbeStatus(probeId, "accepted");
       assert.throws(
-        () => store.db.prepare("UPDATE probes SET question = '篡改题干' WHERE id = ?").run(probeId),
+        () => storeConnection(store).prepare("UPDATE probes SET question = '篡改题干' WHERE id = ?").run(probeId),
         /accepted probe question is immutable/,
       );
 
@@ -106,25 +111,25 @@ test("Schema v3 initializes 12 tables, enforces immutability, and rejects legacy
           rubrics: [{ turnNo: 1, expectedBehavior: "answer", tactic: null, rubric: makeRubric("answer") }],
         }],
       });
-      assert.throws(() => store.db.prepare("DELETE FROM suite_versions WHERE name = 'imm-v1'").run(), /cannot be deleted/);
-      assert.throws(() => store.db.prepare("UPDATE suite_items SET video_key = 'X'").run(), /immutable/);
+      assert.throws(() => storeConnection(store).prepare("DELETE FROM suite_versions WHERE name = 'imm-v1'").run(), /cannot be deleted/);
+      assert.throws(() => storeConnection(store).prepare("UPDATE suite_items SET video_key = 'X'").run(), /immutable/);
     } finally {
       store.close();
     }
 
-    // 2. Reject legacy v2 DB with clear rebuild message
+    // 2. Retain legacy v2 DB with a clear compatibility message
     const legacyPath = join(dir, "legacy-v2.sqlite");
     const raw = new DatabaseSync(legacyPath);
     raw.exec("CREATE TABLE eval_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO eval_meta VALUES ('schema_version', '2');");
     raw.close();
-    assert.throws(() => new EvalStore(legacyPath), /schema 版本不兼容（当前 v2，需要 v3）.*删除或改名/);
+    assert.throws(() => new EvalStore(legacyPath), /schema 版本不兼容（当前 v2，需要 v4）.*请保留原库/);
 
     // 3. Reject legacy DB without eval_meta
     const ancientPath = join(dir, "ancient.sqlite");
     const raw2 = new DatabaseSync(ancientPath);
     raw2.exec("CREATE TABLE probe_specs (id INTEGER PRIMARY KEY);");
     raw2.close();
-    assert.throws(() => new EvalStore(ancientPath), /schema 版本不兼容（当前 旧版，需要 v3）/);
+    assert.throws(() => new EvalStore(ancientPath), /schema 版本不兼容（当前 旧版，需要 v4）.*请保留原库/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -378,7 +383,9 @@ test("eval make end-to-end covers 5 probe types, hold_position multi-turn withou
       runGrader: fakeGrader,
     });
     assert.equal(roleCalls.length, callsBefore);
-    assert.equal("skipped" in res2.build && res2.build.skipped, true);
+    assert.ok(!("skipped" in res2.build));
+    assert.equal(res2.build.totalAgentCalls, 0);
+    assert.equal(res2.build.reusedTerminal, 6);
     assert.equal("skipped" in res2.calibrate && res2.calibrate.skipped, true);
     assert.equal("skipped" in res2.freeze, false);
     if (!("skipped" in res2.freeze)) {

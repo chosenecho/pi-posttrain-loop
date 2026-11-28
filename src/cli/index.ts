@@ -86,6 +86,6 @@ const isEntrypoint = process.argv[1] !== undefined
 if (isEntrypoint) {
   runCli(process.argv.slice(2)).catch((error: unknown) => {
     console.error(`错误：${errorMessage(error)}`);
-    process.exitCode = 1;
+    if (!process.exitCode) process.exitCode = 1;
   });
 }

@@ -2,11 +2,13 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { validateMaxTurns } from "../../shared/schema.js";
-import type { DatasetSplit, Review, SplitAssignMethod, ToolStep } from "../../shared/types.js";
+import { TaskSession, ensureRunOwnerColumn } from "../../shared/task-store.js";
+import type { DatasetSplit, Review, SplitAssignMethod, ToolStep, ToolAttempt } from "../../shared/types.js";
 import { createSeededRng, extractVideoKey, normalizeText, nowIso, sha256Hex } from "../../shared/utils.js";
 import { CorpusRepository } from "./corpus-repo.js";
 import { ExportRepository } from "./export-repo.js";
 import { RunRepository } from "./run-repo.js";
+import { ToolAuditRepository } from "./tool-audit-repo.js";
 import {
   LEGACY_DROP_SQL,
   SCHEMA_SQL,
@@ -70,15 +72,15 @@ export {
 
 /**
  * Unified SQLite store facade backed by modular corpus, run, and export repositories.
- * Production code uses named methods exclusively; `db` is exposed only for low-level test inspection.
+ * Production callers use business actions; low-level constraint fixtures stay in test/.
  */
 export class DataMakerStore {
   /** @internal Low-level connection handle (do not write raw SQL from production business modules). */
-  readonly db: DatabaseSync;
-  private txDepth = 0;
-  readonly corpus: CorpusRepository;
-  readonly runs: RunRepository;
-  readonly exports: ExportRepository;
+  private readonly db: DatabaseSync;
+  private readonly task?: TaskSession;
+  private readonly corpus: CorpusRepository;
+  private readonly runs: RunRepository;
+  private readonly exports: ExportRepository;
 
   constructor(databasePath: string, options: { readOnly?: boolean; busyTimeoutMs?: number } = {}) {
     if (!options.readOnly && databasePath !== ":memory:") {
@@ -87,53 +89,40 @@ export class DataMakerStore {
     this.db = new DatabaseSync(databasePath, { readOnly: options.readOnly ?? false });
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec(`PRAGMA busy_timeout = ${options.busyTimeoutMs ?? 5000};`);
-    if (!options.readOnly) {
-      if (databasePath !== ":memory:") {
-        this.db.exec("PRAGMA journal_mode = WAL;");
+    try {
+      if (!options.readOnly) {
+        this.task = new TaskSession(this.db, "synth");
+        if (databasePath !== ":memory:") this.db.exec("PRAGMA journal_mode = WAL;");
+        this.task.mutate(() => {
+          this.db.exec(SCHEMA_SQL);
+          this.db.exec(LEGACY_DROP_SQL);
+          this.ensureQuestionsColumns();
+          ensureRunOwnerColumn(this.db, "runs");
+        });
       }
-      this.db.exec(SCHEMA_SQL);
-      this.db.exec(LEGACY_DROP_SQL);
-      this.ensureQuestionsColumns();
+    } catch (error) {
+      try { this.task?.release(); } finally { this.db.close(); }
+      throw error;
     }
 
     const hasTable = (name: string) => this.hasTable(name);
     const tx = <T>(fn: () => T) => this.transaction(fn);
     this.corpus = new CorpusRepository(this.db, hasTable);
-    this.runs = new RunRepository(this.db, tx, hasTable, this.corpus);
+    this.runs = new RunRepository(this.db, tx, hasTable, this.corpus, this.task?.ownerToken);
     this.exports = new ExportRepository(this.db, hasTable, this.corpus, this.runs);
   }
 
+  get signal(): AbortSignal | undefined { return this.task?.signal; }
+
+  abort(reason?: unknown): void { this.task?.abort(reason); }
+
   close(): void {
-    this.db.close();
+    try { this.task?.release(); } finally { this.db.close(); }
   }
 
   transaction<T>(fn: () => T): T {
-    const depth = this.txDepth++;
-    const savepoint = `sp_${depth}`;
-    if (depth === 0) {
-      this.db.exec("BEGIN IMMEDIATE");
-    } else {
-      this.db.exec(`SAVEPOINT ${savepoint}`);
-    }
-    try {
-      const value = fn();
-      if (depth === 0) {
-        this.db.exec("COMMIT");
-      } else {
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      }
-      return value;
-    } catch (error) {
-      if (depth === 0) {
-        this.db.exec("ROLLBACK");
-      } else {
-        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
-        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
-      }
-      throw error;
-    } finally {
-      this.txDepth--;
-    }
+    if (!this.task) throw new Error("只读 Store 不执行写事务");
+    return this.task.mutate(fn);
   }
 
   checkIntegrity(): IntegrityReport {
@@ -187,7 +176,7 @@ export class DataMakerStore {
     salt?: string;
     assignedAt?: string;
   }): VideoSplitRecord {
-    return this.corpus.assignVideoSplit(input);
+    return this.transaction(() => this.corpus.assignVideoSplit(input));
   }
 
   getMaterialVideoAndSplitMap(): Map<number, { videoKey: string; videoId: string; split: DatasetSplit }> {
@@ -195,7 +184,7 @@ export class DataMakerStore {
   }
 
   upsertMaterial(input: { videoId: string; content: string; sourcePath?: string | null; createdAt?: string }): MaterialRecord {
-    return this.corpus.upsertMaterial(input);
+    return this.transaction(() => this.corpus.upsertMaterial(input));
   }
 
   insertQuestion(input: {
@@ -207,7 +196,7 @@ export class DataMakerStore {
     taskSpec?: import("./schema-sql.js").QuestionTaskSpec | null;
     createdAt?: string;
   }): { record: QuestionRecord; inserted: boolean } {
-    return this.corpus.insertQuestion(input);
+    return this.transaction(() => this.corpus.insertQuestion(input));
   }
 
   listProcessedVideoRows(profile?: string): Array<{ video_id: string; sha256: string }> {
@@ -216,6 +205,37 @@ export class DataMakerStore {
 
   listMaterialIndex(): Array<{ id: number; video_id: string; sha256: string }> {
     return this.corpus.listMaterialIndex();
+  }
+
+  /** Consistent cross-file import evidence, copied before any asynchronous work. */
+  readCorpusSourceSnapshot(options: { includeContent?: boolean } = {}): {
+    splits: VideoSplitRecord[];
+    materials: Array<{ id: number; video_id: string; sha256: string }>;
+    materialContents: Array<{ id: number; video_id: string; content: string; sha256: string; source_path: string | null }>;
+  } {
+    return this.readSnapshot(() => ({
+      splits: this.corpus.listVideoSplits(),
+      materials: this.corpus.listMaterialIndex(),
+      materialContents: options.includeContent ? this.corpus.listAllMaterials() : [],
+    }));
+  }
+
+  /** Keep split attribution and question selection on the same read snapshot. */
+  readCorpusQuestionSnapshot(): { splits: VideoSplitRecord[]; questions: Array<{ question: string; video_id: string }> } {
+    return this.readSnapshot(() => ({ splits: this.corpus.listVideoSplits(), questions: this.corpus.listAllQuestionsWithVideoId() }));
+  }
+
+  private readSnapshot<T>(read: () => T): T {
+    if (this.db.isTransaction) return read();
+    this.db.exec("BEGIN");
+    try {
+      const result = read();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      if (this.db.isTransaction) this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   listAllMaterials(): Array<{ id: number; video_id: string; content: string; sha256: string; source_path: string | null }> {
@@ -245,7 +265,12 @@ export class DataMakerStore {
   // --- Runs / Dialogue State ---
 
   markInterruptedRuns(timestamp = nowIso()): InterruptedCounts {
-    return this.runs.markInterruptedRuns(timestamp);
+    return this.transaction(() => this.runs.markInterruptedRuns(timestamp));
+  }
+
+  /** Call only after the worker pool has drained; successful results remain immutable. */
+  interruptOwnedRun(runId: number, error?: string): InterruptedCounts {
+    return this.transaction(() => this.runs.interruptOwnedRun(runId, error));
   }
 
   findRunByImportKey(importKey: string): RunRecord | undefined {
@@ -253,19 +278,19 @@ export class DataMakerStore {
   }
 
   createRun(input: CreateRunInput): number {
-    return this.runs.createRun(input);
+    return this.transaction(() => this.runs.createRun(input));
   }
 
   finishRun(runId: number, status: Exclude<RunStatus, "running">, options: { finishedAt?: string; error?: string | null } = {}): void {
-    this.runs.finishRun(runId, status, options);
+    return this.transaction(() => this.runs.finishRun(runId, status, options));
   }
 
   createRunItems(runId: number, questionIds: number[]): Map<number, number> {
-    return this.runs.createRunItems(runId, questionIds);
+    return this.transaction(() => this.runs.createRunItems(runId, questionIds));
   }
 
   startRunItem(runItemId: number, startedAt = nowIso()): void {
-    this.runs.startRunItem(runItemId, startedAt);
+    return this.transaction(() => this.runs.startRunItem(runItemId, startedAt));
   }
 
   finishRunItemNonPass(
@@ -273,11 +298,11 @@ export class DataMakerStore {
     status: "drop" | "exhausted" | "error" | "interrupted",
     options: { finishedAt?: string; error?: string | null } = {},
   ): void {
-    this.runs.finishRunItemNonPass(runItemId, status, options);
+    return this.transaction(() => this.runs.finishRunItemNonPass(runItemId, status, options));
   }
 
   createTurn(input: { runItemId: number; turnNo: number; userContent?: string | null; startedAt?: string }): number {
-    return this.runs.createTurn(input);
+    return this.transaction(() => this.runs.createTurn(input));
   }
 
   finishTurnNonPass(
@@ -285,19 +310,19 @@ export class DataMakerStore {
     status: "drop" | "exhausted" | "error" | "interrupted",
     options: { finishedAt?: string; error?: string | null } = {},
   ): void {
-    this.runs.finishTurnNonPass(turnId, status, options);
+    return this.transaction(() => this.runs.finishTurnNonPass(turnId, status, options));
   }
 
   startAttempt(input: { turnId: number; attemptNo: number; startedAt?: string }): number {
-    return this.runs.startAttempt(input);
+    return this.transaction(() => this.runs.startAttempt(input));
   }
 
   recordAttemptAnswer(attemptId: number, answer: string): void {
-    this.runs.recordAttemptAnswer(attemptId, answer);
+    return this.transaction(() => this.runs.recordAttemptAnswer(attemptId, answer));
   }
 
   recordAttemptToolSteps(attemptId: number, steps: ToolStep[], createdAt = nowIso()): void {
-    this.runs.recordAttemptToolSteps(attemptId, steps, createdAt);
+    return this.transaction(() => this.runs.recordAttemptToolSteps(attemptId, steps, createdAt));
   }
 
   queryAttemptToolStepsMap(attemptIds: number[]): Map<number, ToolStep[]> {
@@ -305,11 +330,11 @@ export class DataMakerStore {
   }
 
   finishAttemptReview(attemptId: number, review: Review, finishedAt = nowIso()): void {
-    this.runs.finishAttemptReview(attemptId, review, finishedAt);
+    return this.transaction(() => this.runs.finishAttemptReview(attemptId, review, finishedAt));
   }
 
   finishAttemptError(attemptId: number, error: string, finishedAt = nowIso()): void {
-    this.runs.finishAttemptError(attemptId, error, finishedAt);
+    return this.transaction(() => this.runs.finishAttemptError(attemptId, error, finishedAt));
   }
 
   startModelCall(input: {
@@ -321,7 +346,7 @@ export class DataMakerStore {
     inputRefs: Record<string, unknown>;
     startedAt?: string;
   }): number {
-    return this.runs.startModelCall(input);
+    return this.transaction(() => this.runs.startModelCall(input));
   }
 
   getModelCallStatus(callId: number): string | undefined {
@@ -329,11 +354,11 @@ export class DataMakerStore {
   }
 
   finishModelCall(callId: number, outputText: string, finishedAt = nowIso()): void {
-    this.runs.finishModelCall(callId, outputText, finishedAt);
+    return this.transaction(() => this.runs.finishModelCall(callId, outputText, finishedAt));
   }
 
   failModelCall(callId: number, error: string, options: { outputText?: string | null; finishedAt?: string } = {}): void {
-    this.runs.failModelCall(callId, error, options);
+    return this.transaction(() => this.runs.failModelCall(callId, error, options));
   }
 
   commitJudgeOutcome(input: {
@@ -348,11 +373,11 @@ export class DataMakerStore {
     exhaustedBudget: boolean;
     finishedAt?: string;
   }): { resultId?: number } {
-    return this.runs.commitJudgeOutcome(input);
+    return this.transaction(() => this.runs.commitJudgeOutcome(input));
   }
 
   finalizePassedRunItem(runItemId: number, turnCount: number, finishedAt = nowIso()): number {
-    return this.runs.finalizePassedRunItem(runItemId, turnCount, finishedAt);
+    return this.transaction(() => this.runs.finalizePassedRunItem(runItemId, turnCount, finishedAt));
   }
 
   queryTargetQuestions(filter: {
@@ -372,6 +397,15 @@ export class DataMakerStore {
 
   queryOutcomeCounts(runId: number): Record<string, number> {
     return this.runs.queryOutcomeCounts(runId);
+  }
+
+  /** Audit may finish after cancellation while the owning pool is still draining. */
+  recordToolAttemptAudit(modelCallId: number, attempt: Readonly<ToolAttempt>): void {
+    this.transaction(() => new ToolAuditRepository(this.db).record(modelCallId, attempt));
+  }
+
+  listToolAttemptAudit(modelCallId: number): ToolAttempt[] {
+    return new ToolAuditRepository(this.db).list(modelCallId);
   }
 
   // --- Exports ---

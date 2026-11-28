@@ -46,6 +46,7 @@ export function renderInspectMarkdown(
   runId: number | undefined,
   probes: readonly ProbeRecord[],
   totalMatched: number,
+  executionRunId?: number,
 ): string {
   const lines: string[] = [];
   lines.push("# 评测考题（Probe）抽检报告");
@@ -53,6 +54,13 @@ export function renderInspectMarkdown(
   if (runId !== undefined) {
     const run = store.getRun(runId);
     lines.push(`- **Run ID**: \`${runId}\`（状态：\`${run?.status ?? "unknown"}\`，模型：\`${String(run?.config?.modelId ?? "unknown")}\`）`);
+  }
+  if (executionRunId !== undefined) {
+    const plans = store.listBuildPlans({ executionRunId });
+    lines.push(`- **执行 Run ID**: \`${executionRunId}\`（关联计划：${plans.map((plan) => `#${plan.id}`).join("、") || "无"}）`);
+  }
+  if (runId !== undefined && probes.length === 0 && store.listProbes({ executionRunId: runId }).length > 0) {
+    lines.push(`- 该运行仅续跑已有考题；按创建者过滤无新题，请使用 \`--execution-run ${runId}\` 查看本次执行关联的全部考题。`);
   }
   lines.push(`- **匹配考题数**: ${totalMatched}　｜　**本报告展示**: ${probes.length}`);
 

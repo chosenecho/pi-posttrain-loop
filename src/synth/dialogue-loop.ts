@@ -1,3 +1,4 @@
+import { combineSignals, isOperationAborted, rethrowIfAborted, throwIfAborted } from "../shared/cancellation.js";
 import { createWarmupGate, runConcurrentPool } from "../shared/concurrency.js";
 import { publicErrorMessage, toPublicError } from "../shared/public-error.js";
 import {
@@ -27,6 +28,7 @@ export interface DialoguePrompts {
 
 export interface RunDialogueBatchOptions {
   store: DataMakerStore;
+  signal?: AbortSignal;
   runRole: RoleRunner;
   /** Optional multi-step tool-enabled answer runner used by `search` profile. */
   runSearchAnswer?: SearchAnswerRunner;
@@ -79,6 +81,8 @@ export function loadTargetQuestions(
  */
 export async function runDialogueBatch(options: RunDialogueBatchOptions): Promise<RunDialogueBatchSummary> {
   const { store, runRole } = options;
+  const signal = combineSignals(options.signal, store.signal);
+  throwIfAborted(signal);
   const maxAttempts = validateMaxAttempts(options.maxAttempts);
   const concurrency = validateConcurrency(options.concurrency ?? 1);
   const callMaxAttempts = validateCallMaxAttempts(options.callMaxAttempts ?? 1);
@@ -91,7 +95,6 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     ? nonEmpty(options.prompts.followup, "多轮追问系统提示词")
     : undefined;
 
-  store.markInterruptedRuns();
 
   const questions = loadTargetQuestions(store, {
     videoId: options.videoId,
@@ -141,7 +144,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     wireInput: Record<string, unknown>;
     parse: (raw: string) => T;
     progressPrefix: string;
+    signal: AbortSignal;
   }): Promise<{ callId: number; output: string; parsed: T }> {
+    throwIfAborted(params.signal);
     const callId = store.startModelCall({
       runId,
       role: params.role,
@@ -154,6 +159,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
       const result = await runWithRetry({
         maxAttempts: callMaxAttempts,
         delayMs: callRetryDelayMs,
+        signal: params.signal,
         run: async () => {
           lastRawOutput = undefined;
           const output = await warmupGate.run(`${params.materialId}:${params.role}`, warmupEnabled, () =>
@@ -161,7 +167,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
               role: params.role,
               systemPrompt: params.systemPrompt,
               input: params.wireInput,
+              signal: params.signal,
             }),
+            params.signal,
           );
           lastRawOutput = output;
           try {
@@ -185,11 +193,13 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
       const publicMsg = publicErrorMessage(error);
       const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${publicMsg}` : publicMsg;
       store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
+      rethrowIfAborted(error, params.signal);
       throw toPublicError(error);
     }
   }
 
-  async function processQuestion(item: LoadedQuestion): Promise<void> {
+  async function processQuestion(item: LoadedQuestion, signal: AbortSignal): Promise<void> {
+    throwIfAborted(signal);
     const runItemId = runItemIdByQuestion.get(item.id)!;
     store.startRunItem(runItemId);
 
@@ -200,6 +210,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     let passedResultId: number | undefined;
 
     for (let turnNo = 1; turnNo <= maxTurns; turnNo++) {
+      throwIfAborted(signal);
       const turnId = store.createTurn({
         runItemId,
         turnNo,
@@ -213,6 +224,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
       let turnPassedAnswer = "";
 
       for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo++) {
+        throwIfAborted(signal);
         const attemptId = store.startAttempt({ turnId, attemptNo });
 
         const answerInputRefs: Record<string, unknown> = {
@@ -252,6 +264,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
               const searchRes: SearchAnswerResult = await runWithRetry({
                 maxAttempts: callMaxAttempts,
                 delayMs: callRetryDelayMs,
+                signal,
                 run: async () => {
                   lastRawOutput = undefined;
                   const result = await warmupGate.run(`${item.materialId}:answer`, warmupEnabled, () =>
@@ -263,7 +276,10 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
                         ...(item.questionMode && item.questionMode !== "direct" ? { _questionMode: item.questionMode } : {}),
                         ...(item.taskSpec ? { _taskSpec: item.taskSpec } : {}),
                       },
+                      signal,
+                      onToolAttempt: (attempt) => store.recordToolAttemptAudit(callId, attempt),
                     }),
+                    signal,
                   );
                   lastRawOutput = result.answer;
                   return {
@@ -280,6 +296,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
                   );
                 },
               });
+              throwIfAborted(signal);
               answerText = searchRes.answer;
               attemptToolSteps = searchRes.toolSteps;
               store.transaction(() => {
@@ -291,6 +308,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
               const publicMsg = publicErrorMessage(error);
               const finalMsg = callMaxAttempts > 1 ? `重试 ${callMaxAttempts} 次后仍失败：${publicMsg}` : publicMsg;
               store.failModelCall(callId, finalMsg, { outputText: lastRawOutput ?? null });
+              rethrowIfAborted(error, signal);
               throw toPublicError(error);
             }
           } else {
@@ -304,7 +322,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
               wireInput: answerWireInput,
               parse: (raw) => nonEmpty(raw, "回答"),
               progressPrefix: attemptTag,
+              signal,
             });
+            throwIfAborted(signal);
             answerText = answerCall.parsed;
             store.transaction(() => {
               store.finishModelCall(answerCall.callId, answerCall.output);
@@ -318,6 +338,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             store.finishTurnNonPass(turnId, "error", { error: msg });
             store.finishRunItemNonPass(runItemId, "error", { error: msg });
           });
+          rethrowIfAborted(error, signal);
           itemErrors++;
           itemFailed = true;
           options.onProgress?.(`${attemptTag} answer error${callMaxAttempts > 1 ? "（已丢弃本题）" : ""}: ${msg}`);
@@ -363,7 +384,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             wireInput: judgeWireInput,
             parse: parseReview,
             progressPrefix: attemptTag,
+            signal,
           });
+          throwIfAborted(signal);
           const review = judgeCall.parsed;
 
           const isFinalTurn = turnNo === maxTurns;
@@ -405,6 +428,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             store.finishTurnNonPass(turnId, "error", { error: msg });
             store.finishRunItemNonPass(runItemId, "error", { error: msg });
           });
+          rethrowIfAborted(error, signal);
           itemErrors++;
           itemFailed = true;
           options.onProgress?.(`${attemptTag} judge error${callMaxAttempts > 1 ? "（已丢弃本题）" : ""}: ${msg}`);
@@ -440,7 +464,9 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
             },
             parse: parseFollowup,
             progressPrefix: turnTag,
+            signal,
           });
+          throwIfAborted(signal);
           const decision = call.parsed;
           store.finishModelCall(call.callId, call.output);
           if (decision.action === "stop") {
@@ -454,6 +480,7 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
           store.transaction(() => {
             store.finishRunItemNonPass(runItemId, "error", { error: msg });
           });
+          rethrowIfAborted(error, signal);
           itemErrors++;
           options.onProgress?.(`${turnTag} followup error${callMaxAttempts > 1 ? "（已丢弃本题）" : ""}: ${msg}`);
           break;
@@ -462,9 +489,17 @@ export async function runDialogueBatch(options: RunDialogueBatchOptions): Promis
     }
   }
 
-  await runConcurrentPool(questions, concurrency, (item) => processQuestion(item));
-
-  store.finishRun(runId, "completed");
+  try {
+    await runConcurrentPool(questions, concurrency, (item, _index, workerSignal) => processQuestion(item, workerSignal), { signal });
+    throwIfAborted(signal);
+    store.finishRun(runId, "completed");
+  } catch (error) {
+    const message = publicErrorMessage(error);
+    store.interruptOwnedRun(runId, message);
+    store.finishRun(runId, isOperationAborted(error) || signal?.aborted ? "interrupted" : "error", { error: message });
+    rethrowIfAborted(error, signal);
+    throw toPublicError(error);
+  }
   const outcomes = store.queryOutcomeCounts(runId);
   const results = store.exportRunSamples(runId).length;
   const integrity = store.checkIntegrity();

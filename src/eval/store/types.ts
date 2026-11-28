@@ -1,6 +1,6 @@
 import type { EvalRole } from "../../shared/types.js";
 
-export const EVAL_SCHEMA_VERSION = "3";
+export const EVAL_SCHEMA_VERSION = "4";
 
 export const PROBE_TYPES = [
   "answer",
@@ -247,6 +247,94 @@ export interface StartAgentCallInput {
   role: EvalRole;
   model: string;
   inputRefs: Record<string, unknown>;
+}
+
+export type ProbeBuildPlanStatus = "pending" | "planning" | "ready" | "retryable" | "done" | "skipped";
+export type ProbeBuildSlotStatus = "pending" | "running" | "retryable" | "accepted" | "rejected" | "dropped";
+export type ProbeBuildStage = "critic" | "revision" | "adversary" | "reference" | "verifier" | "done";
+
+export interface ProbeBuildDraft {
+  probeType: ProbeType;
+  persona: string;
+  targetTurns: number;
+  question: string;
+  anchor: string;
+  trap: string;
+}
+
+/** The next operation, including business budgets already consumed in earlier executions. */
+export interface ProbeBuildCheckpoint {
+  version: 1;
+  stage: ProbeBuildStage;
+  roundNo: number;
+  turnNo: number;
+  attempt: number;
+  review?: { issues: string[]; feedback: string };
+  userContent?: string;
+  trap?: string;
+  tactic?: AdversaryTactic | null;
+  answer?: string;
+  previousAnswer?: string;
+  feedback?: string;
+  pendingCallId?: number;
+}
+
+export interface ProbeBuildSpec {
+  version: 1;
+  modelId: string;
+  allowedTypes: readonly ProbeType[];
+  maxProbesPerVideo: number;
+  maxRevisions: number;
+  maxAnswerAttempts: number;
+  prompts: { probeWriter: string; probeCritic: string; reference: string; verifier: string; adversary: string };
+  skills: Array<{ name: string; status: string; sha256: string }>;
+}
+
+export interface ProbeBuildPlanRecord {
+  id: number;
+  sourceMaterialId: number;
+  generation: number;
+  originRunId: number;
+  lastExecutionRunId: number;
+  sourceSha256: string;
+  spec: ProbeBuildSpec | null;
+  specHash: string;
+  writerCallId: number | null;
+  status: ProbeBuildPlanStatus;
+  plannedCount: number;
+  planComplete: boolean;
+  skipReason: string | null;
+  errorCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProbeBuildSlotRecord {
+  id: number;
+  planId: number;
+  slotIndex: number;
+  probeId: number | null;
+  draft: ProbeBuildDraft;
+  status: ProbeBuildSlotStatus;
+  stage: ProbeBuildStage;
+  checkpoint: ProbeBuildCheckpoint;
+  lastExecutionRunId: number;
+  errorCode: string | null;
+}
+
+export interface ProbeBuildExecutionRecord {
+  executionRunId: number;
+  planId: number;
+  stats: Record<string, number>;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface BuildPlanFilter {
+  sourceMaterialId?: number;
+  executionRunId?: number;
+  originRunId?: number;
+  latestOnly?: boolean;
 }
 
 export interface EvalStoreSummary {

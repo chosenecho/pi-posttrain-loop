@@ -1,3 +1,4 @@
+import { storeConnection } from "./fixtures/store-connection.js";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -145,7 +146,7 @@ test("dialogue loop injects independent system prompts and isolated Skills and s
   assert.ok(!calls[1].systemPrompt.includes(answerStyle.body));
   assert.equal(calls[1].systemPrompt, expectedJudge);
 
-  const jRun = store.db.prepare("SELECT prompts_json, skills_json FROM runs WHERE id = ?").get(summary.runId) as {
+  const jRun = storeConnection(store).prepare("SELECT prompts_json, skills_json FROM runs WHERE id = ?").get(summary.runId) as {
     prompts_json: string; skills_json: string;
   };
   assert.deepEqual(JSON.parse(jRun.prompts_json), { answer: expectedAnswer, judge: expectedJudge });

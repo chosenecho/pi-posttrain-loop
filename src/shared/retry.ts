@@ -1,3 +1,5 @@
+import { rethrowIfAborted, throwIfAborted } from "./cancellation.js";
+
 export const DEFAULT_CALL_MAX_ATTEMPTS = 3;
 export const DEFAULT_CALL_RETRY_DELAY_MS = 3000;
 
@@ -15,15 +17,26 @@ export function validateCallRetryDelayMs(value: number): number {
   return value;
 }
 
-export function sleep(ms: number): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      cleanup();
+      try { throwIfAborted(signal); } catch (error) { reject(error); }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export async function runWithRetry<T>(options: {
   maxAttempts: number;
   delayMs: number;
-  run: (attempt: number) => Promise<T>;
+  signal?: AbortSignal;
+  run: (attempt: number, signal?: AbortSignal) => Promise<T>;
   shouldRetry?: (error: unknown, attempt: number) => boolean;
   onRetry?: (attempt: number, maxAttempts: number, error: unknown) => void;
 }): Promise<T> {
@@ -33,15 +46,19 @@ export async function runWithRetry<T>(options: {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await options.run(attempt);
+      throwIfAborted(options.signal);
+      const result = await options.run(attempt, options.signal);
+      throwIfAborted(options.signal);
+      return result;
     } catch (error) {
+      rethrowIfAborted(error, options.signal);
       lastError = error;
       const canRetry = attempt < maxAttempts && (options.shouldRetry ? options.shouldRetry(error, attempt) : true);
       if (!canRetry) {
         throw error;
       }
       options.onRetry?.(attempt, maxAttempts, error);
-      await sleep(delayMs);
+      await sleep(delayMs, options.signal);
     }
   }
 

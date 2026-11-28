@@ -21,27 +21,47 @@ export class RunRepository {
     private readonly transaction: <T>(fn: () => T) => T,
     private readonly hasTable: (name: string) => boolean,
     private readonly corpus: CorpusRepository,
+    private readonly ownerToken?: string,
   ) {}
 
   markInterruptedRuns(timestamp = nowIso()): InterruptedCounts {
     return this.transaction(() => {
+      const orphanRuns = "SELECT id FROM runs WHERE owner_token IS NULL OR owner_token != ?";
+      const owner = this.ownerToken ?? "";
       const modelCalls = Number(this.db.prepare(
-        "UPDATE model_calls SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-      ).run(timestamp).changes);
+        `UPDATE model_calls SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running' AND run_id IN (${orphanRuns})`,
+      ).run(timestamp, owner).changes);
+      const orphanItems = `SELECT id FROM run_items WHERE run_id IN (${orphanRuns})`;
+      const orphanTurns = `SELECT id FROM turns WHERE run_item_id IN (${orphanItems})`;
       const attempts = Number(this.db.prepare(
-        "UPDATE attempts SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-      ).run(timestamp).changes);
+        `UPDATE attempts SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running' AND turn_id IN (${orphanTurns})`,
+      ).run(timestamp, owner).changes);
       const turns = Number(this.db.prepare(
-        "UPDATE turns SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-      ).run(timestamp).changes);
+        `UPDATE turns SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running' AND run_item_id IN (${orphanItems})`,
+      ).run(timestamp, owner).changes);
       const runItems = Number(this.db.prepare(
-        "UPDATE run_items SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-      ).run(timestamp).changes);
+        `UPDATE run_items SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status IN ('pending', 'running') AND run_id IN (${orphanRuns})`,
+      ).run(timestamp, owner).changes);
       const runs = Number(this.db.prepare(
-        "UPDATE runs SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running'",
-      ).run(timestamp).changes);
+        "UPDATE runs SET status = 'interrupted', finished_at = COALESCE(finished_at, ?) WHERE status = 'running' AND (owner_token IS NULL OR owner_token != ?)",
+      ).run(timestamp, owner).changes);
 
       return { runs, runItems, turns, attempts, modelCalls };
+    });
+  }
+
+  interruptOwnedRun(runId: number, error?: string): InterruptedCounts {
+    return this.transaction(() => {
+      const owned = this.db.prepare("SELECT id FROM runs WHERE id = ? AND owner_token = ?").get(runId, this.ownerToken ?? "");
+      if (!owned) throw new Error("运行不属于当前写会话 [database_owner_lost]");
+      const timestamp = nowIso();
+      const modelCalls = Number(this.db.prepare("UPDATE model_calls SET status='interrupted', finished_at=COALESCE(finished_at, ?), error=COALESCE(error, ?) WHERE status='running' AND run_id=?").run(timestamp, error ?? null, runId).changes);
+      const items = "SELECT id FROM run_items WHERE run_id = ?";
+      const turnsQuery = `SELECT id FROM turns WHERE run_item_id IN (${items})`;
+      const attempts = Number(this.db.prepare(`UPDATE attempts SET status='interrupted', finished_at=COALESCE(finished_at, ?) WHERE status='running' AND turn_id IN (${turnsQuery})`).run(timestamp, runId).changes);
+      const turns = Number(this.db.prepare(`UPDATE turns SET status='interrupted', finished_at=COALESCE(finished_at, ?) WHERE status='running' AND run_item_id IN (${items})`).run(timestamp, runId).changes);
+      const runItems = Number(this.db.prepare("UPDATE run_items SET status='interrupted', finished_at=COALESCE(finished_at, ?) WHERE status IN ('pending','running') AND run_id=?").run(timestamp, runId).changes);
+      return { runs: 0, runItems, turns, attempts, modelCalls };
     });
   }
 
@@ -55,8 +75,8 @@ export class RunRepository {
     const info = this.db.prepare(`
       INSERT INTO runs (
         kind, status, started_at, finished_at, max_attempts, max_turns,
-        config_json, prompts_json, skills_json, export_policy_json, import_key, error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        config_json, prompts_json, skills_json, export_policy_json, import_key, error, owner_token
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.kind,
       input.status ?? "running",
@@ -70,6 +90,7 @@ export class RunRepository {
       assertObjectJson(input.exportPolicy, "exportPolicy"),
       input.importKey ?? null,
       input.error ?? null,
+      this.ownerToken ?? null,
     );
     return Number(info.lastInsertRowid);
   }

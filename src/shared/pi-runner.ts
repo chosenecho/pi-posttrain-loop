@@ -1,26 +1,22 @@
+import { randomUUID } from "node:crypto";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createModels, createProvider, type Model } from "@earendil-works/pi-ai";
 import * as completions from "@earendil-works/pi-ai/api/openai-completions";
 import type {
   DialogueRole,
-  QuestionMode,
-  QuestionTaskSpec,
   RoleRequest,
   RoleRunner,
   SearchAnswerResult,
   SearchAnswerRunner,
-  SynthProfile,
   ToolStep,
+  ToolAttempt,
 } from "./types.js";
+import { combineSignals, createAttemptCancellation, throwIfAborted } from "./cancellation.js";
 import { nonEmpty } from "./schema.js";
 import { PublicError, toPublicError } from "./public-error.js";
 import { normalizeApiBaseUrl, resolveApiEndpoint } from "./api-config.js";
 import { createWebSearchAgentTool, type CreateWebSearchToolOptions, type WebSearchRunner } from "./web-search.js";
-import {
-  createQuestionAgentTool,
-  createQuestionnaireAgentTool,
-  createTodoAgentTool,
-} from "./pi-tools.js";
+
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high" | "max";
 
@@ -146,18 +142,19 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
     api: completions,
   }));
 
-  return async ({ role, systemPrompt, input }) => {
+  return async ({ role, systemPrompt, input, signal }) => {
+    throwIfAborted(signal);
     let httpStatus: number | undefined;
     // A fresh Agent for each invocation prevents cross-role and cross-question history leaks.
-    const timeout = AbortSignal.timeout(config.timeoutMs);
+    const timeout = createAttemptCancellation(signal, config.timeoutMs);
     const thinkingLevel = config.roleThinkingLevels?.[role as DialogueRole] ?? config.thinkingLevel ?? "high";
     const agent = new Agent({
-      initialState: { systemPrompt, model, tools, thinkingLevel },
+      initialState: { systemPrompt, model, tools: tools.map((tool) => withCancellation(tool, timeout.signal)), thinkingLevel },
       // Execute the declared tools, then end; receipts are returned below without a second model call.
       finishTurn: () => ({ action: "end" }),
       streamFn: (selectedModel, context, options) => models.streamSimple(selectedModel, context, {
         ...options,
-        signal: options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout,
+        signal: combineSignals(timeout.signal, options?.signal),
         maxTokens: config.maxTokens,
         timeoutMs: config.timeoutMs,
         maxRetries: 0,
@@ -170,8 +167,12 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
         },
       }),
     });
+    const abortAgent = () => agent.abort();
+    timeout.signal.addEventListener("abort", abortAgent, { once: true });
     try {
+      throwIfAborted(timeout.signal);
       await agent.prompt(JSON.stringify(input));
+      throwIfAborted(timeout.signal);
       const last = agent.state.messages.findLast((message) => message.role === "assistant");
       if (!last || last.role !== "assistant") {
         throw new PublicError("model_missing_message", { httpStatus });
@@ -185,17 +186,39 @@ export function createPiRunner(config: PiConfig, tools: AgentTool[] = []): RoleR
         return receipt;
       }
       if (last.stopReason !== "stop") {
-        throw new PublicError(timeout.aborted ? "model_timeout" : "model_incomplete", { httpStatus, stopReason: last.stopReason });
+        throw new PublicError(timeout.signal.aborted ? "model_timeout" : "model_incomplete", { httpStatus, stopReason: last.stopReason });
       }
       const text = last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
       if (!text.trim()) throw new PublicError("model_empty_output", { httpStatus });
       return text;
     } catch (error) {
+      throwIfAborted(timeout.signal);
       if (error instanceof PublicError) throw error;
-      throw new PublicError(timeout.aborted ? "model_timeout" : "model_request_failed", {
+      throw new PublicError(timeout.signal.aborted ? "model_timeout" : "model_request_failed", {
         httpStatus: httpStatus ?? toPublicError(error).httpStatus,
       });
+    } finally {
+      timeout.signal.removeEventListener("abort", abortAgent);
+      agent.abort();
+      await agent.waitForIdle();
+      timeout.dispose();
     }
+  };
+}
+
+/** The awaited tool promise is the cleanup contract; no race can declare an ignoring tool idle. */
+function withCancellation(tool: AgentTool, signal: AbortSignal): AgentTool {
+  return {
+    ...tool,
+    async execute(id, input, sdkSignal, onUpdate) {
+      const combined = combineSignals(signal, sdkSignal);
+      throwIfAborted(combined);
+      const result = await tool.execute(id, input, combined, (update) => {
+        if (!combined?.aborted) onUpdate?.(update);
+      });
+      throwIfAborted(combined);
+      return result;
+    },
   };
 }
 
@@ -205,25 +228,23 @@ export interface PiSearchRunnerOptions {
   /** Result count per web_search call (default 5). */
   searchCount?: number;
   searchContextSize?: CreateWebSearchToolOptions["searchContextSize"];
-  /** Target synth profile (auto-mounts `todo` on `todo` profile and `question`/`questionnaire` on `clarify` profile). */
-  profile?: SynthProfile;
-  /** Enable `web_search` tool on this runner (default true when webSearchRunner is provided). */
+  /** Enable the generic web_search tool (default true when a runner is provided). */
   enableSearch?: boolean;
-  /** Max todo calls per answer attempt (default 12). */
-  maxTodoCalls?: number;
-  /** Max question/questionnaire calls per answer attempt (default 1). */
-  maxClarifyCalls?: number;
-  /** Optional LLM runner used by `question`/`questionnaire` user simulator. */
-  simulatorRunner?: RoleRunner;
-  /** Optional custom tool factory per request. */
+  /** Remove or project caller-owned metadata before serializing model input. */
+  transformInput?: (request: RoleRequest) => Record<string, unknown>;
+  /** Per-request tool round allowance; defaults to maxSearchCalls + 2. */
+  maxToolRounds?: number | ((request: RoleRequest) => number);
+  /** Tools are created inside the attempt lifecycle and share its effective deadline. */
   extraToolsFactory?: (ctx: {
     request: RoleRequest;
+    signal: AbortSignal;
     recordStep: (step: Omit<ToolStep, "stepNo">) => void;
+    recordCallStep: (toolCallId: string, step: ToolStep) => void;
   }) => AgentTool[];
 }
 
 /**
- * Multi-step Pi runner for tool-enabled answers (`web_search`, `todo`, `question`, `questionnaire`):
+ * Multi-step Pi runner for caller-supplied tools and optional generic web search:
  * mounts the configured Pi tools for each attempt, lets the model invoke tools and consume tool outputs,
  * and captures every tool step (with sequential `stepNo` and pre-call thinking) alongside the final text answer.
  */
@@ -264,143 +285,182 @@ export function createPiSearchRunner(
   }));
 
   const maxSearchCalls = Math.max(1, Math.floor(options.maxSearchCalls ?? 3));
-  const maxTodoCalls = Math.max(1, Math.floor(options.maxTodoCalls ?? 12));
-  const maxClarifyCalls = Math.max(1, Math.floor(options.maxClarifyCalls ?? 1));
 
   return async (request): Promise<SearchAnswerResult> => {
-    const { role, systemPrompt, input } = request;
+    const { role, systemPrompt, input, signal } = request;
+    throwIfAborted(signal);
     let httpStatus: number | undefined;
-    const timeout = AbortSignal.timeout(config.timeoutMs);
-    const thinkingLevel = config.roleThinkingLevels?.[role as DialogueRole] ?? config.thinkingLevel ?? "high";
-    const capturedSteps: ToolStep[] = [];
-    let toolRounds = 0;
-
-    const recordStep = (step: Omit<ToolStep, "stepNo">): void => {
-      capturedSteps.push({
-        ...step,
-        stepNo: capturedSteps.length + 1,
-      });
-    };
-
-    // Strip internal simulator metadata (`_questionMode`, `_taskSpec`) before sending wire input to Answer Agent
-    const {
-      _questionMode: rawQuestionMode,
-      _taskSpec: rawTaskSpec,
-      ...cleanWireInput
-    } = input;
-    const questionMode = (typeof rawQuestionMode === "string" ? rawQuestionMode : undefined) as QuestionMode | undefined;
-    const taskSpec = (rawTaskSpec && typeof rawTaskSpec === "object" ? rawTaskSpec : undefined) as QuestionTaskSpec | undefined;
-
-    const tools: AgentTool[] = [];
-    const enableSearch = options.enableSearch ?? Boolean(webSearchRunner);
-    if (enableSearch && webSearchRunner) {
-      tools.push(
-        createWebSearchAgentTool(webSearchRunner, {
-          maxCalls: maxSearchCalls,
-          count: options.searchCount,
-          searchContextSize: options.searchContextSize,
-          onStep: (step) => recordStep(step),
-        }),
-      );
-    }
-
-    const mountTodo = options.profile === "todo" || questionMode === "todo_plan";
-    if (mountTodo) {
-      tools.push(
-        createTodoAgentTool({
-          maxCalls: maxTodoCalls,
-          onStep: (step) => recordStep(step),
-        }),
-      );
-    }
-
-    const mountClarify = options.profile === "clarify" || questionMode === "clarify_question";
-    if (mountClarify) {
-      const simContext = {
-        question: typeof cleanWireInput.question === "string" ? cleanWireInput.question : undefined,
-        material: typeof cleanWireInput.material === "string" ? cleanWireInput.material : undefined,
-        hiddenUserPersona: taskSpec?.hidden_user_persona,
-        missingSlots: taskSpec?.missing_slots,
-        runRole: options.simulatorRunner,
-      };
-      tools.push(
-        createQuestionAgentTool({
-          maxCalls: maxClarifyCalls,
-          context: simContext,
-          onStep: (step) => recordStep(step),
-        }),
-        createQuestionnaireAgentTool({
-          maxCalls: maxClarifyCalls,
-          context: simContext,
-          onStep: (step) => recordStep(step),
-        }),
-      );
-    }
-
-    if (options.extraToolsFactory) {
-      tools.push(...options.extraToolsFactory({ request, recordStep }));
-    }
-
-    const maxToolRounds = (mountTodo ? maxTodoCalls : 0) + (mountClarify ? maxClarifyCalls : 0) + maxSearchCalls + 2;
-
-    const agent = new Agent({
-      initialState: { systemPrompt, model, tools, thinkingLevel },
-      finishTurn: (turn) => {
-        if (turn.toolResults.length === 0) return { action: "end" };
-        toolRounds++;
-        // Extract any thinking emitted right before this tool-call batch
-        const thinkingText = turn.message.content
-          .filter((part): part is { type: "thinking"; thinking: string } => part.type === "thinking" && "thinking" in part)
-          .map((part) => part.thinking.trim())
-          .filter(Boolean)
-          .join("\n");
-        if (thinkingText) {
-          const batchStart = Math.max(0, capturedSteps.length - turn.toolResults.length);
-          for (let i = batchStart; i < capturedSteps.length; i++) {
-            if (!capturedSteps[i]!.preCallThought) {
-              capturedSteps[i]!.preCallThought = thinkingText;
-            }
-          }
-        }
-        if (toolRounds > maxToolRounds) {
-          return { action: "end" };
-        }
-        return undefined;
-      },
-      streamFn: (selectedModel, context, streamOptions) => models.streamSimple(selectedModel, context, {
-        ...streamOptions,
-        signal: streamOptions?.signal ? AbortSignal.any([streamOptions.signal, timeout]) : timeout,
-        maxTokens: config.maxTokens,
-        timeoutMs: config.timeoutMs,
-        maxRetries: 0,
-        fetch: async (req, init) => {
-          const response = await globalThis.fetch(req, { ...init, redirect: "manual" });
-          httpStatus = response.status;
-          return response;
-        },
-      }),
-    });
-
+    const timeout = createAttemptCancellation(signal, config.timeoutMs);
     try {
-      await agent.prompt(JSON.stringify(cleanWireInput));
-      const last = agent.state.messages.findLast((message) => message.role === "assistant");
-      if (!last || last.role !== "assistant") {
-        throw new PublicError("model_missing_message", { httpStatus });
-      }
-      if (last.stopReason !== "stop") {
-        throw new PublicError(timeout.aborted ? "model_timeout" : "model_incomplete", { httpStatus, stopReason: last.stopReason });
-      }
-      const text = last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
-      if (!text.trim()) throw new PublicError("model_empty_output", { httpStatus });
-      return {
-        answer: text,
-        toolSteps: capturedSteps,
+      const thinkingLevel = config.roleThinkingLevels?.[role as DialogueRole] ?? config.thinkingLevel ?? "high";
+      const capturedSteps: ToolStep[] = [];
+      const attemptId = randomUUID();
+      const toolAttempts: ToolAttempt[] = [];
+      const projectedSteps = new Map<ToolAttempt, ToolStep>();
+      let batchId = 0;
+      let batchCalls = new Map<string, ToolAttempt>();
+      const recordCallStep = (toolCallId: string, step: ToolStep) => {
+        if (timeout.signal.aborted) return;
+        const call = batchCalls.get(toolCallId);
+        if (call) projectedSteps.set(call, step);
       };
-    } catch (error) {
-      if (error instanceof PublicError) throw error;
-      throw new PublicError(timeout.aborted ? "model_timeout" : "model_request_failed", {
-        httpStatus: httpStatus ?? toPublicError(error).httpStatus,
+      let toolRounds = 0;
+
+      const recordStep = (step: Omit<ToolStep, "stepNo">): void => {
+        if (timeout.signal.aborted) return;
+        capturedSteps.push({
+          ...step,
+          stepNo: capturedSteps.length + 1,
+        });
+      };
+
+      const cleanWireInput = options.transformInput?.(request) ?? input;
+
+      const tools: AgentTool[] = [];
+      const enableSearch = options.enableSearch ?? Boolean(webSearchRunner);
+      if (enableSearch && webSearchRunner) {
+        tools.push(
+          createWebSearchAgentTool(webSearchRunner, {
+            maxCalls: maxSearchCalls,
+            count: options.searchCount,
+            searchContextSize: options.searchContextSize,
+            onCallStep: recordCallStep,
+            signal: timeout.signal,
+          }),
+        );
+      }
+
+      if (options.extraToolsFactory) {
+        tools.push(...options.extraToolsFactory({ request, signal: timeout.signal, recordStep, recordCallStep }));
+      }
+      const maxToolRounds = typeof options.maxToolRounds === "function"
+        ? options.maxToolRounds(request) : options.maxToolRounds ?? (maxSearchCalls + 2);
+
+      const agent = new Agent({
+        initialState: { systemPrompt, model, tools: tools.map((tool) => withCancellation(tool, timeout.signal)), thinkingLevel },
+        finishTurn: (turn) => {
+          if (timeout.signal.aborted) return { action: "end" };
+          if (turn.toolResults.length === 0) return { action: "end" };
+          toolRounds++;
+          if (toolRounds > maxToolRounds) {
+            return { action: "end" };
+          }
+          return undefined;
+        },
+        streamFn: (selectedModel, context, streamOptions) => models.streamSimple(selectedModel, context, {
+          ...streamOptions,
+          signal: combineSignals(timeout.signal, streamOptions?.signal),
+          maxTokens: config.maxTokens,
+          timeoutMs: config.timeoutMs,
+          maxRetries: 0,
+          fetch: async (req, init) => {
+            const response = await globalThis.fetch(req, { ...init, redirect: "manual" });
+            httpStatus = response.status;
+            return response;
+          },
+        }),
       });
+
+      let auditFailed = false;
+      let auditFailure: unknown;
+      const reportAttempt = (attempt: ToolAttempt) => {
+        if (!request.onToolAttempt || auditFailed) return;
+        try {
+          request.onToolAttempt(structuredClone(attempt));
+        } catch (error) {
+          // Keep the real store failure without letting an SDK listener exception skip draining.
+          auditFailed = true;
+          auditFailure = error;
+          agent.abort();
+        }
+      };
+      const unsubscribe = agent.subscribe((event) => {
+        if (event.type === "message_end" && event.message.role === "assistant") {
+          const calls = event.message.content.filter((part) => part.type === "toolCall");
+          if (calls.length === 0) return;
+          batchId++;
+          batchCalls = new Map();
+          const thought = event.message.content
+            .filter((part) => part.type === "thinking")
+            .map((part) => part.thinking.trim()).filter(Boolean).join("\n");
+          calls.forEach((call, sourceIndex) => {
+            const attempt: ToolAttempt = {
+              attemptId, batchId, toolCallId: call.id, sourceIndex,
+              toolName: call.name, arguments: call.arguments,
+              status: "attempted", ...(thought ? { preCallThought: thought } : {}),
+            };
+            toolAttempts.push(attempt);
+            batchCalls.set(call.id, attempt);
+            reportAttempt(attempt);
+          });
+        } else if (event.type === "tool_execution_end") {
+          const call = batchCalls.get(event.toolCallId);
+          if (!call) return;
+          const skipped = event.result?.details?.skipped || event.result?.details?.error === "limit_reached";
+          call.status = timeout.signal.aborted ? "cancelled" : skipped ? "limit_reached" : event.isError
+            ? event.durationMs === undefined ? "invalid_arguments" : "failed" : "succeeded";
+          call.durationMs = event.durationMs;
+          if (call.status !== "succeeded") {
+            call.errorCode = timeout.signal.aborted ? (timeout.signal.reason as PublicError).code : skipped ? "tool_limit_reached"
+              : event.durationMs === undefined ? "tool_arguments_invalid" : "tool_execution_failed";
+          }
+          reportAttempt(call);
+        }
+      });
+      const abortAgent = () => agent.abort();
+      timeout.signal.addEventListener("abort", abortAgent, { once: true });
+      try {
+        throwIfAborted(timeout.signal);
+        await agent.prompt(JSON.stringify(cleanWireInput));
+        if (auditFailed) throw auditFailure;
+        throwIfAborted(timeout.signal);
+        const last = agent.state.messages.findLast((message) => message.role === "assistant");
+        if (!last || last.role !== "assistant") {
+          throw new PublicError("model_missing_message", { httpStatus });
+        }
+        if (last.stopReason !== "stop") {
+          throw new PublicError(timeout.signal.aborted ? "model_timeout" : "model_incomplete", { httpStatus, stopReason: last.stopReason });
+        }
+        const text = last.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+        if (!text.trim()) throw new PublicError("model_empty_output", { httpStatus });
+        return {
+          answer: text,
+          toolSteps: [
+            ...toolAttempts.flatMap((call) => {
+              const step = projectedSteps.get(call);
+              return call.status === "succeeded" && step
+                ? [{ ...step, ...(call.preCallThought ? { preCallThought: call.preCallThought } : {}) }] : [];
+            }),
+            ...capturedSteps,
+          ].map((step, index) => ({ ...step, stepNo: index + 1 })),
+          toolAttempts,
+        };
+      } catch (error) {
+        if (auditFailed) throw auditFailure;
+        throwIfAborted(timeout.signal);
+        if (error instanceof PublicError) throw error;
+        throw new PublicError(timeout.signal.aborted ? "model_timeout" : "model_request_failed", {
+          httpStatus: httpStatus ?? toPublicError(error).httpStatus,
+        });
+      } finally {
+        timeout.signal.removeEventListener("abort", abortAgent);
+        agent.abort();
+        try {
+          try { await agent.waitForIdle(); }
+          catch { throw new PublicError("adapter_cleanup_failed"); }
+        } finally {
+          try {
+            for (const call of toolAttempts) {
+              if (call.status !== "attempted") continue;
+              call.status = timeout.signal.aborted ? "cancelled" : "failed";
+              call.errorCode = timeout.signal.aborted ? (timeout.signal.reason as PublicError).code : "tool_execution_failed";
+              reportAttempt(call);
+            }
+          } finally { unsubscribe(); }
+        }
+      }
+    } finally {
+      timeout.dispose();
     }
   };
 }

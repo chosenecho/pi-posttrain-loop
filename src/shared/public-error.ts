@@ -1,5 +1,10 @@
 const PUBLIC_ERROR_MESSAGES = {
   unexpected_error: "内部处理失败",
+  operation_aborted: "操作已取消",
+  adapter_cleanup_failed: "适配器清理失败",
+  tool_limit_reached: "工具调用次数已达上限",
+  tool_arguments_invalid: "工具参数校验失败",
+  tool_execution_failed: "工具执行失败",
   model_request_failed: "模型请求失败",
   model_timeout: "模型请求超时",
   model_missing_message: "模型未返回 assistant 消息",

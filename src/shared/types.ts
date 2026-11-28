@@ -75,6 +75,10 @@ export interface RoleRequest {
   role: DialogueRole | EvalRole;
   systemPrompt: string;
   input: Record<string, unknown>;
+  /** Runtime cancellation metadata; never part of model input or persisted configuration. */
+  signal?: AbortSignal;
+  /** Synchronous runtime audit sink; never serialized into the model input. */
+  onToolAttempt?: (attempt: Readonly<ToolAttempt>) => void;
 }
 
 export type RoleRunner = (request: RoleRequest) => Promise<string>;
@@ -113,9 +117,24 @@ export interface ToolStep {
   preCallThought?: string | null;
 }
 
+export interface ToolAttempt {
+  attemptId: string;
+  batchId: number;
+  toolCallId: string;
+  sourceIndex: number;
+  toolName: string;
+  arguments: Record<string, unknown>;
+  status: "attempted" | "succeeded" | "failed" | "limit_reached" | "cancelled" | "invalid_arguments";
+  durationMs?: number;
+  errorCode?: string;
+  preCallThought?: string;
+}
+
 export interface SearchAnswerResult {
   answer: string;
+  /** Successful training projection only; audit failures never become training tool steps. */
   toolSteps: ToolStep[];
+  toolAttempts?: ToolAttempt[];
 }
 
 export type SearchAnswerRunner = (request: RoleRequest) => Promise<SearchAnswerResult>;
